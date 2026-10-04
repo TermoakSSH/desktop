@@ -118,6 +118,17 @@ add_targets() {
   [[ -n "${TERMOAK_BUILDER:-}" ]] || rustup target add "$@" >/dev/null
 }
 
+# Defaults for the official Termoak releases, so nothing has to be exported:
+# the public key and the update URL are public; the secret key is read from
+# ~/.config/termoak/update-secret (mode 600) when TERMOAK_UPDATE_SECRET is unset.
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/termoak"
+export TERMOAK_UPDATE_PUBKEY="${TERMOAK_UPDATE_PUBKEY:-zwbxnEY2xFDcaICtxAW8BVhccqXWdjXae4bsDB+Kkt4=}"
+export TERMOAK_UPDATE_URL="${TERMOAK_UPDATE_URL:-https://termoak.com/updates/latest.json}"
+if [[ -z "${TERMOAK_UPDATE_SECRET:-}" && -f "$config_dir/update-secret" ]]; then
+  TERMOAK_UPDATE_SECRET="$(tr -d '[:space:]' <"$config_dir/update-secret")"
+  export TERMOAK_UPDATE_SECRET
+fi
+
 check_update_env() {
   [[ -n "${TERMOAK_UPDATE_PUBKEY:-}" ]] ||
     die "TERMOAK_UPDATE_PUBKEY is missing (the GitHub variable of the same name): without it the app does not update itself"
@@ -274,8 +285,12 @@ github_setup() {
   if [[ -z "$github_token" && -f "$file" ]]; then
     github_token="$(tr -d '[:space:]' <"$file")"
   fi
+  # Otherwise, the login of the GitHub CLI if it is installed (`gh auth login`).
+  if [[ -z "$github_token" ]] && command -v gh >/dev/null; then
+    github_token="$(gh auth token 2>/dev/null || true)"
+  fi
   [[ -n "$github_token" ]] ||
-    die "the GitHub token is missing: GITHUB_TOKEN or $file (fine-grained, Contents: Read and write)"
+    die "the GitHub token is missing: GITHUB_TOKEN, $file or \`gh auth login\`"
   # This repository; REPO=owner/repository publishes somewhere else (a fork).
   repo="${REPO:-TermoakSSH/desktop}"
   [[ "$repo" == */* ]] || die "cannot tell which repository this is: set REPO=owner/repository"
@@ -401,7 +416,8 @@ cmd_publish() { # component
   [[ "$(cat "$dist/.version" 2>/dev/null)" == "$tag" ]] ||
     die "dist/$component/ does not hold $tag: run scripts/release-local.sh build $component first"
   github_setup
-  [[ -n "${TERMOAK_UPDATE_SECRET:-}" ]] || die "TERMOAK_UPDATE_SECRET is missing"
+  [[ -n "${TERMOAK_UPDATE_SECRET:-}" ]] ||
+    die "the update secret key is missing: put it once in $config_dir/update-secret (chmod 600) or set TERMOAK_UPDATE_SECRET"
   release_tool check-keys
 
   base="https://github.com/$repo/releases/download/$tag"
