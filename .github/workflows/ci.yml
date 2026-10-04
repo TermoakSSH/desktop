@@ -1,0 +1,50 @@
+name: CI
+
+# Public repository: GitHub Actions minutes are free. The same locally:
+#   cargo fmt --check && cargo build --locked && cargo test --locked
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**/*.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["docs/**", "**/*.md", "LICENSE"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Desktop app (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain pinned by rust-toolchain.toml
+        shell: bash
+        run: rustup toolchain install && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: GPUI dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev libasound2-dev
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - run: cargo build --locked
+      - name: Tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test --locked

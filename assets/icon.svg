@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f2a1c"/>
+      <stop offset="1" stop-color="#0e140d"/>
+    </linearGradient>
+    <radialGradient id="olive" cx="0.38" cy="0.35" r="0.75">
+      <stop offset="0" stop-color="#b5cc5a"/>
+      <stop offset="0.55" stop-color="#7d9a2c"/>
+      <stop offset="1" stop-color="#4e6317"/>
+    </radialGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg)"/>
+  <!-- Hoja -->
+  <path d="M322 118c52-34 110-30 138-12-18 44-68 86-128 84-10-24-13-50-10-72z" fill="#6f8f3a"/>
+  <path d="M332 176c30-20 64-38 104-58" stroke="#3f5520" stroke-width="7" fill="none" stroke-linecap="round"/>
+  <!-- Aceituna -->
+  <ellipse cx="300" cy="300" rx="118" ry="150" transform="rotate(-28 300 300)" fill="url(#olive)"/>
+  <ellipse cx="262" cy="232" rx="30" ry="18" transform="rotate(-28 262 232)" fill="#e6f0b4" opacity="0.55"/>
+  <!-- Prompt de terminal -->
+  <path d="M92 318l70 48-70 48" stroke="#e8f0d8" stroke-width="30" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M182 414h92" stroke="#e8f0d8" stroke-width="30" stroke-linecap="round"/>
+</svg>

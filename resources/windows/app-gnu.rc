@@ -1,0 +1,4 @@
+// With mingw (cross-compiling from Linux) the manifest goes in as a resource:
+// 1 = the application, 24 = RT_MANIFEST. With MSVC, build.rs passes it to the linker.
+#include "app.rc"
+1 24 "app.manifest"

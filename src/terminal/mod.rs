@@ -1,0 +1,2235 @@
+//! Terminal tab: emulation (alacritty_terminal), painting with GPUI, keyboard
+//! (with dead keys and IME) and mouse (with reports to programs), history,
+//! selection, copy/paste, session sharing, command autocompletion and quick
+//! AI actions. Used for SSH, server sessions and the local terminal.
+
+pub mod backend;
+pub mod complete;
+mod element;
+pub mod input;
+pub mod model;
+pub mod mouse;
+pub mod serial;
+pub mod shell;
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use alacritty_terminal::term::TermMode;
+use gpui::{
+    Action, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle,
+    FontWeight, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Styled, Task, UTF16Selection, WeakEntity, Window, div, point,
+    prelude::FluentBuilder, px, size,
+};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::spinner::Spinner;
+use gpui_component::text::TextView;
+use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, WindowExt, h_flex, v_flex};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use termoak_client::relay::{LocalTerm, RelayShare};
+use termoak_core::Id;
+use termoak_ssh::terminal::OutputHub;
+use termoak_ssh::{Connection, TerminalSession};
+
+use self::backend::{Backend, Cmd, LocalParams, Out, ServerTarget};
+use self::complete::{LineTracker, Suggestions};
+use self::element::{PADDING, TerminalElement};
+use self::model::{Snapshot, TermEvent, TermModel};
+use crate::runtime;
+use crate::state::{AppModel, ToastKind, api_error};
+use crate::theme::TermPalette;
+use crate::ui::{self, IconName};
+
+const CONTEXT: &str = "Terminal";
+
+/// Sends text as is to the terminal (for shortcuts the app must not capture).
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = terminal, no_json)]
+pub struct SendText {
+    pub text: String,
+}
+
+gpui::actions!(
+    terminal,
+    [
+        Copy,
+        Paste,
+        SelectAll,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollToBottom
+    ]
+);
+
+/// Terminal shortcuts.
+pub fn init(cx: &mut App) {
+    let send = |text: &str| SendText {
+        text: text.to_string(),
+    };
+    cx.bind_keys([
+        KeyBinding::new("tab", send("\t"), Some(CONTEXT)),
+        KeyBinding::new("shift-tab", send("\x1b[Z"), Some(CONTEXT)),
+        KeyBinding::new("shift-pageup", ScrollPageUp, Some(CONTEXT)),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, Some(CONTEXT)),
+        KeyBinding::new("shift-end", ScrollToBottom, Some(CONTEXT)),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        // In the terminal Ctrl+C and Ctrl+W belong to the shell (interrupt, delete word).
+        KeyBinding::new("ctrl-c", send("\x03"), Some(CONTEXT)),
+        KeyBinding::new("ctrl-w", send("\x17"), Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
+    ]);
+}
+
+/// Source of the terminal.
+#[derive(Debug, Clone)]
+pub enum TermKind {
+    /// SSH from this computer.
+    Local { host_id: Id },
+    /// Session that lives on the server.
+    Server {
+        host_id: Option<Id>,
+        session_id: Option<Id>,
+    },
+    /// Shell of this computer (local terminal, no SSH).
+    Shell,
+    /// Serial port of this computer.
+    Serial { path: String, baud: u32 },
+}
+
+/// Context of a terminal for the AI.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiContext {
+    pub host_id: Option<Id>,
+    /// Server session (the AI can read it and write to it).
+    pub session_id: Option<Id>,
+    /// Name of the host or the terminal.
+    pub label: String,
+    /// Terminal of this computer (shell or serial): the AI cannot reach it.
+    pub device: bool,
+}
+
+/// Connection state.
+#[derive(Debug, Clone)]
+pub enum TermState {
+    Connecting(String),
+    Running,
+    Closed(Option<String>),
+    Failed(String),
+}
+
+/// Notifications for the main window.
+pub enum TerminalEvent {
+    TitleChanged,
+    /// Open SFTP over the same connection.
+    OpenSftp {
+        host_id: Id,
+        conn: Option<Arc<Connection>>,
+    },
+}
+
+/// Sharing of a local terminal through the server.
+type SharedRelay = Arc<tokio::sync::Mutex<Option<RelayShare>>>;
+
+/// View of a terminal.
+pub struct TerminalView {
+    app: Entity<AppModel>,
+    kind: TermKind,
+    host_label: String,
+    /// Title set by the remote program (OSC 0/2).
+    osc_title: Option<String>,
+    focus: FocusHandle,
+    model: TermModel,
+    backend: Option<Backend>,
+    state: TermState,
+    local: Option<Arc<TerminalSession>>,
+    can_write: bool,
+    viewers: usize,
+    relay: Option<SharedRelay>,
+    /// Server session it is shared through (relay or server session).
+    share_session: Option<Id>,
+    /// Shared shell or serial port: copy of its output for the server and
+    /// close notification.
+    local_feed: Option<(Arc<OutputHub>, tokio::sync::watch::Sender<bool>)>,
+    /// Shared by the copilot (not the user): sharing stops when the copilot
+    /// is closed or stopped.
+    copilot_shared: bool,
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    selecting: bool,
+    /// Cell where a click without drag started (to open links on release).
+    press_cell: Option<(usize, usize)>,
+    /// Link under the mouse (hand cursor).
+    hover_link: Option<String>,
+    scroll_rest: f32,
+    /// Composition text of the IME or a dead key (not sent yet).
+    ime_marked: Option<String>,
+    /// Button whose press was reported to the program (for dragging and to
+    /// report its release).
+    mouse_held: Option<(MouseButton, mouse::Button)>,
+    /// Last reported cell (reports happen only when the cell changes).
+    mouse_cell: Option<(usize, usize)>,
+    ai_busy: bool,
+    /// Line being typed (autocompletion).
+    line: LineTracker,
+    /// Suggestions for the current line.
+    suggestions: Option<Suggestions>,
+    /// Suggestion lookup in progress (cancelled when more is typed).
+    complete_task: Option<Task<()>>,
+    /// Was on the alternate screen (vim, less...) when the last output was
+    /// processed.
+    was_alt: bool,
+    /// Id of this terminal for the AI that runs on this computer.
+    ai_id: Id,
+    /// Copy of the output for the AI on this computer (while it waits for
+    /// what a command prints).
+    ai_tap: Option<tokio::sync::broadcast::Sender<bytes::Bytes>>,
+    _reader: Option<Task<()>>,
+}
+
+/// Maximum suggestions in the autocompletion list.
+const MAX_SUGGESTIONS: usize = 5;
+/// Height of each row of the suggestion list.
+const SUGGESTION_ROW: f32 = 24.;
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl TerminalView {
+    fn base(app: Entity<AppModel>, kind: TermKind, label: String, cx: &mut Context<Self>) -> Self {
+        let scrollback = app.read(cx).settings.scrollback;
+        Self {
+            app,
+            kind,
+            host_label: label,
+            osc_title: None,
+            focus: cx.focus_handle(),
+            model: TermModel::new(80, 24, scrollback),
+            backend: None,
+            state: TermState::Connecting(t!("terminal.status.preparing").to_string()),
+            local: None,
+            can_write: false,
+            viewers: 0,
+            relay: None,
+            share_session: None,
+            local_feed: None,
+            copilot_shared: false,
+            origin: Point::default(),
+            cell_width: px(8.),
+            line_height: px(18.),
+            selecting: false,
+            press_cell: None,
+            hover_link: None,
+            scroll_rest: 0.,
+            ime_marked: None,
+            mouse_held: None,
+            mouse_cell: None,
+            ai_busy: false,
+            line: LineTracker::default(),
+            suggestions: None,
+            complete_task: None,
+            was_alt: false,
+            ai_id: termoak_core::new_id(),
+            ai_tap: None,
+            _reader: None,
+        }
+    }
+
+    /// Local SSH terminal.
+    pub fn local(
+        app: Entity<AppModel>,
+        host_id: Id,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let label = app.read(cx).host_label(host_id);
+        let mut view = Self::base(app, TermKind::Local { host_id }, label, cx);
+        view.connect(window, cx);
+        view
+    }
+
+    /// Terminal on the server: a new session for a host or attaching to an existing one.
+    pub fn server(
+        app: Entity<AppModel>,
+        host_id: Option<Id>,
+        session_id: Option<Id>,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::base(
+            app,
+            TermKind::Server {
+                host_id,
+                session_id,
+            },
+            title,
+            cx,
+        );
+        view.connect(window, cx);
+        view
+    }
+
+    /// Local terminal: a shell of this computer.
+    pub fn shell(app: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let label = t!("terminal.shell_label").to_string();
+        let mut view = Self::base(app, TermKind::Shell, label, cx);
+        view.connect(window, cx);
+        view
+    }
+
+    /// Serial terminal: a port of this computer.
+    pub fn serial(
+        app: Entity<AppModel>,
+        params: serial::SerialParams,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let label = format!(
+            "{} · {}",
+            params
+                .path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&params.path),
+            params.baud
+        );
+        let kind = TermKind::Serial {
+            path: params.path,
+            baud: params.baud,
+        };
+        let mut view = Self::base(app, kind, label, cx);
+        view.connect(window, cx);
+        view
+    }
+
+    /// Terminal of this computer (shell or serial port), without a host.
+    fn is_local_device(&self) -> bool {
+        matches!(self.kind, TermKind::Shell | TermKind::Serial { .. })
+    }
+
+    pub fn kind(&self) -> &TermKind {
+        &self.kind
+    }
+
+    /// What the AI (copilot) needs to know about this terminal.
+    pub fn copilot_context(&self, cx: &App) -> AiContext {
+        let (host_id, session_id) = match &self.kind {
+            TermKind::Local { host_id } => (Some(*host_id), self.share_session),
+            TermKind::Server {
+                host_id,
+                session_id,
+            } => (*host_id, *session_id),
+            TermKind::Shell | TermKind::Serial { .. } => (None, self.share_session),
+        };
+        AiContext {
+            host_id,
+            session_id,
+            label: self.label(cx),
+            device: self.is_local_device(),
+        }
+    }
+
+    /// Text of the visible screen.
+    pub fn screen_text(&self) -> String {
+        self.model.screen_text()
+    }
+
+    /// Id of this terminal for the AI that runs on this computer.
+    pub fn ai_id(&self) -> Id {
+        self.ai_id
+    }
+
+    /// State for the AI's terminal list.
+    pub fn ai_status(&self) -> &'static str {
+        match &self.state {
+            TermState::Connecting(_) => "connecting",
+            TermState::Running if self.can_write => "running",
+            TermState::Running => "read_only",
+            TermState::Closed(_) => "closed",
+            TermState::Failed(_) => "failed",
+        }
+    }
+
+    /// For the AI on this computer: types `input` (as the keyboard would)
+    /// and returns a subscription to what the terminal prints next.
+    pub fn ai_type(
+        &mut self,
+        input: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<tokio::sync::broadcast::Receiver<bytes::Bytes>, String> {
+        if !matches!(self.state, TermState::Running) || self.backend.is_none() {
+            return Err("the terminal is not connected".into());
+        }
+        if !self.can_write {
+            return Err("the terminal is read-only".into());
+        }
+        let tap = self
+            .ai_tap
+            .get_or_insert_with(|| tokio::sync::broadcast::channel(1024).0);
+        let rx = tap.subscribe();
+        // Whatever the user had half typed is not tracked any more.
+        self.clear_line();
+        self.write(input.as_bytes().to_vec(), cx);
+        Ok(rx)
+    }
+
+    pub fn state(&self) -> &TermState {
+        &self.state
+    }
+
+    /// Name of the host (read again from the model in case it changed or was
+    /// not loaded yet).
+    fn label(&self, cx: &App) -> String {
+        if matches!(self.kind, TermKind::Shell) {
+            return t!("terminal.shell_label").to_string();
+        }
+        let host_id = match &self.kind {
+            TermKind::Local { host_id } => Some(*host_id),
+            TermKind::Server { host_id, .. } => *host_id,
+            TermKind::Shell | TermKind::Serial { .. } => None,
+        };
+        host_id
+            .and_then(|id| self.app.read(cx).host(id).map(|h| h.label.clone()))
+            .unwrap_or_else(|| self.host_label.clone())
+    }
+
+    /// Title of the tab.
+    pub fn title(&self, cx: &App) -> SharedString {
+        let label = self.label(cx);
+        match &self.osc_title {
+            Some(t) if !t.trim().is_empty() && t.len() < 60 => {
+                format!("{label} · {}", t.trim()).into()
+            }
+            _ => label.into(),
+        }
+    }
+
+    /// (Re)connects.
+    pub fn connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(old) = self.backend.take() {
+            old.send(Cmd::Close);
+        }
+        self.local = None;
+        self.can_write = false;
+        self.ime_marked = None;
+        self.mouse_held = None;
+        self.clear_line();
+        self.model.reset();
+        let (cols, rows) = (self.model.cols(), self.model.rows());
+        let app = self.app.read(cx);
+        let rt = runtime::handle(cx);
+        let started = match &self.kind {
+            TermKind::Local { host_id } => Some(backend::start_local(
+                &rt,
+                LocalParams {
+                    ws: app.ws.clone(),
+                    host_id: *host_id,
+                    prompter: app.prompter.clone(),
+                    use_agent: app.settings.use_agent,
+                    cols,
+                    rows,
+                    conn: None,
+                },
+            )),
+            TermKind::Server {
+                host_id,
+                session_id,
+            } => match app.api.clone() {
+                Some(api) => {
+                    let target = match (session_id, host_id) {
+                        (Some(s), _) => Some(ServerTarget::Attach { session_id: *s }),
+                        (None, Some(h)) => Some(ServerTarget::New { host_id: *h }),
+                        (None, None) => None,
+                    };
+                    target.map(|t| {
+                        backend::start_server(&rt, api, t, app.prompter.clone(), cols, rows)
+                    })
+                }
+                None => None,
+            },
+            TermKind::Shell => Some(shell::start(cols, rows)),
+            TermKind::Serial { path, baud } => Some(serial::start(serial::SerialParams {
+                path: path.clone(),
+                baud: *baud,
+            })),
+        };
+        let Some((backend, mut rx)) = started else {
+            self.state = TermState::Failed(t!("terminal.not_signed_in").to_string());
+            cx.notify();
+            return;
+        };
+        self.backend = Some(backend);
+        self.state = TermState::Connecting(if self.is_local_device() {
+            t!("terminal.status.opening_terminal").to_string()
+        } else {
+            t!("terminal.status.connecting").to_string()
+        });
+        self._reader = Some(cx.spawn(async move |this, cx| {
+            while let Some(first) = rx.recv().await {
+                let mut batch = vec![first];
+                while batch.len() < 512 {
+                    match rx.try_recv() {
+                        Ok(more) => batch.push(more),
+                        Err(_) => break,
+                    }
+                }
+                if this.update(cx, |v, cx| v.handle_out(batch, cx)).is_err() {
+                    break;
+                }
+                // With continuous output (`yes`, a huge `cat`) there is always
+                // more waiting: the UI thread is yielded so it can paint and
+                // handle the keyboard (Ctrl+C) before the next batch.
+                if !rx.is_empty() {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(4))
+                        .await;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn handle_out(&mut self, batch: Vec<Out>, cx: &mut Context<Self>) {
+        for out in batch {
+            match out {
+                Out::Status(s) => {
+                    if s.is_empty() {
+                        if !matches!(self.state, TermState::Closed(_) | TermState::Failed(_)) {
+                            self.state = TermState::Running;
+                            // The server ignores size changes until the terminal starts.
+                            self.sync_size();
+                        }
+                    } else {
+                        self.state = TermState::Connecting(s);
+                    }
+                }
+                Out::Local(term) => {
+                    if let TermKind::Local { host_id } = self.kind {
+                        let conn = term.connection().clone();
+                        self.app
+                            .update(cx, |m, cx| m.start_auto_forwards(host_id, conn, cx));
+                    }
+                    self.local = Some(term);
+                    self.can_write = true;
+                    self.state = TermState::Running;
+                    self.sync_size();
+                }
+                Out::Shell => {
+                    self.can_write = true;
+                    self.state = TermState::Running;
+                    self.sync_size();
+                }
+                Out::Remote {
+                    session_id,
+                    can_write,
+                } => {
+                    if let TermKind::Server { session_id: s, .. } = &mut self.kind {
+                        *s = Some(session_id);
+                    }
+                    self.share_session = Some(session_id);
+                    self.can_write = can_write;
+                    self.state = TermState::Running;
+                    self.sync_size();
+                }
+                Out::Data(bytes) => {
+                    if matches!(self.state, TermState::Connecting(_)) {
+                        self.state = TermState::Running;
+                    }
+                    if let Some((hub, _)) = &self.local_feed {
+                        hub.push(bytes.clone());
+                    }
+                    if let Some(tap) = &self.ai_tap
+                        && tap.receiver_count() > 0
+                    {
+                        let _ = tap.send(bytes.clone());
+                    }
+                    let events = self.model.feed(&bytes);
+                    if let Some(b) = &self.backend {
+                        b.consumed(bytes.len());
+                    }
+                    self.handle_term_events(events, cx);
+                    // When leaving vim, less... the shell paints a new line.
+                    let alt = self.model.mode().contains(TermMode::ALT_SCREEN);
+                    if self.was_alt && !alt {
+                        self.clear_line();
+                    }
+                    self.was_alt = alt;
+                }
+                Out::Reset => self.model.reset(),
+                Out::Notice(msg) => {
+                    self.app
+                        .update(cx, |m, cx| m.toast(ToastKind::Warning, msg, cx));
+                }
+                Out::Presence(n) => self.viewers = n,
+                Out::Closed(reason) => {
+                    if self.is_local_device() {
+                        // Leave a note on the screen itself, like other terminals.
+                        let text = match &reason {
+                            Some(r) => r.clone(),
+                            None if matches!(self.kind, TermKind::Shell) => {
+                                t!("terminal.shell.exited").to_string()
+                            }
+                            None => t!("terminal.serial.port_closed").to_string(),
+                        };
+                        let line = format!("\r\n\x1b[0;2m[{text}]\x1b[0m\r\n");
+                        self.model.feed(line.as_bytes());
+                    }
+                    self.ime_marked = None;
+                    self.mouse_held = None;
+                    self.state = TermState::Closed(reason);
+                    self.stop_relay(cx);
+                }
+                Out::Failed(e) => self.state = TermState::Failed(e),
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_term_events(&mut self, events: Vec<TermEvent>, cx: &mut Context<Self>) {
+        for ev in events {
+            match ev {
+                TermEvent::Write(bytes) => {
+                    if let Some(b) = &self.backend {
+                        b.input(bytes);
+                    }
+                }
+                TermEvent::Title(t) => {
+                    self.osc_title = Some(t);
+                    cx.emit(TerminalEvent::TitleChanged);
+                }
+                TermEvent::ResetTitle => {
+                    self.osc_title = None;
+                    cx.emit(TerminalEvent::TitleChanged);
+                }
+                TermEvent::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                TermEvent::Bell => {}
+            }
+        }
+    }
+
+    /// Sends the current size to the other end.
+    fn sync_size(&self) {
+        if let Some(b) = &self.backend {
+            b.send(Cmd::Resize(self.model.cols(), self.model.rows()));
+        }
+    }
+
+    /// Closes the terminal (or detaches from the server session).
+    pub fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.stop_relay(cx);
+        if let Some(b) = self.backend.take() {
+            b.send(Cmd::Close);
+        }
+        self._reader = None;
+    }
+
+    /// Called by the element when it knows the available space.
+    pub(crate) fn set_geometry(
+        &mut self,
+        origin: Point<Pixels>,
+        cell_width: Pixels,
+        line_height: Pixels,
+        cols: u16,
+        rows: u16,
+        cx: &mut Context<Self>,
+    ) {
+        self.origin = origin;
+        self.cell_width = cell_width;
+        self.line_height = line_height;
+        if (cols, rows) != (self.model.cols(), self.model.rows()) {
+            self.model.resize(cols, rows);
+            if let Some(b) = &self.backend {
+                b.send(Cmd::Resize(cols, rows));
+            }
+            if let Some(relay) = self.relay.clone() {
+                runtime::handle(cx).spawn(async move {
+                    if let Some(r) = relay.lock().await.as_ref() {
+                        r.resize(cols, rows).await;
+                    }
+                });
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(&self, palette: &TermPalette, focused: bool) -> Snapshot {
+        let mut snap = self.model.snapshot(palette, focused);
+        if !matches!(self.state, TermState::Running) {
+            snap.cursor = None;
+        }
+        snap
+    }
+
+    // ----- Input -----
+
+    fn write(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !self.can_write || !matches!(self.state, TermState::Running) {
+            return;
+        }
+        if let Some(b) = &self.backend {
+            self.model.scroll_to_bottom();
+            b.input(bytes);
+            cx.notify();
+        }
+    }
+
+    /// User input (keyboard, IME, paste): besides sending it, tracks the
+    /// line being typed for autocompletion.
+    fn write_input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if !self.can_write || !matches!(self.state, TermState::Running) || self.backend.is_none() {
+            return;
+        }
+        self.track_input(&bytes, cx);
+        self.write(bytes, cx);
+    }
+
+    /// Special keys, Ctrl and Alt. Normal text is not handled here: it goes
+    /// on to the input handler (`EntityInputHandler`), which receives it
+    /// already composed (dead keys, AltGr, IME) and only once.
+    fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.suggestion_key(ev, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(bytes) =
+            input::to_bytes(&ev.keystroke, ev.prefer_character_input, self.model.mode())
+        {
+            cx.stop_propagation();
+            if self.model.has_selection() {
+                self.model.clear_selection();
+            }
+            self.write_input(bytes, cx);
+        }
+    }
+
+    /// Text committed by the keyboard or the IME.
+    fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.model.has_selection() {
+            self.model.clear_selection();
+        }
+        self.write_input(input::text_bytes(text), cx);
+    }
+
+    // ----- Autocompletion -----
+
+    /// Forgets the line and the suggestions (new connection, vim exited...).
+    fn clear_line(&mut self) {
+        self.line.reset();
+        self.suggestions = None;
+        self.complete_task = None;
+    }
+
+    fn autocomplete_enabled(&self, cx: &App) -> bool {
+        self.app.read(cx).settings.autocomplete
+    }
+
+    /// Host of the terminal (for the history and the system).
+    fn host_id(&self) -> Option<Id> {
+        match &self.kind {
+            TermKind::Local { host_id } => Some(*host_id),
+            TermKind::Server { host_id, .. } => *host_id,
+            TermKind::Shell | TermKind::Serial { .. } => None,
+        }
+    }
+
+    /// Is what is on screen before the cursor the typed line, with nothing to
+    /// its right? If not (questions without echo such as passwords, lines
+    /// the shell changed...), nothing is suggested or saved.
+    fn line_on_screen(&self, line: &str) -> bool {
+        let (before, after_blank) = self.model.text_around_cursor(line.chars().count());
+        complete::screen_matches(line, &before, after_blank)
+    }
+
+    /// Tracks what is typed: saves the line sent with Enter in the history
+    /// and looks for suggestions for the new one.
+    fn track_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.model.mode().contains(TermMode::ALT_SCREEN) {
+            // Inside vim, less... there is no shell line.
+            self.line.forget();
+            self.suggestions = None;
+            return;
+        }
+        let pending = self.line.current();
+        let echoed = pending.as_deref().is_some_and(|l| self.line_on_screen(l));
+        if let Some(sent) = self.line.feed(bytes)
+            && echoed
+            && pending.as_deref() == Some(sent.as_str())
+        {
+            self.record_command(sent, cx);
+        }
+        self.refresh_suggestions(cx);
+    }
+
+    /// Saves a command in the host history (on this device only).
+    fn record_command(&self, command: String, cx: &mut Context<Self>) {
+        let Some(host) = self.host_id() else {
+            return;
+        };
+        if !self.autocomplete_enabled(cx) {
+            return;
+        }
+        let ws = self.app.read(cx).ws.clone();
+        runtime::handle(cx).spawn(async move {
+            if let Err(e) = ws.record_command(host, &command).await {
+                tracing::debug!(error = %e, "could not save the command in the history");
+            }
+        });
+    }
+
+    /// Asks for suggestions for the current line (while they arrive, the
+    /// previous ones that still match stay, so they do not flicker).
+    fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
+        let line = self
+            .line
+            .current()
+            .filter(|l| self.line.at_end() && !l.trim().is_empty());
+        let Some(line) = line.filter(|_| self.autocomplete_enabled(cx)) else {
+            self.suggestions = None;
+            self.complete_task = None;
+            return;
+        };
+        if self.suggestions.as_ref().is_some_and(|s| s.line == line) {
+            return;
+        }
+        self.suggestions = self.suggestions.as_ref().and_then(|s| s.narrow(&line));
+        let app = self.app.read(cx);
+        let ws = app.ws.clone();
+        let host = self.host_id();
+        let os = match &self.kind {
+            TermKind::Shell => Some(std::env::consts::OS.to_string()),
+            _ => host.and_then(|h| app.host(h)).and_then(|h| h.os.clone()),
+        };
+        let query = line.clone();
+        let task = runtime::spawn(cx, async move {
+            ws.complete(host, os.as_deref(), &query, MAX_SUGGESTIONS)
+                .await
+                .map_err(api_error)
+        });
+        self.complete_task = Some(cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |v, cx| {
+                // Only if the line has not changed in the meantime.
+                if v.line.current().as_deref() != Some(line.as_str()) {
+                    return;
+                }
+                match res {
+                    Ok(items) => {
+                        let items: Vec<_> = items
+                            .into_iter()
+                            .filter(|s| {
+                                !s.insert.is_empty() && !s.insert.chars().any(char::is_control)
+                            })
+                            .collect();
+                        v.suggestions = (!items.is_empty()).then(|| Suggestions {
+                            line: line.clone(),
+                            items,
+                            selected: 0,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "autocompletion not available");
+                        v.suggestions = None;
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Visible suggestions (the selected one is painted as ghost text after
+    /// the cursor), if any. Only with autocompletion on, outside the
+    /// alternate screen, not looking at the history nor composing text, with
+    /// the cursor at the end of what was typed and the screen matching the
+    /// line.
+    pub(crate) fn visible_suggestion(&self, cx: &App) -> Option<&Suggestions> {
+        let s = self.suggestions.as_ref()?;
+        s.current()?;
+        if !self.autocomplete_enabled(cx)
+            || !self.can_write
+            || !matches!(self.state, TermState::Running)
+            || self.ime_marked.is_some()
+            || self.model.has_selection()
+            || self.model.display_offset() != 0
+            || self.model.mode().contains(TermMode::ALT_SCREEN)
+            || !self.line.at_end()
+        {
+            return None;
+        }
+        let line = self.line.current()?;
+        (line == s.line && self.line_on_screen(&line)).then_some(s)
+    }
+
+    /// Ghost text and the cursor cell where it starts (for the element).
+    pub(crate) fn ghost_text(&self, cx: &App) -> Option<(String, usize, usize)> {
+        let insert = self.visible_suggestion(cx)?.current()?.insert.clone();
+        let (row, col) = self.model.cursor_cell()?;
+        Some((insert, row, col))
+    }
+
+    /// Accepts the visible suggestion: types what is missing.
+    fn accept_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(insert) = self
+            .visible_suggestion(cx)
+            .and_then(|s| s.current())
+            .map(|s| s.insert.clone())
+        else {
+            return false;
+        };
+        self.write_input(input::text_bytes(&insert), cx);
+        true
+    }
+
+    /// Autocompletion keys: → accepts and Alt+↑/↓ chooses in the list. Only
+    /// if a suggestion is visible; otherwise they go to the terminal as usual.
+    fn suggestion_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        let plain = !m.control && !m.alt && !m.shift && !m.platform && !m.function;
+        let only_alt = m.alt && !m.control && !m.shift && !m.platform;
+        match ks.key.as_str() {
+            "right" if plain => self.accept_suggestion(cx),
+            "up" | "down" if only_alt => {
+                let listed = self
+                    .visible_suggestion(cx)
+                    .is_some_and(|s| s.items.len() > 1);
+                if listed && let Some(s) = self.suggestions.as_mut() {
+                    s.step(if ks.key == "up" { -1 } else { 1 });
+                    cx.notify();
+                }
+                listed
+            }
+            _ => false,
+        }
+    }
+
+    /// Suggestion list below (or above) the cursor.
+    fn render_suggestions(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let s = self.visible_suggestion(cx)?;
+        if s.items.len() < 2 {
+            return None;
+        }
+        let (row, col) = self.model.cursor_cell()?;
+        let items = s.items.clone();
+        let selected = s.selected;
+        let typed = s.line.chars().count();
+        let theme = cx.theme();
+        let mono = ui::mono_family(cx);
+        let width = 460f32;
+        let height = SUGGESTION_ROW * items.len() as f32 + 30.;
+        let area_w = PADDING * 2. + self.cell_width * self.model.cols() as f32;
+        let x = (PADDING + self.cell_width * col as f32)
+            .min(area_w - px(width) - PADDING)
+            .max(px(4.));
+        let fits_below = row + 1 + items.len() + 2 <= self.model.rows() as usize;
+        let y = if fits_below {
+            PADDING / 2. + self.line_height * (row + 1) as f32
+        } else {
+            (PADDING / 2. + self.line_height * row as f32 - px(height)).max(px(0.))
+        };
+        Some(
+            v_flex()
+                .id("suggestions")
+                .absolute()
+                .left(x)
+                .top(y)
+                .w(px(width))
+                .p_1()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .shadow_md()
+                .children(items.into_iter().enumerate().map(|(i, item)| {
+                    let (head, tail): (String, String) = {
+                        let chars: Vec<char> = item.text.chars().collect();
+                        let cut = typed.min(chars.len());
+                        (chars[..cut].iter().collect(), chars[cut..].iter().collect())
+                    };
+                    h_flex()
+                        .id(("suggestion", i))
+                        .h(px(SUGGESTION_ROW))
+                        .px_2()
+                        .gap_3()
+                        .items_center()
+                        .rounded(theme.radius)
+                        .cursor_pointer()
+                        .when(i == selected, |this| this.bg(theme.list_active))
+                        .when(i != selected, |this| {
+                            this.hover(|s| s.bg(theme.secondary_hover))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(s) = this.suggestions.as_mut() {
+                                    s.selected = i;
+                                }
+                                this.accept_suggestion(cx);
+                                this.focus.focus(window, cx);
+                            }),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .font_family(mono.clone())
+                                .text_sm()
+                                .child(div().text_color(theme.muted_foreground).child(head))
+                                .child(div().text_color(theme.popover_foreground).child(tail)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .max_w(px(180.))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(item.description.clone()),
+                        )
+                }))
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("terminal.suggestions.hint")),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Composition text and the cursor cell where it is painted.
+    pub(crate) fn ime_preedit(&self) -> Option<(String, usize, usize)> {
+        let text = self.ime_marked.clone()?;
+        let (row, col) = self.model.cursor_cell()?;
+        Some((text, row, col))
+    }
+
+    fn on_send_text(&mut self, action: &SendText, _: &mut Window, cx: &mut Context<Self>) {
+        // Tab accepts the visible suggestion; if there is none, the shell completes.
+        if action.text == "\t" && self.accept_suggestion(cx) {
+            return;
+        }
+        self.write_input(action.text.clone().into_bytes(), cx);
+    }
+
+    fn on_copy(&mut self, _: &Copy, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selection(window, cx);
+    }
+
+    fn on_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        self.paste(cx);
+    }
+
+    fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.select_all();
+        cx.notify();
+    }
+
+    fn on_page_up(&mut self, _: &ScrollPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.scroll_page(true);
+        cx.notify();
+    }
+
+    fn on_page_down(&mut self, _: &ScrollPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.scroll_page(false);
+        cx.notify();
+    }
+
+    fn on_bottom(&mut self, _: &ScrollToBottom, _: &mut Window, cx: &mut Context<Self>) {
+        self.model.scroll_to_bottom();
+        cx.notify();
+    }
+
+    pub fn copy_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.model.selection_text() {
+            Some(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                ui::notify(window, cx, ToastKind::Info, t!("common.copied"));
+            }
+            None => ui::notify(window, cx, ToastKind::Info, t!("terminal.no_selection")),
+        }
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+            let bytes = input::paste_bytes(&text, self.model.mode());
+            self.write_input(bytes, cx);
+        }
+    }
+
+    /// Writes text in the terminal without pressing Enter (AI suggestions).
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = input::paste_bytes(text, self.model.mode());
+        self.write_input(bytes, cx);
+    }
+
+    // ----- Mouse -----
+
+    fn cell_at(&self, pos: Point<Pixels>) -> (usize, usize, bool) {
+        let x = (pos.x - self.origin.x).max(px(0.));
+        let y = (pos.y - self.origin.y).max(px(0.));
+        let fx = x / self.cell_width;
+        let col = fx.floor() as usize;
+        let row = (y / self.line_height).floor() as usize;
+        (row, col, fx.fract() > 0.5)
+    }
+
+    /// Cell (column, row) for the reports, inside the grid.
+    fn report_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
+        let (row, col, _) = self.cell_at(pos);
+        (
+            col.min(self.model.cols().saturating_sub(1) as usize),
+            row.min(self.model.rows().saturating_sub(1) as usize),
+        )
+    }
+
+    /// Do mouse events go to the program? Only if it asked for them, Shift is
+    /// not held (it forces local selection) and the history is not being
+    /// looked at.
+    fn mouse_reporting(&self, modifiers: &Modifiers) -> bool {
+        !modifiers.shift
+            && mouse::reporting(self.model.mode())
+            && self.model.display_offset() == 0
+            && self.can_write
+            && matches!(self.state, TermState::Running)
+    }
+
+    /// Sends a mouse report if the current mode allows it.
+    fn report_mouse(
+        &mut self,
+        button: mouse::Button,
+        action: mouse::Action,
+        pos: Point<Pixels>,
+        modifiers: &Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (col, row) = self.report_cell(pos);
+        let report = mouse::Report {
+            button,
+            action,
+            col,
+            row,
+            mods: mouse::Mods {
+                shift: modifiers.shift,
+                alt: modifiers.alt,
+                ctrl: modifiers.control,
+            },
+        };
+        match mouse::encode(&report, self.model.mode()) {
+            Some(bytes) => {
+                self.mouse_cell = Some((col, row));
+                self.write(bytes, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        let button = match ev.button {
+            MouseButton::Left => mouse::Button::Left,
+            MouseButton::Middle => mouse::Button::Middle,
+            MouseButton::Right => mouse::Button::Right,
+            MouseButton::Navigate(_) => return,
+        };
+        // Ctrl+click (⌘+click on Mac) always opens the link, also in
+        // programs that use the mouse (htop, vim...).
+        if ev.button == MouseButton::Left && (ev.modifiers.platform || ev.modifiers.control) {
+            let (row, col, _) = self.cell_at(ev.position);
+            if let Some(url) = self.model.link_at(row, col) {
+                cx.open_url(&url);
+                return;
+            }
+        }
+        if self.mouse_reporting(&ev.modifiers) {
+            if self.report_mouse(button, mouse::Action::Press, ev.position, &ev.modifiers, cx) {
+                self.mouse_held = Some((ev.button, button));
+                if self.model.has_selection() {
+                    self.model.clear_selection();
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        match ev.button {
+            MouseButton::Left => {
+                let (row, col, right) = self.cell_at(ev.position);
+                self.model.start_selection(row, col, right, ev.click_count);
+                self.selecting = true;
+                self.press_cell = (ev.click_count == 1).then_some((row, col));
+                cx.notify();
+            }
+            MouseButton::Middle => self.paste(cx),
+            _ => {}
+        }
+    }
+
+    /// Mouse motion anywhere in the window (registered by the element):
+    /// `hovered` says whether it is over the terminal.
+    pub(crate) fn mouse_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, button)) = self.mouse_held {
+            // Drag reported to the program (modes 1002 and 1003).
+            if self.mouse_cell != Some(self.report_cell(ev.position)) {
+                self.report_mouse(
+                    button,
+                    mouse::Action::Motion,
+                    ev.position,
+                    &ev.modifiers,
+                    cx,
+                );
+            }
+            return;
+        }
+        if self.selecting {
+            if ev.pressed_button == Some(MouseButton::Left) {
+                let (row, col, right) = self.cell_at(ev.position);
+                if self.press_cell != Some((row, col)) {
+                    // It is a drag now: selection, not a click.
+                    self.press_cell = None;
+                }
+                self.model.update_selection(row, col, right);
+                cx.notify();
+            }
+            return;
+        }
+        // Link under the mouse: hand cursor.
+        let link = if hovered {
+            let (row, col, _) = self.cell_at(ev.position);
+            self.model.link_at(row, col)
+        } else {
+            None
+        };
+        if link != self.hover_link {
+            self.hover_link = link;
+            cx.notify();
+        }
+        // Motion without a button (mode 1003).
+        if hovered
+            && ev.pressed_button.is_none()
+            && self.mouse_reporting(&ev.modifiers)
+            && self.mouse_cell != Some(self.report_cell(ev.position))
+        {
+            self.report_mouse(
+                mouse::Button::None,
+                mouse::Action::Motion,
+                ev.position,
+                &ev.modifiers,
+                cx,
+            );
+        }
+    }
+
+    /// Button released anywhere in the window (registered by the element).
+    pub(crate) fn mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
+        if let Some((held, button)) = self.mouse_held
+            && held == ev.button
+        {
+            self.mouse_held = None;
+            self.report_mouse(
+                button,
+                mouse::Action::Release,
+                ev.position,
+                &ev.modifiers,
+                cx,
+            );
+            return;
+        }
+        if self.selecting && ev.button == MouseButton::Left {
+            self.selecting = false;
+            // Click without drag on a link: it is opened.
+            if let Some((row, col)) = self.press_cell.take()
+                && self.cell_at(ev.position).0 == row
+                && self.cell_at(ev.position).1 == col
+                && let Some(url) = self.model.link_at(row, col)
+            {
+                self.model.clear_selection();
+                cx.open_url(&url);
+                cx.notify();
+                return;
+            }
+            if !self.model.has_selection() {
+                self.model.clear_selection();
+            }
+            cx.notify();
+        }
+    }
+
+    fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let delta = ev.delta.pixel_delta(self.line_height);
+        let lines = delta.y / self.line_height + self.scroll_rest;
+        let whole = lines.trunc();
+        self.scroll_rest = lines - whole;
+        let n = whole as i32;
+        if n == 0 {
+            return;
+        }
+        let mode = self.model.mode();
+        if self.mouse_reporting(&ev.modifiers) {
+            // Wheel for the program: one report per line.
+            let button = if n > 0 {
+                mouse::Button::WheelUp
+            } else {
+                mouse::Button::WheelDown
+            };
+            for _ in 0..n.unsigned_abs() {
+                self.report_mouse(button, mouse::Action::Press, ev.position, &ev.modifiers, cx);
+            }
+        } else if !ev.modifiers.shift
+            && mode.contains(TermMode::ALT_SCREEN)
+            && mode.contains(TermMode::ALTERNATE_SCROLL)
+        {
+            // Full screen without mouse (less, man...): arrows, like xterm.
+            let seq: &[u8] = if n > 0 { b"\x1bOA" } else { b"\x1bOB" };
+            let bytes: Vec<u8> = std::iter::repeat_n(seq, n.unsigned_abs() as usize)
+                .flatten()
+                .copied()
+                .collect();
+            self.write(bytes, cx);
+        } else {
+            self.model.scroll(n);
+            cx.notify();
+        }
+    }
+
+    // ----- Sharing -----
+
+    fn stop_relay(&mut self, cx: &mut Context<Self>) {
+        self.copilot_shared = false;
+        if let Some((_, closed)) = self.local_feed.take() {
+            let _ = closed.send(true);
+        }
+        if let Some(relay) = self.relay.take() {
+            if !matches!(self.kind, TermKind::Server { .. }) {
+                self.share_session = None;
+            }
+            runtime::handle(cx).spawn(async move {
+                if let Some(r) = relay.lock().await.take() {
+                    r.stop().await;
+                }
+            });
+        }
+    }
+
+    /// Shares the terminal through the server.
+    pub fn share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(api) = self.app.read(cx).api.clone() else {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.share.not_signed_in"),
+            );
+            return;
+        };
+        if self.share_session.is_some() {
+            self.open_share_dialog(window, cx);
+            return;
+        }
+        let Some(term) = self.local.clone() else {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.share.not_connected"),
+            );
+            return;
+        };
+        let title = self.label(cx);
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                RelayShare::start(&api, term, &title)
+                    .await
+                    .map_err(api_error)
+            },
+            |this, res, window, cx| match res {
+                Ok(share) => {
+                    this.share_session = Some(share.session_id);
+                    this.relay = Some(Arc::new(tokio::sync::Mutex::new(Some(share))));
+                    cx.notify();
+                    this.open_share_dialog(window, cx);
+                }
+                Err(e) => ui::error(window, cx, t!("terminal.share.failed", error = e)),
+            },
+        );
+    }
+
+    fn open_share_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.share_session else {
+            return;
+        };
+        let weak = cx.entity().downgrade();
+        let is_relay = self.relay.is_some();
+        crate::views::share::open(
+            self.app.clone(),
+            session_id,
+            Some(weak),
+            is_relay,
+            window,
+            cx,
+        );
+    }
+
+    /// For the copilot: shares the terminal with the server (only for you) so
+    /// the AI can read it and write to it. `None` if it is not needed (server
+    /// session or already shared) or not possible (not signed in or not
+    /// connected).
+    pub fn copilot_share(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl std::future::Future<Output = termoak_client::Result<RelayShare>> + use<>> {
+        if self.share_session.is_some() || matches!(self.kind, TermKind::Server { .. }) {
+            return None;
+        }
+        if !matches!(self.state, TermState::Running) {
+            return None;
+        }
+        let api = self.app.read(cx).api.clone()?;
+        let title = t!("terminal.copilot_session_title", host = self.label(cx)).to_string();
+        let source = match &self.kind {
+            TermKind::Local { .. } => Err(self.local.clone()?),
+            _ => {
+                // Shell or serial: the output is copied here when painted
+                // (starting with what is already on screen) and what comes
+                // from the server is typed into the terminal.
+                let backend = self.backend.clone()?;
+                let hub = Arc::new(OutputHub::new(256 * 1024));
+                hub.push(bytes::Bytes::from(
+                    self.model.screen_text().replace('\n', "\r\n") + "\r\n",
+                ));
+                let (input, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+                runtime::handle(cx).spawn(async move {
+                    while let Some(data) = input_rx.recv().await {
+                        backend.input(data);
+                    }
+                });
+                let (closed_tx, closed) = tokio::sync::watch::channel(false);
+                self.local_feed = Some((hub.clone(), closed_tx));
+                Ok(LocalTerm {
+                    hub,
+                    input,
+                    size: (self.model.cols(), self.model.rows()),
+                    closed,
+                })
+            }
+        };
+        Some(async move {
+            match source {
+                Err(term) => RelayShare::start(&api, term, &title).await,
+                Ok(local) => RelayShare::start_local(&api, local, &title).await,
+            }
+        })
+    }
+
+    /// The copilot has shared the terminal.
+    pub fn adopt_share(&mut self, share: RelayShare, cx: &mut Context<Self>) {
+        self.share_session = Some(share.session_id);
+        self.relay = Some(Arc::new(tokio::sync::Mutex::new(Some(share))));
+        self.copilot_shared = true;
+        cx.notify();
+    }
+
+    /// The copilot no longer needs it (it was closed or stopped): sharing
+    /// stops if the copilot shared it. What the user shared stays.
+    pub fn stop_copilot_share(&mut self, cx: &mut Context<Self>) {
+        if self.copilot_shared {
+            self.stop_relay(cx);
+            cx.notify();
+        }
+    }
+
+    /// Could not share for the copilot: left as it was.
+    pub fn forget_share(&mut self, cx: &mut Context<Self>) {
+        if self.relay.is_none() {
+            self.local_feed = None;
+        }
+        cx.notify();
+    }
+
+    /// Stops sharing the terminal (asked by the share dialog).
+    pub(crate) fn stop_sharing(&mut self, cx: &mut Context<Self>) {
+        self.stop_relay(cx);
+    }
+
+    // ----- AI -----
+
+    /// With "This computer" in Settings → AI, what the quick assistant runs
+    /// with here (the vault and the AI settings); `None` = the server.
+    fn ai_local(&self, cx: &App) -> Option<(termoak_core::Store, crate::local_ai::AiSettings)> {
+        let app = self.app.read(cx);
+        (app.ai_run_on() == crate::local_ai::RunOn::Local)
+            .then(|| (app.ws.store.clone(), app.settings.ai.clone()))
+    }
+
+    fn ai_context(&self, cx: &App) -> Value {
+        let os = match &self.kind {
+            TermKind::Local { host_id } => {
+                self.app.read(cx).host(*host_id).and_then(|h| h.os.clone())
+            }
+            TermKind::Server {
+                host_id: Some(h), ..
+            } => self.app.read(cx).host(*h).and_then(|h| h.os.clone()),
+            TermKind::Shell => Some(local_os()),
+            _ => None,
+        };
+        let screen = self.model.screen_text();
+        let tail: String = {
+            let chars: Vec<char> = screen.chars().collect();
+            chars[chars.len().saturating_sub(3000)..].iter().collect()
+        };
+        json!({"os": os, "screen": tail})
+    }
+
+    /// Explains the selection (or the visible screen) with the server AI.
+    pub fn ai_explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let local = self.ai_local(cx);
+        let api = self.app.read(cx).api.clone();
+        if local.is_none() && api.is_none() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.ai.not_signed_in"),
+            );
+            return;
+        }
+        let text = self
+            .model
+            .selection_text()
+            .unwrap_or_else(|| self.model.screen_text());
+        if text.trim().is_empty() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Info,
+                t!("terminal.ai.nothing_to_explain"),
+            );
+            return;
+        }
+        let text: String = {
+            let chars: Vec<char> = text.chars().collect();
+            chars[chars.len().saturating_sub(6000)..].iter().collect()
+        };
+        let context = self.ai_context(cx);
+        self.ai_busy = true;
+        cx.notify();
+        ui::notify(window, cx, ToastKind::Info, t!("terminal.ai.asking"));
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                match (local, api) {
+                    (Some((store, settings)), _) => {
+                        crate::local_ai::copilot::explain(&store, &settings, &text, context).await
+                    }
+                    (None, Some(api)) => api
+                        .post::<Value>(
+                            "/api/v1/ai/explain",
+                            &json!({"text": text, "context": context}),
+                        )
+                        .await
+                        .map_err(api_error),
+                    (None, None) => Err(t!("terminal.ai.not_signed_in").to_string()),
+                }
+            },
+            |this, res, window, cx| {
+                this.ai_busy = false;
+                cx.notify();
+                match res {
+                    Ok(v) => {
+                        let answer: SharedString = v["answer"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| t!("terminal.ai.no_answer").to_string())
+                            .into();
+                        let provider = v["provider"].as_str().unwrap_or("").to_string();
+                        window.open_dialog(cx, move |d, _, cx| {
+                            d.title(t!("terminal.ai.explanation_title"))
+                                .w(px(640.))
+                                .child(
+                                    v_flex()
+                                        .gap_2()
+                                        .max_h(px(460.))
+                                        .child(
+                                            TextView::markdown("ai-explain", answer.clone())
+                                                .selectable(true),
+                                        )
+                                        .when(!provider.is_empty(), |this| {
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(t!(
+                                                        "terminal.ai.provider",
+                                                        provider = provider
+                                                    )),
+                                            )
+                                        }),
+                                )
+                                .footer(
+                                    h_flex().w_full().justify_end().child(
+                                        Button::new("ai-close")
+                                            .label(t!("common.close"))
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    ),
+                                )
+                        });
+                    }
+                    Err(e) => ui::error(window, cx, t!("terminal.ai.failed", error = e)),
+                }
+            },
+        );
+    }
+
+    /// Asks the AI for a command and inserts it without running it.
+    pub fn ai_suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai_local(cx).is_none() && self.app.read(cx).api.is_none() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.ai.not_signed_in"),
+            );
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("terminal.ai.suggest_placeholder"))
+        });
+        ui::focus_later(&input, window, cx);
+        let weak = cx.entity().downgrade();
+        let input_ok = input.clone();
+        ui::open_form_dialog(
+            window,
+            cx,
+            t!("terminal.ai.which_command"),
+            t!("terminal.ai.suggest"),
+            520.,
+            move |_, cx| {
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("terminal.ai.suggest_hint")),
+                    )
+                    .child(Input::new(&input))
+                    .into_any_element()
+            },
+            move |window, cx| {
+                let request = input_ok.read(cx).value().trim().to_string();
+                if request.is_empty() {
+                    return false;
+                }
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |v, cx| v.request_suggestion(request, window, cx));
+                }
+                true
+            },
+        );
+    }
+
+    fn request_suggestion(&mut self, request: String, window: &mut Window, cx: &mut Context<Self>) {
+        let local = self.ai_local(cx);
+        let api = self.app.read(cx).api.clone();
+        if local.is_none() && api.is_none() {
+            return;
+        }
+        let context = self.ai_context(cx);
+        self.ai_busy = true;
+        cx.notify();
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                match (local, api) {
+                    (Some((store, settings)), _) => {
+                        crate::local_ai::copilot::suggest(&store, &settings, &request, context)
+                            .await
+                    }
+                    (None, Some(api)) => api
+                        .post::<Value>(
+                            "/api/v1/ai/suggest",
+                            &json!({"request": request, "context": context}),
+                        )
+                        .await
+                        .map_err(api_error),
+                    (None, None) => Err(t!("terminal.ai.not_signed_in").to_string()),
+                }
+            },
+            |this, res, window, cx| {
+                this.ai_busy = false;
+                cx.notify();
+                match res {
+                    Ok(v) => this.show_suggestion(v, window, cx),
+                    Err(e) => ui::error(window, cx, t!("terminal.ai.failed", error = e)),
+                }
+            },
+        );
+    }
+
+    fn show_suggestion(&mut self, v: Value, window: &mut Window, cx: &mut Context<Self>) {
+        let command: SharedString = v["command"].as_str().unwrap_or("").to_string().into();
+        if command.trim().is_empty() {
+            ui::notify(window, cx, ToastKind::Warning, t!("terminal.ai.no_command"));
+            return;
+        }
+        let explanation: SharedString = v["explanation"].as_str().unwrap_or("").to_string().into();
+        let risk = v["risk"].as_str().unwrap_or("read").to_string();
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |d, _, cx| {
+            let (risk_label, risk_color) = match risk.as_str() {
+                "dangerous" => (t!("terminal.ai.risk_dangerous"), cx.theme().danger),
+                "write" => (t!("terminal.ai.risk_write"), cx.theme().warning),
+                _ => (t!("terminal.ai.risk_read"), cx.theme().success),
+            };
+            let insert_cmd = command.clone();
+            let copy_cmd = command.clone();
+            let weak = weak.clone();
+            d.title(t!("terminal.ai.suggested_title"))
+                .w(px(600.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .p_3()
+                                .rounded(cx.theme().radius)
+                                .bg(cx.theme().muted)
+                                .font_family(ui::mono_family(cx))
+                                .text_sm()
+                                .child(command.clone()),
+                        )
+                        .child(h_flex().gap_2().child(ui::pill(risk_label, risk_color)))
+                        .when(!explanation.is_empty(), |this| {
+                            this.child(explanation.clone())
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(Button::new("sugg-copy").label(t!("common.copy")).on_click(
+                            move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_cmd.to_string(),
+                                ));
+                                window.close_dialog(cx);
+                            },
+                        ))
+                        .child(
+                            Button::new("sugg-insert")
+                                .primary()
+                                .label(t!("terminal.ai.insert"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    if let Some(view) = weak.upgrade() {
+                                        view.update(cx, |v, cx| {
+                                            v.insert_text(&insert_cmd, cx);
+                                            v.focus.focus(window, cx);
+                                        });
+                                    }
+                                }),
+                        ),
+                )
+        });
+    }
+
+    // ----- Painting -----
+
+    fn terminal_font(&self, cx: &App) -> (Font, Pixels) {
+        let settings = &self.app.read(cx).settings;
+        let family: SharedString = if settings.font_family.trim().is_empty() {
+            cx.theme().mono_font_family.clone()
+        } else {
+            settings.font_family.trim().to_string().into()
+        };
+        (
+            Font {
+                family,
+                features: FontFeatures::disable_ligatures(),
+                fallbacks: None,
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+            },
+            px(settings.font_size.clamp(8., 32.)),
+        )
+    }
+
+    fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (dot, status): (gpui::Hsla, String) = match &self.state {
+            TermState::Connecting(m) => (theme.warning, m.clone()),
+            TermState::Running => (theme.success, String::new()),
+            TermState::Closed(r) => (
+                theme.muted_foreground,
+                r.clone()
+                    .unwrap_or_else(|| t!("terminal.status.session_closed").to_string()),
+            ),
+            TermState::Failed(e) => (theme.danger, e.clone()),
+        };
+        let running = matches!(self.state, TermState::Running);
+        let ended = matches!(self.state, TermState::Closed(_) | TermState::Failed(_));
+        let logged_in = self.app.read(cx).logged_in();
+        // The quick assistant runs on the server or on this computer.
+        let ai_ready = logged_in || self.ai_local(cx).is_some();
+        let is_server = matches!(self.kind, TermKind::Server { .. });
+        let is_shell = matches!(self.kind, TermKind::Shell);
+        let local_host = match &self.kind {
+            TermKind::Local { host_id } => Some(*host_id),
+            _ => None,
+        };
+        let weak: WeakEntity<Self> = cx.entity().downgrade();
+        let (kind_label, kind_color) = match self.kind {
+            TermKind::Local { .. } => (t!("terminal.kind.local"), theme.primary),
+            TermKind::Server { .. } => (t!("terminal.kind.server"), theme.info),
+            TermKind::Shell => (t!("terminal.kind.shell"), theme.success),
+            TermKind::Serial { .. } => (t!("terminal.kind.serial"), theme.warning),
+        };
+
+        h_flex()
+            .h(px(34.))
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.tab_bar)
+            .child(div().size(px(8.)).rounded_full().bg(dot))
+            .child(div().text_sm().font_medium().child(self.label(cx)))
+            .child(ui::pill(kind_label, kind_color))
+            .when(
+                self.share_session.is_some() && self.relay.is_some(),
+                |this| this.child(ui::pill(t!("terminal.shared"), theme.success)),
+            )
+            .when(self.viewers > 1, |this| {
+                this.child(ui::pill(tn!("terminal.viewers", self.viewers), theme.info))
+            })
+            .when(!self.can_write && running && is_server, |this| {
+                this.child(ui::pill(t!("terminal.read_only"), theme.warning))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .whitespace_nowrap()
+                    .child(status),
+            )
+            .when(ended, |this| {
+                this.child(
+                    Button::new("reconnect")
+                        .small()
+                        .primary()
+                        .icon(ui::icon(IconName::RefreshCw))
+                        .label(if is_shell {
+                            t!("terminal.reopen")
+                        } else {
+                            t!("terminal.reconnect")
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.connect(window, cx);
+                        })),
+                )
+            })
+            .when_some(local_host, |this, host_id| {
+                let conn = self.local.as_ref().map(|t| t.connection().clone());
+                this.child(
+                    Button::new("sftp")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::FolderOpen))
+                        .label("SFTP")
+                        .tooltip(t!("terminal.open_sftp"))
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                            cx.emit(TerminalEvent::OpenSftp {
+                                host_id,
+                                conn: conn.clone(),
+                            });
+                        })),
+                )
+            })
+            .child(
+                Button::new("copy")
+                    .small()
+                    .ghost()
+                    .icon(ui::icon(IconName::Copy))
+                    .tooltip(t!("terminal.copy_selection"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.copy_selection(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("paste")
+                    .small()
+                    .ghost()
+                    .icon(ui::icon(IconName::ClipboardPaste))
+                    .tooltip(t!("terminal.paste"))
+                    .disabled(!running)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.paste(cx);
+                        this.focus.focus(window, cx);
+                    })),
+            )
+            .child({
+                let w1 = weak.clone();
+                let w2 = weak.clone();
+                Button::new("ai")
+                    .small()
+                    .ghost()
+                    .icon(ui::icon(IconName::Sparkles))
+                    .label(t!("terminal.ai.button"))
+                    .loading(self.ai_busy)
+                    .disabled(!ai_ready)
+                    .tooltip(if ai_ready {
+                        t!("terminal.ai.tooltip")
+                    } else {
+                        t!("terminal.ai.tooltip_signed_out")
+                    })
+                    .dropdown_menu(move |menu, _, _| {
+                        let w1 = w1.clone();
+                        let w2 = w2.clone();
+                        menu.item(
+                            PopupMenuItem::new(t!("terminal.ai.explain"))
+                                .icon(ui::icon(IconName::BookOpen))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(v) = w1.upgrade() {
+                                        v.update(cx, |v, cx| v.ai_explain(window, cx));
+                                    }
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(t!("terminal.ai.which_command"))
+                                .icon(ui::icon(IconName::Wand))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(v) = w2.upgrade() {
+                                        v.update(cx, |v, cx| v.ai_suggest(window, cx));
+                                    }
+                                }),
+                        )
+                    })
+            })
+            // Sharing goes through the SSH session (relay) or the server one;
+            // the local shell is not shared.
+            .when(!is_shell, |this| {
+                this.child(
+                    Button::new("share")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::Share2))
+                        .label(t!("terminal.share.button"))
+                        .disabled(!running || !logged_in)
+                        .tooltip(if logged_in {
+                            t!("terminal.share.tooltip")
+                        } else {
+                            t!("terminal.share.tooltip_signed_out")
+                        })
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.share(window, cx);
+                        })),
+                )
+            })
+            .when(is_server && running, |this| {
+                this.child(
+                    Button::new("close-server-session")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::CircleStop))
+                        .tooltip(t!("terminal.end_session.tooltip"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            let weak = cx.entity().downgrade();
+                            ui::confirm(
+                                window,
+                                cx,
+                                t!("terminal.end_session.title"),
+                                t!("terminal.end_session.message"),
+                                t!("terminal.end_session.confirm"),
+                                true,
+                                move |_, cx| {
+                                    if let Some(v) = weak.upgrade() {
+                                        v.update(cx, |v, _| {
+                                            if let Some(b) = &v.backend {
+                                                b.send(Cmd::CloseSession);
+                                            }
+                                        });
+                                    }
+                                },
+                            );
+                            let _ = this;
+                        })),
+                )
+            })
+    }
+
+    fn render_overlay(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let theme = cx.theme();
+        let failed_title = if matches!(self.kind, TermKind::Serial { .. }) {
+            t!("terminal.failed.serial")
+        } else if matches!(self.kind, TermKind::Shell) {
+            t!("terminal.failed.shell")
+        } else {
+            t!("terminal.failed.connect")
+        };
+        match &self.state {
+            TermState::Connecting(msg) => Some(
+                v_flex()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .child(Spinner::new().large())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(msg.clone()),
+                    )
+                    .into_any_element(),
+            ),
+            TermState::Failed(e) => Some(
+                v_flex()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        ui::card(cx)
+                            .p_6()
+                            .gap_3()
+                            .max_w(px(560.))
+                            .items_center()
+                            .child(
+                                ui::icon(IconName::TriangleAlert)
+                                    .size(px(32.))
+                                    .text_color(theme.danger),
+                            )
+                            .child(div().text_lg().font_semibold().child(failed_title))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_center()
+                                    .text_color(theme.muted_foreground)
+                                    .child(e.clone()),
+                            )
+                            .child(
+                                Button::new("retry")
+                                    .primary()
+                                    .icon(ui::icon(IconName::RefreshCw))
+                                    .label(t!("common.retry"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.connect(window, cx);
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = TermPalette::for_mode(cx.theme().is_dark());
+        let (font, font_size) = self.terminal_font(cx);
+        let _ = window;
+        let toolbar = self.render_toolbar(cx);
+        let overlay = self.render_overlay(cx);
+        let suggestions = self.render_suggestions(cx);
+        let entity = cx.entity();
+        v_flex()
+            .size_full()
+            .bg(palette.background)
+            .child(toolbar)
+            .child(
+                div()
+                    .id("terminal-area")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .key_context(CONTEXT)
+                    .track_focus(&self.focus)
+                    .cursor(if self.hover_link.is_some() {
+                        CursorStyle::PointingHand
+                    } else {
+                        CursorStyle::IBeam
+                    })
+                    .on_key_down(cx.listener(Self::on_key_down))
+                    .on_action(cx.listener(Self::on_send_text))
+                    .on_action(cx.listener(Self::on_copy))
+                    .on_action(cx.listener(Self::on_paste))
+                    .on_action(cx.listener(Self::on_select_all))
+                    .on_action(cx.listener(Self::on_page_up))
+                    .on_action(cx.listener(Self::on_page_down))
+                    .on_action(cx.listener(Self::on_bottom))
+                    // Motion and release are registered by the element for the whole window.
+                    .on_any_mouse_down(cx.listener(Self::mouse_down))
+                    .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                    .child(TerminalElement::new(
+                        entity,
+                        self.focus.clone(),
+                        font,
+                        font_size,
+                        palette,
+                    ))
+                    .children(suggestions)
+                    .children(overlay),
+            )
+    }
+}
+
+/// Platform text input: dead keys, compose sequences, AltGr and IME (Chinese,
+/// Japanese, Korean...). Committed text goes to the terminal; text being
+/// composed is painted underlined at the cursor until it is committed or
+/// cancelled.
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        // Only the composition text is known.
+        let units: Vec<u16> = self.ime_marked.as_deref()?.encode_utf16().collect();
+        let start = range.start.min(units.len());
+        let end = range.end.clamp(start, units.len());
+        *adjusted_range = Some(start..end);
+        Some(String::from_utf16_lossy(&units[start..end]))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // The IME "cursor" is at the end of the composition text.
+        let caret = self.ime_marked.as_deref().map_or(0, input::utf16_len);
+        Some(UTF16Selection {
+            range: caret..caret,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.ime_marked
+            .as_deref()
+            .map(|text| 0..input::utf16_len(text))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self.ime_marked.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_marked = None;
+        if !text.is_empty() {
+            self.commit_text(text, cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_marked = (!new_text.is_empty()).then(|| new_text.to_string());
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // Cursor cell, moved to the requested position inside the composition
+        // text: the IME candidate window appears there.
+        let (row, col) = self.model.cursor_cell()?;
+        let offset = self
+            .ime_marked
+            .as_deref()
+            .map_or(0, |text| input::cells_before(text, range_utf16.start));
+        Some(Bounds::new(
+            point(
+                self.origin.x + self.cell_width * (col + offset) as f32,
+                self.origin.y + self.line_height * row as f32,
+            ),
+            size(self.cell_width, self.line_height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+/// Operating system of this computer (context for the AI).
+fn local_os() -> String {
+    match std::env::consts::OS {
+        "linux" => "Linux".into(),
+        "macos" => "macOS".into(),
+        "windows" => "Windows".into(),
+        other => other.to_string(),
+    }
+}

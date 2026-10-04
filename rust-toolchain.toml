@@ -1,0 +1,5 @@
+# GPUI (gpui-pre 0.3.6) needs Rust 1.95 or later (`std::hint::cold_path`).
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt"]

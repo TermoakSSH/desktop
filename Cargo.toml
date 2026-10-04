@@ -1,0 +1,86 @@
+[package]
+name = "termoak-desktop"
+description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Oihalitz <oihalitz@ohz.es>"]
+repository = "https://github.com/TermoakSSH/desktop"
+license = "AGPL-3.0-only"
+publish = false
+
+# Own workspace: the crates of TermoakSSH/core come from git.
+[workspace]
+
+[[bin]]
+name = "termoak-desktop"
+path = "src/main.rs"
+
+[dependencies]
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+# AI engine: checks your own API keys from this computer (and, next, runs
+# the copilot and tasks locally).
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0", features = ["pty"] }
+
+gpui = { package = "gpui-pre", version = "=0.3.6" }
+gpui-component = "0.6.6"
+# Lucide icons used by the components.
+gpui-kit-assets = "0.6.6"
+alacritty_terminal = "0.26"
+# PTY I/O of the local terminal (the same one alacritty_terminal uses).
+polling = "3.8"
+
+tokio = { version = "1.53", features = ["full"] }
+futures = "0.3"
+tokio-util = "0.7"
+bytes = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Translations (`locales/<lang>.json`, see docs/I18N.md) and the system language.
+rust-i18n = "4"
+sys-locale = "0.3"
+anyhow = "1"
+# Local AI keys: sealed with the vault key and stored as text; wiped from memory.
+base64 = "0.22"
+zeroize = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+directories = "6"
+url = "2"
+semver = "1"
+# System roots plus the bundled ones (webpki): Windows does not ship some
+# recent ones (ISRG Root X2, Let's Encrypt's ECDSA root) and only downloads
+# them when its own TLS asks for them, not rustls.
+serialport = { version = "4.10", default-features = false }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+
+# Native GPUI platform (Metal on macOS, DirectX on Windows, Vulkan on Linux).
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+
+# Copy of gpui-pre-windows that uses precompiled shaders when building for
+# Windows from Linux or macOS (see vendor/gpui-pre-windows/README.md).
+[patch.crates-io]
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+[build-dependencies]
+# Icon of the Windows .exe (build.rs).
+embed-resource = "3"

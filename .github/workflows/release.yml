@@ -1,0 +1,133 @@
+name: Release
+
+# Publishes the desktop app with the version in Cargo.toml as the
+# desktop-vX.Y.Z release. Only runs by hand (Actions > Release > Run
+# workflow). The same from your machine, without Actions:
+# scripts/release-local.sh (docs/RELEASING.md); the last step here is that
+# same script, so releases come out identical.
+#
+# Repository configuration (Settings > Secrets and variables > Actions):
+# - Variable  TERMOAK_UPDATE_PUBKEY  public key, compiled into the app
+# - Secret    TERMOAK_UPDATE_SECRET  signing secret key
+# - Variable  TERMOAK_UPDATE_URL     optional: https://YOUR-SERVER/updates/latest.json
+#             (updates from your server instead of this repository's releases)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        run: echo "version=$(scripts/release-local.sh version desktop)" >> "$GITHUB_OUTPUT"
+      - name: That version is not published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: desktop-v${{ steps.version.outputs.version }}
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          if [ "$status" = 200 ]; then
+            echo "::error::Release $TAG already exists: bump the version with scripts/release-local.sh version desktop X.Y.Z"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Update keys
+        env:
+          TERMOAK_UPDATE_SECRET: ${{ secrets.TERMOAK_UPDATE_SECRET }}
+          TERMOAK_UPDATE_PUBKEY: ${{ vars.TERMOAK_UPDATE_PUBKEY }}
+        run: |
+          tag="$(sed -n 's/^termoak-core = {.*tag = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          cargo install -q --locked --git https://github.com/TermoakSSH/core --tag "$tag" termoak-update --bin termoak-release
+          termoak-release check-keys
+
+  desktop:
+    name: Desktop (${{ matrix.name }})
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-universal }
+          - { os: windows-latest, name: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      TERMOAK_UPDATE_PUBKEY: ${{ vars.TERMOAK_UPDATE_PUBKEY }}
+      TERMOAK_UPDATE_URL: ${{ vars.TERMOAK_UPDATE_URL }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Toolchain pinned by rust-toolchain.toml
+        shell: bash
+        run: |
+          rustup toolchain install
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libfontconfig-dev libfreetype-dev libvulkan-dev libasound2-dev librsvg2-bin libfuse2
+      - name: Build (Linux / Windows)
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked
+      - name: Build universal binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/termoak-desktop \
+            target/aarch64-apple-darwin/release/termoak-desktop target/x86_64-apple-darwin/release/termoak-desktop
+      - name: Package
+        shell: bash
+        run: scripts/package-desktop.sh "${{ matrix.name }}" "v$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}
+          path: dist/*
+          retention-days: 3
+
+  publish:
+    name: Publish
+    needs: [check, desktop]
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      COMMIT: ${{ github.sha }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: dist/desktop
+          merge-multiple: true
+      - run: echo "desktop-v$VERSION" > dist/desktop/.version
+      - name: Sign and publish
+        env:
+          TERMOAK_UPDATE_SECRET: ${{ secrets.TERMOAK_UPDATE_SECRET }}
+          TERMOAK_UPDATE_PUBKEY: ${{ vars.TERMOAK_UPDATE_PUBKEY }}
+        run: scripts/release-local.sh publish desktop
