@@ -1,5 +1,5 @@
 //! Resources of the Windows .exe: the icon (resource 1, the one GPUI loads)
-//! and the manifest, which declares per-monitor DPI awareness.
+//! and, with mingw, our manifest (per-monitor DPI, UTF-8, long paths).
 
 fn main() {
     println!("cargo:rerun-if-changed=resources/windows");
@@ -8,15 +8,10 @@ fn main() {
     }
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     let rc = if msvc {
-        // The MSVC linker generates its own manifest: give it ours.
-        let manifest = std::path::Path::new("resources/windows/app.manifest")
-            .canonicalize()
-            .expect("resources/windows/app.manifest is missing");
-        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!(
-            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
-            manifest.display()
-        );
+        // GPUI already embeds a manifest resource (per-monitor DPI, common
+        // controls); a second one from the MSVC linker makes the link fail
+        // with a duplicate resource, so the linker must not generate one.
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
         "resources/windows/app.rc"
     } else {
         "resources/windows/app-gnu.rc"
