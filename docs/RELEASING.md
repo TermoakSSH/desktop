@@ -59,15 +59,6 @@ scripts/release-local.sh publish desktop
   (see "Updates and downloads through the server" in the
   [server's deployment guide](https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md)).
 
-## With GitHub Actions
-
-Run the release workflow (`.github/workflows/release.yml`) by hand from the
-*Actions* tab. It needs the `TERMOAK_UPDATE_PUBKEY` variable and the
-`TERMOAK_UPDATE_SECRET` secret (and, optionally, the `TERMOAK_UPDATE_URL`
-variable). Its last step is `release-local.sh publish`, so releases come out
-the same. If a run built but did not publish, `download desktop <id>` puts its
-files in `dist/desktop/`; then run `publish` with `COMMIT=<commit of that run>`.
-
 ## Code signing
 
 Distributing on macOS without Gatekeeper warnings requires signing and
