@@ -1,6 +1,6 @@
 //! Settings: appearance, language, terminal (with autocomplete), account and
-//! sync with the server (with two-step verification and invitations) and
-//! updates. The AI has its own page (where it runs, API keys, AI credit).
+//! sync with the server (with two-step verification, invitations and the
+//! email verification code) and updates. The AI has its own page (where it runs, API keys, AI credit).
 
 use std::time::Duration;
 
@@ -23,7 +23,10 @@ use super::ai_settings::AiSettingsView;
 use super::two_factor::TwoFactorPanel;
 use crate::i18n;
 use crate::runtime;
-use crate::state::{AppModel, LoginError, LoginRequest, api_error};
+use crate::state::{
+    AppModel, LoginError, LoginOutcome, LoginRequest, PendingVerification, ToastKind, api_error,
+    clean_email_code,
+};
 use crate::theme;
 use crate::ui::{self, IconName};
 use crate::update::{self, UpdateModel, UpdateStatus};
@@ -60,6 +63,8 @@ pub struct SettingsView {
     totp: Entity<InputState>,
     /// Invitation code (optional) when creating the account.
     invite: Entity<InputState>,
+    /// Six-digit code from the verification email.
+    email_code: Entity<InputState>,
     font_family: Entity<InputState>,
     /// Interface language (`None` = the system language).
     language: ui::ChoiceState<Option<String>>,
@@ -67,7 +72,13 @@ pub struct SettingsView {
     register: bool,
     /// The account asked for the two-step verification code.
     totp_step: bool,
+    /// Verifying the email also asked for the two-step verification code.
+    verify_totp: bool,
     busy: bool,
+    /// Asking for another verification email.
+    resending: bool,
+    /// The "Resend in N s" countdown is ticking.
+    countdown: bool,
     invite_check: Option<InviteCheck>,
     _invite_task: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -165,6 +176,7 @@ impl SettingsView {
         let totp = cx.new(|cx| InputState::new(window, cx).placeholder("123456"));
         let invite =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("settings.placeholder.invite")));
+        let email_code = cx.new(|cx| InputState::new(window, cx).placeholder("123456"));
         let font_family = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t!("settings.placeholder.font_family"))
@@ -211,9 +223,33 @@ impl SettingsView {
             }),
             cx.subscribe_in(&totp, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
-                    this.login(window, cx);
+                    if this.model.read(cx).pending_verification.is_some() {
+                        this.verify_email(window, cx);
+                    } else {
+                        this.login(window, cx);
+                    }
                 }
             }),
+            // The email code keeps only its digits (pasted as "123 456" or
+            // "123-456") and is checked as soon as it is complete.
+            cx.subscribe_in(
+                &email_code,
+                window,
+                |this, input, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::Change => {
+                        let value = input.read(cx).value().to_string();
+                        let code = clean_email_code(&value);
+                        if code != value {
+                            input.update(cx, |i, cx| i.set_value(code.clone(), window, cx));
+                        }
+                        if code.len() == 6 && !this.verify_totp {
+                            this.verify_email(window, cx);
+                        }
+                    }
+                    InputEvent::PressEnter { .. } => this.verify_email(window, cx),
+                    _ => {}
+                },
+            ),
             // Another email or server: the previous code no longer applies.
             cx.subscribe_in(&email, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::Change = ev {
@@ -247,12 +283,16 @@ impl SettingsView {
             name,
             totp,
             invite,
+            email_code,
             font_family,
             language,
             two_factor,
             register: false,
             totp_step: false,
+            verify_totp: false,
             busy: false,
+            resending: false,
+            countdown: false,
             invite_check: None,
             _invite_task: None,
             _subs: subs,
@@ -489,7 +529,18 @@ impl SettingsView {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match res {
-                    Ok(()) => {
+                    Ok(LoginOutcome::VerifyEmail) => {
+                        // The password stays in case "Use a different email"
+                        // brings the form back.
+                        this.totp_step = false;
+                        this.verify_totp = false;
+                        for input in [&this.totp, &this.email_code] {
+                            input.update(cx, |i, cx| i.set_value("", window, cx));
+                        }
+                        ui::focus_later(&this.email_code, window, cx);
+                        this.start_countdown(cx);
+                    }
+                    Ok(LoginOutcome::SignedIn) => {
                         // After signing out, "Sign in" is offered again.
                         this.register = false;
                         this.totp_step = false;
@@ -528,6 +579,282 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    /// Checks the code from the verification email and signs in.
+    fn verify_email(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let code = clean_email_code(&self.email_code.read(cx).value());
+        if code.len() != 6 {
+            ui::error(window, cx, t!("settings.verify.missing_code"));
+            return;
+        }
+        let totp: String = self
+            .totp
+            .read(cx)
+            .value()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if self.verify_totp && totp.is_empty() {
+            ui::error(window, cx, t!("settings.login.missing_code"));
+            return;
+        }
+        let totp = self.verify_totp.then_some(totp);
+        self.busy = true;
+        cx.notify();
+        let task = self
+            .model
+            .update(cx, |m, cx| m.verify_email_code(code, totp, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match res {
+                    Ok(()) => {
+                        this.register = false;
+                        this.totp_step = false;
+                        this.verify_totp = false;
+                        for input in [&this.password, &this.totp, &this.invite, &this.email_code] {
+                            input.update(cx, |i, cx| i.set_value("", window, cx));
+                        }
+                        this.invite_check = None;
+                    }
+                    Err(LoginError::TotpRequired) => {
+                        this.verify_totp = true;
+                        ui::focus_later(&this.totp, window, cx);
+                        ui::notify(
+                            window,
+                            cx,
+                            ToastKind::Info,
+                            t!("settings.login.totp_required"),
+                        );
+                    }
+                    Err(LoginError::TotpInvalid) => {
+                        this.verify_totp = true;
+                        this.totp.update(cx, |i, cx| i.set_value("", window, cx));
+                        ui::focus_later(&this.totp, window, cx);
+                        ui::error(window, cx, t!("settings.login.totp_invalid"));
+                    }
+                    Err(LoginError::Failed(e)) => {
+                        this.email_code
+                            .update(cx, |i, cx| i.set_value("", window, cx));
+                        ui::focus_later(&this.email_code, window, cx);
+                        ui::error(window, cx, t!("settings.verify.failed", error = e));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Asks for another verification email.
+    fn resend_email_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.resending {
+            return;
+        }
+        let Some(email) = self
+            .model
+            .read(cx)
+            .pending_verification
+            .as_ref()
+            .map(|p| p.email.clone())
+        else {
+            return;
+        };
+        self.resending = true;
+        cx.notify();
+        let task = self.model.update(cx, |m, cx| m.resend_email_code(cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.resending = false;
+                match res {
+                    Ok(()) => {
+                        ui::notify(
+                            window,
+                            cx,
+                            ToastKind::Success,
+                            t!("settings.verify.resent", email = email),
+                        );
+                        ui::focus_later(&this.email_code, window, cx);
+                    }
+                    Err(e) => ui::error(window, cx, t!("settings.verify.resend_failed", error = e)),
+                }
+                this.start_countdown(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Back to the sign-in form to use another email.
+    fn use_another_email(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.verify_totp = false;
+        for input in [&self.totp, &self.email_code] {
+            input.update(cx, |i, cx| i.set_value("", window, cx));
+        }
+        self.model.update(cx, |m, cx| m.cancel_verification(cx));
+        ui::focus_later(&self.email, window, cx);
+        cx.notify();
+    }
+
+    /// Seconds left before "Resend" can be used again.
+    fn resend_wait(&self, cx: &Context<Self>) -> u64 {
+        self.model
+            .read(cx)
+            .pending_verification
+            .as_ref()
+            .map_or(0, PendingVerification::resend_wait)
+    }
+
+    /// Re-renders every half second while "Resend" is waiting.
+    fn start_countdown(&mut self, cx: &mut Context<Self>) {
+        if self.countdown || self.resend_wait(cx) == 0 {
+            return;
+        }
+        self.countdown = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let waiting = this.update(cx, |this, cx| {
+                    cx.notify();
+                    let waiting = this.resend_wait(cx) > 0;
+                    this.countdown = waiting;
+                    waiting
+                });
+                if !matches!(waiting, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Two-step verification code box (signing in or verifying the email).
+    fn render_totp_box(&self, cx: &Context<Self>) -> gpui::Div {
+        let theme = cx.theme();
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.primary)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        ui::icon(IconName::ShieldCheck)
+                            .size(px(16.))
+                            .text_color(theme.primary),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("settings.totp.title")),
+                    ),
+            )
+            .child(ui::field_with_hint(
+                t!("settings.totp.code"),
+                div().w(px(240.)).child(Input::new(&self.totp)),
+                t!("settings.totp.hint"),
+                cx,
+            ))
+    }
+
+    /// "Check your email": the code from the verification email, which
+    /// signs in.
+    fn render_verify_email(
+        &self,
+        pending: PendingVerification,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let wait = pending.resend_wait();
+        v_flex()
+            .gap_4()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        ui::icon(IconName::Mail)
+                            .size(px(16.))
+                            .text_color(theme.primary),
+                    )
+                    .child(div().font_semibold().child(t!("settings.verify.title"))),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(t!("settings.verify.sent", email = pending.email)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(pending.url.clone()),
+                    ),
+            )
+            .child(ui::field_with_hint(
+                t!("settings.verify.code"),
+                div().w(px(240.)).child(Input::new(&self.email_code)),
+                t!("settings.verify.hint"),
+                cx,
+            ))
+            .when(self.verify_totp, |this| {
+                this.child(self.render_totp_box(cx))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .flex_wrap()
+                    .child(
+                        Button::new("verify-email")
+                            .primary()
+                            .icon(ui::icon(IconName::ShieldCheck))
+                            .label(t!("settings.login.verify"))
+                            .loading(self.busy)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.verify_email(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("resend-code")
+                            .ghost()
+                            .icon(ui::icon(IconName::Send))
+                            .label(if wait > 0 {
+                                t!("settings.verify.resend_in", seconds = wait)
+                            } else {
+                                t!("settings.verify.resend")
+                            })
+                            .loading(self.resending)
+                            .disabled(wait > 0)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.resend_email_code(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("use-another-email")
+                            .ghost()
+                            .label(t!("settings.verify.another_email"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.use_another_email(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_card(
@@ -735,38 +1062,7 @@ impl SettingsView {
                         .children(invite_line),
                 )
             })
-            .when(totp_step, |this| {
-                this.child(
-                    v_flex()
-                        .gap_2()
-                        .p_3()
-                        .rounded(theme.radius)
-                        .border_1()
-                        .border_color(theme.primary)
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    ui::icon(IconName::ShieldCheck)
-                                        .size(px(16.))
-                                        .text_color(theme.primary),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_semibold()
-                                        .child(t!("settings.totp.title")),
-                                ),
-                        )
-                        .child(ui::field_with_hint(
-                            t!("settings.totp.code"),
-                            div().w(px(240.)).child(Input::new(&self.totp)),
-                            t!("settings.totp.hint"),
-                            cx,
-                        )),
-                )
-            })
+            .when(totp_step, |this| this.child(self.render_totp_box(cx)))
             .child(
                 h_flex()
                     .gap_2()
@@ -849,6 +1145,7 @@ impl SettingsView {
         let syncing = m.syncing;
         let last = m.last_sync.clone();
         let online = m.events_online;
+        let pending = m.pending_verification.clone();
         let theme = cx.theme();
         let card = self.render_card(t!("settings.account.title"), IconName::Cloud, cx);
         if logged_in {
@@ -944,6 +1241,8 @@ impl SettingsView {
                     ),
             )
             .child(self.two_factor.clone())
+        } else if let Some(pending) = pending {
+            card.child(self.render_verify_email(pending, cx))
         } else {
             card.child(self.render_login_form(cx))
         }
@@ -1074,6 +1373,8 @@ impl Render for SettingsView {
                 .child(header)
                 .child(div().flex_1().min_h_0().child(self.ai.clone()));
         }
+        // A pending verification may come from the background (sync).
+        self.start_countdown(cx);
         let account = self.render_account(cx);
         let appearance = self.render_appearance(cx);
         let updates = self.render_updates(cx);

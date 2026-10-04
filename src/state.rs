@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{Context, EventEmitter, Task};
@@ -26,6 +26,9 @@ use crate::runtime;
 
 const SETTINGS_KEY: &str = "desktop.settings";
 const SYNC_EVERY: Duration = Duration::from_secs(60);
+/// Wait before asking for another verification email when the server does
+/// not say (it allows one a minute).
+const RESEND_WAIT: Duration = Duration::from_secs(60);
 
 /// Desktop app preferences (stored in the local database).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +121,47 @@ pub enum LoginRequest {
         name: String,
         invite: Option<String>,
     },
+}
+
+/// How a successful sign-in ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    /// Signed in: sync has started.
+    SignedIn,
+    /// The server requires a verified email and this account has not
+    /// verified it: the code from the email is needed
+    /// ([`AppModel::pending_verification`]).
+    VerifyEmail,
+}
+
+/// An account that has to confirm its email with the six-digit code from the
+/// verification email before using the server (docs/API.md, "Email
+/// verification"). The restricted tokens of that sign-in are discarded:
+/// [`AppModel::verify_email_code`] signs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingVerification {
+    pub url: String,
+    pub email: String,
+    /// When "Resend" can be used again (`None`: now).
+    pub resend_at: Option<Instant>,
+}
+
+impl PendingVerification {
+    /// Whole seconds left before "Resend" can be used again.
+    pub fn resend_wait(&self) -> u64 {
+        self.resend_at
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+            .map_or(0, |left| {
+                left.as_secs() + u64::from(left.subsec_nanos() > 0)
+            })
+    }
+}
+
+/// Keeps only the digits of a verification code as typed or pasted
+/// ("123 456", "123-456"), at most six.
+pub fn clean_email_code(text: &str) -> String {
+    text.chars().filter(char::is_ascii_digit).take(6).collect()
 }
 
 /// Why signing in failed.
@@ -249,6 +293,20 @@ enum BgMsg {
     Synced(Result<SyncSummary, String>),
     Event(Value),
     EventsOnline(bool),
+    /// The server answered `email_not_verified`: the account has to confirm
+    /// its email before using the server.
+    EmailNotVerified,
+}
+
+/// Message for the result of a sync.
+fn synced(res: termoak_client::Result<(usize, usize)>) -> BgMsg {
+    match res {
+        Err(e) if e.is_email_not_verified() => BgMsg::EmailNotVerified,
+        res => BgMsg::Synced(
+            res.map(|(pushed, pulled)| SyncSummary::new(pushed, pulled))
+                .map_err(|e| e.to_string()),
+        ),
+    }
 }
 
 /// Data loaded from the local database.
@@ -272,6 +330,9 @@ pub struct AppModel {
     pub api: Option<ApiClient>,
     pub server_user: Option<String>,
     pub server_url: Option<String>,
+    /// Signed in (or registered) to an account that still has to confirm
+    /// its email: Settings → Account asks for the code.
+    pub pending_verification: Option<PendingVerification>,
     /// Signed-in account (`GET /api/v1/me`): id, name, whether it is a server
     /// administrator and whether it has two-step verification.
     pub me: Option<User>,
@@ -323,6 +384,7 @@ impl AppModel {
             api: None,
             server_user: None,
             server_url: None,
+            pending_verification: None,
             me: None,
             teams: Vec::new(),
             hosts: Vec::new(),
@@ -675,12 +737,8 @@ impl AppModel {
             let mut tick = tokio::time::interval(SYNC_EVERY);
             loop {
                 tick.tick().await;
-                let res = engine
-                    .sync_once()
-                    .await
-                    .map(|r| SyncSummary::new(r.pushed, r.pulled))
-                    .map_err(|e| e.to_string());
-                if tx.send(BgMsg::Synced(res)).is_err() {
+                let res = engine.sync_once().await.map(|r| (r.pushed, r.pulled));
+                if tx.send(synced(res)).is_err() {
                     break;
                 }
             }
@@ -723,12 +781,146 @@ impl AppModel {
                 self.events_online = online;
                 cx.notify();
             }
+            BgMsg::EmailNotVerified => self.email_not_verified(cx),
+        }
+    }
+
+    /// The server says that the signed-in account has not confirmed its
+    /// email (e.g. a session from before the server required it): the
+    /// session is left and Settings → Account asks for the code.
+    fn email_not_verified(&mut self, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+        let Some(email) = self
+            .server_user
+            .clone()
+            .or_else(|| self.me.as_ref().map(|u| u.email.clone()))
+        else {
+            return;
+        };
+        tracing::info!("the account has to confirm its email");
+        self.start_verification(api.base_url().to_string(), email, None, cx);
+        // The restricted tokens are useless: the code signs in again.
+        let ws = self.ws.clone();
+        runtime::run(cx, async move { ws.logout().await }, |_, res, _| {
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "could not discard the restricted session");
+            }
+        });
+        self.toast(ToastKind::Warning, t!("state.verify_email"), cx);
+        cx.emit(ModelEvent::SessionChanged);
+    }
+
+    /// Leaves the session (if any) and waits for the email verification
+    /// code of `email` on `url`.
+    fn start_verification(
+        &mut self,
+        url: String,
+        email: String,
+        resend_wait: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_background();
+        self.api = None;
+        self.me = None;
+        self.teams.clear();
+        self.syncing = false;
+        self.last_sync = None;
+        self.server_url = Some(url.clone());
+        self.server_user = Some(email.clone());
+        self.pending_verification = Some(PendingVerification {
+            url,
+            email,
+            resend_at: resend_wait.map(|wait| Instant::now() + wait),
+        });
+        cx.notify();
+    }
+
+    /// Verifies the email with the code from the verification email and
+    /// signs in (sync starts). If the account has two-step verification and
+    /// `totp` is missing, returns [`LoginError::TotpRequired`].
+    pub fn verify_email_code(
+        &mut self,
+        code: String,
+        totp: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), LoginError>> {
+        let Some(pending) = self.pending_verification.clone() else {
+            return Task::ready(Err(LoginError::Failed(
+                t!("error.not_logged_in").to_string(),
+            )));
+        };
+        let ws = self.ws.clone();
+        let code = clean_email_code(&code);
+        let (url, email) = (pending.url.clone(), pending.email.clone());
+        let fut = runtime::spawn(cx, async move {
+            let res = ws
+                .verify_code(&url, &email, &code, totp.as_deref())
+                .await
+                .map_err(LoginError::from);
+            Ok::<_, std::convert::Infallible>(res)
+        });
+        cx.spawn(async move |this, cx| {
+            let api = fut.await.map_err(LoginError::Failed)??;
+            let _ = this.update(cx, |m, cx| {
+                m.pending_verification = None;
+                m.signed_in(api, pending.email, cx);
+            });
+            Ok(())
+        })
+    }
+
+    /// Asks the server to email a new verification code. On success,
+    /// "Resend" waits as long as the server says.
+    pub fn resend_email_code(&mut self, cx: &mut Context<Self>) -> Task<Result<(), String>> {
+        let Some(pending) = self.pending_verification.clone() else {
+            return Task::ready(Err(t!("error.not_logged_in").to_string()));
+        };
+        let fut = runtime::spawn(cx, async move {
+            let api = ApiClient::new(&pending.url)?;
+            let res = api
+                .post_public::<Value>(
+                    "/api/v1/auth/resend-code",
+                    &serde_json::json!({ "email": pending.email }),
+                )
+                .await;
+            Ok::<_, ClientError>(res)
+        });
+        cx.spawn(async move |this, cx| {
+            let res = fut.await?;
+            let wait = match &res {
+                Ok(v) => v["resend_after"]
+                    .as_u64()
+                    .map_or(RESEND_WAIT, Duration::from_secs),
+                // Asked too often: the client does not get `retry_after`, so
+                // wait the usual minute before offering it again.
+                Err(e) if e.api_code() == Some("too_many_attempts") => RESEND_WAIT,
+                Err(_) => Duration::ZERO,
+            };
+            let _ = this.update(cx, |m, cx| {
+                if let Some(p) = m.pending_verification.as_mut() {
+                    p.resend_at = Some(Instant::now() + wait);
+                    cx.notify();
+                }
+            });
+            res.map(|_| ()).map_err(api_error)
+        })
+    }
+
+    /// Gives up the pending verification ("Use a different email"): back to
+    /// the sign-in form.
+    pub fn cancel_verification(&mut self, cx: &mut Context<Self>) {
+        if self.pending_verification.take().is_some() {
+            cx.notify();
         }
     }
 
     /// Signs in or creates the account. If the account has two-step
     /// verification and the code is missing, returns
-    /// [`LoginError::TotpRequired`].
+    /// [`LoginError::TotpRequired`]. If the server requires a verified email
+    /// that the account has not confirmed yet, returns
+    /// [`LoginOutcome::VerifyEmail`] without signing in.
     pub fn login(
         &mut self,
         url: String,
@@ -736,9 +928,10 @@ impl AppModel {
         password: String,
         request: LoginRequest,
         cx: &mut Context<Self>,
-    ) -> Task<Result<(), LoginError>> {
+    ) -> Task<Result<LoginOutcome, LoginError>> {
         let ws = self.ws.clone();
         let email_task = email.clone();
+        let registering = matches!(request, LoginRequest::Register { .. });
         let fut = runtime::spawn(cx, async move {
             let email = email_task;
             let res = match request {
@@ -751,33 +944,66 @@ impl AppModel {
                         .await
                 }
             };
-            // The error keeps its type (to know whether the code is missing).
-            Ok::<_, std::convert::Infallible>(res.map_err(LoginError::from))
+            let api = match res {
+                Ok(api) => api,
+                // The error keeps its type (to know whether the code is missing).
+                Err(e) => return Ok(Err(LoginError::from(e))),
+            };
+            // Until the email is confirmed the tokens only reach the account
+            // itself: drop them and sign in with the code instead.
+            let verify = match api.verification_required().await {
+                Ok(verify) => verify,
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not check the email verification");
+                    false
+                }
+            };
+            if verify && let Err(e) = ws.logout().await {
+                tracing::warn!(error = %e, "could not discard the restricted session");
+            }
+            Ok::<_, std::convert::Infallible>(Ok((api, verify)))
         });
         cx.spawn(async move |this, cx| {
-            let api = fut.await.map_err(LoginError::Failed)??;
+            let (api, verify) = fut.await.map_err(LoginError::Failed)??;
             let _ = this.update(cx, |m, cx| {
-                m.server_user = Some(email.clone());
-                m.set_api(api, cx);
-                // Periodic sync starts right away with `set_api`.
-                m.toast(
-                    ToastKind::Success,
-                    t!("state.signed_in", email = email).to_string(),
-                    cx,
-                );
-                // A language picked explicitly goes to the account (emails).
-                if m.settings.language.is_some() {
-                    m.sync_locale(cx);
+                if verify {
+                    // Creating the account sent the first code just now.
+                    let wait = registering.then_some(RESEND_WAIT);
+                    m.start_verification(api.base_url().to_string(), email, wait, cx);
+                } else {
+                    m.pending_verification = None;
+                    m.signed_in(api, email, cx);
                 }
             });
-            Ok(())
+            Ok(if verify {
+                LoginOutcome::VerifyEmail
+            } else {
+                LoginOutcome::SignedIn
+            })
         })
+    }
+
+    /// Starts the session with the server (and its sync) after signing in.
+    fn signed_in(&mut self, api: ApiClient, email: String, cx: &mut Context<Self>) {
+        self.server_user = Some(email.clone());
+        self.set_api(api, cx);
+        // Periodic sync starts right away with `set_api`.
+        self.toast(
+            ToastKind::Success,
+            t!("state.signed_in", email = email).to_string(),
+            cx,
+        );
+        // A language picked explicitly goes to the account (emails).
+        if self.settings.language.is_some() {
+            self.sync_locale(cx);
+        }
     }
 
     /// Signs out of the server (local data is kept).
     pub fn logout(&mut self, cx: &mut Context<Self>) {
         self.stop_background();
         self.api = None;
+        self.pending_verification = None;
         self.me = None;
         self.teams.clear();
         self.last_sync = None;
@@ -808,12 +1034,8 @@ impl AppModel {
         let engine = SyncEngine::new(self.ws.store.clone(), api);
         let tx = self.bg_tx.clone();
         runtime::handle(cx).spawn(async move {
-            let res = engine
-                .sync_once()
-                .await
-                .map(|r| SyncSummary::new(r.pushed, r.pulled))
-                .map_err(|e| e.to_string());
-            let _ = tx.send(BgMsg::Synced(res));
+            let res = engine.sync_once().await.map(|r| (r.pushed, r.pulled));
+            let _ = tx.send(synced(res));
         });
     }
 
@@ -965,6 +1187,10 @@ async fn events_loop(api: ApiClient, tx: mpsc::UnboundedSender<BgMsg>) {
             }
             Err(e) => {
                 tracing::debug!(error = %e, "events WebSocket not available");
+                if e.is_email_not_verified() {
+                    let _ = tx.send(BgMsg::EmailNotVerified);
+                    return;
+                }
                 if matches!(
                     e,
                     termoak_client::ClientError::NotLoggedIn
@@ -985,6 +1211,29 @@ async fn events_loop(api: ApiClient, tx: mpsc::UnboundedSender<BgMsg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_codes_keep_only_six_digits() {
+        assert_eq!(clean_email_code("123456"), "123456");
+        assert_eq!(clean_email_code(" 123 456 "), "123456");
+        assert_eq!(clean_email_code("123-456"), "123456");
+        assert_eq!(clean_email_code("Code: 1234567"), "123456");
+        assert_eq!(clean_email_code("abc"), "");
+    }
+
+    #[test]
+    fn resend_countdown() {
+        let mut p = PendingVerification {
+            url: "https://termoak.com".into(),
+            email: "ana@example.com".into(),
+            resend_at: None,
+        };
+        assert_eq!(p.resend_wait(), 0);
+        p.resend_at = Some(Instant::now() + Duration::from_millis(59_500));
+        assert_eq!(p.resend_wait(), 60);
+        p.resend_at = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(p.resend_wait(), 0);
+    }
 
     #[test]
     fn old_settings_files_keep_loading() {

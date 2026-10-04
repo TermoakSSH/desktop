@@ -1,7 +1,7 @@
 [package]
 name = "termoak-desktop"
 description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.0", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
