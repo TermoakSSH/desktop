@@ -5,7 +5,9 @@
 //! 1. The update downloaded in the previous session (if any) is applied and
 //!    the app relaunches already updated, before opening any window.
 //! 2. The tokio runtime used by the SSH engine and the API is created.
-//! 3. The local vault is opened (its key is in the system keychain).
+//! 3. The local vault is opened. Its key is in the system keychain, read
+//!    once (see `vault_key`); if the keychain refuses and there is already
+//!    data, an error screen offers to try again instead of inventing a key.
 //! 4. The interface language is chosen and the window is opened.
 
 #![cfg_attr(
@@ -30,6 +32,7 @@ mod terminal;
 mod theme;
 mod ui;
 mod update;
+mod vault_key;
 mod views;
 
 use std::sync::Arc;
@@ -37,10 +40,11 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, WindowBounds, WindowOptions, div, px, size,
+    SharedString, Styled, Window, WindowBounds, WindowOptions, div, prelude::FluentBuilder, px,
+    size,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, Root, StyledExt, TitleBar, v_flex};
+use gpui_component::{ActiveTheme, Root, StyledExt, TitleBar, h_flex, v_flex};
 use termoak_client::Workspace;
 
 use crate::app::AppView;
@@ -105,7 +109,8 @@ fn main() {
                 }),
                 Err(error) => cx.open_window(options, move |window, cx| {
                     let view = cx.new(|_| StartupError {
-                        message: error.into(),
+                        message: error.message.into(),
+                        keychain: error.keychain,
                     });
                     cx.new(|cx| Root::new(view, window, cx))
                 }),
@@ -131,16 +136,24 @@ fn init_tracing() {
 /// Opens the local vault. Its key is in the system keychain and `keyring`
 /// must not be used from the main thread nor inside tokio: it runs in its
 /// own thread, with a time limit in case the keychain does not respond.
-fn open_workspace() -> Result<Workspace, String> {
+fn open_workspace() -> Result<Workspace, vault_key::OpenError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("termoak-vault".into())
         .spawn(move || {
-            let _ = tx.send(Workspace::open_default().map_err(|e| e.to_string()));
+            let _ = tx.send(vault_key::open_workspace());
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| vault_key::OpenError {
+            message: e.to_string(),
+            keychain: false,
+        })?;
     rx.recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| Err(t!("startup.keychain_timeout").to_string()))
+        .unwrap_or_else(|_| {
+            Err(vault_key::OpenError {
+                message: t!("startup.keychain_timeout").to_string(),
+                keychain: true,
+            })
+        })
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {
@@ -156,6 +169,8 @@ fn window_options(cx: &mut App) -> WindowOptions {
 /// Error screen when the local vault could not be opened.
 struct StartupError {
     message: SharedString,
+    /// The keychain refused or did not answer: say how to fix it.
+    keychain: bool,
 }
 
 impl Render for StartupError {
@@ -185,11 +200,31 @@ impl Render for StartupError {
                             .text_color(theme.muted_foreground)
                             .child(self.message.clone()),
                     )
+                    .when(self.keychain, |this| {
+                        this.child(
+                            div()
+                                .max_w(px(640.))
+                                .text_sm()
+                                .text_center()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("startup.keychain_hint")),
+                        )
+                    })
                     .child(
-                        Button::new("quit")
-                            .primary()
-                            .label(t!("startup.quit"))
-                            .on_click(|_: &ClickEvent, _, cx| cx.quit()),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("quit")
+                                    .label(t!("startup.quit"))
+                                    .on_click(|_: &ClickEvent, _, cx| cx.quit()),
+                            )
+                            .child(
+                                Button::new("retry")
+                                    .primary()
+                                    .label(t!("startup.retry"))
+                                    // A new process: the keychain is asked again.
+                                    .on_click(|_: &ClickEvent, _, cx| cx.restart()),
+                            ),
                     ),
             )
     }

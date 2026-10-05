@@ -8386,6 +8386,7 @@ dependencies = [
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
+ "keyring",
  "parking_lot",
  "polling",
  "rust-i18n",

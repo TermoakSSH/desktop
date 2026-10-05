@@ -3,6 +3,7 @@
 # Usage: scripts/package-desktop.sh <linux-x86_64|macos-universal|windows-x86_64> <tag>
 # The binary is taken from target/release, or from DESKTOP_BIN_DIR.
 # Output files go to dist/, or to DIST_DIR.
+# macOS: MACOS_SIGN_IDENTITY signs the .app with that identity (ad-hoc otherwise).
 set -euo pipefail
 
 platform="$1"
@@ -71,8 +72,18 @@ DESKTOP
 </dict>
 </plist>
 PLIST
-    # Ad-hoc signature (signing and notarizing require an Apple Developer account).
-    codesign --force --deep --sign - "$app" || true
+    # MACOS_SIGN_IDENTITY: a code signing identity of this Mac's keychain
+    # ("Developer ID Application: ..." or a self-signed certificate). With a
+    # stable identity, "Always Allow" on the keychain question survives
+    # updates; ad-hoc signatures change with every build (docs/RELEASING.md).
+    sign_identity="${MACOS_SIGN_IDENTITY:--}"
+    if [ "$sign_identity" = "-" ]; then
+      echo "warning: ad-hoc signature; macOS will ask again for the keychain after every update (set MACOS_SIGN_IDENTITY)" >&2
+      codesign --force --deep --sign - "$app" || true
+    else
+      codesign --force --deep --options runtime --sign "$sign_identity" "$app"
+      codesign --verify --strict --verbose=2 "$app"
+    fi
     tar czf "$dist/Termoak-macos-universal.app.tar.gz" -C "$work" Termoak.app
     hdiutil create -volname Termoak -srcfolder "$app" -ov -format UDZO "$dist/Termoak-$tag-macos-universal.dmg"
     ;;

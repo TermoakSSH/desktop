@@ -64,4 +64,40 @@ scripts/release-local.sh publish desktop
 Distributing on macOS without Gatekeeper warnings requires signing and
 notarizing with an Apple Developer account. On Windows, a code signing
 certificate avoids the SmartScreen warning. The packaging script
-(`scripts/package-desktop.sh`) is ready for both steps to be added.
+(`scripts/package-desktop.sh`) signs the macOS app with
+`MACOS_SIGN_IDENTITY` (see below); notarizing and Windows signing are not
+automated yet.
+
+### macOS: the keychain question after every update
+
+The app keeps the key of its local vault in the macOS Keychain and reads it
+once at every launch. macOS ties the "Always Allow" answer to the app's
+**code signature**. An ad-hoc signature (`codesign --sign -`, the default of
+`scripts/package-desktop.sh`) is a hash of that exact build, so after every
+update macOS sees a different app and asks again for access to the
+"Termoak" item. With a stable signing identity the designated requirement
+is the certificate, not the build, and "Always Allow" survives updates.
+
+Sign with an identity from the release Mac's keychain by exporting
+`MACOS_SIGN_IDENTITY` before building (the release script passes it on):
+
+```sh
+security find-identity -v -p codesigning     # list the identities
+MACOS_SIGN_IDENTITY="Developer ID Application: Ohz Digital SL (TEAMID)" \
+  scripts/release-local.sh build desktop macos
+```
+
+- A **Developer ID Application** certificate (Apple Developer account) is
+  the right one: it also allows notarizing, which removes the Gatekeeper
+  warning.
+- Without an account, a **self-signed code signing certificate** (Keychain
+  Access → Certificate Assistant → Create a Certificate…, type "Code
+  Signing") kept in the release Mac's keychain is enough for the keychain
+  question: always sign with the same certificate. Gatekeeper still warns
+  on first open, as with ad-hoc builds.
+- If the identity changes (new certificate), macOS asks once more. Users
+  who answered for an ad-hoc build are asked once after the first signed
+  update, and then no more.
+
+Without `MACOS_SIGN_IDENTITY` the script signs ad-hoc and prints a warning:
+those builds ask for the keychain once after every update.

@@ -32,6 +32,9 @@ gpui-kit-assets = "0.6.6"
 alacritty_terminal = "0.26"
 # PTY I/O of the local terminal (the same one alacritty_terminal uses).
 polling = "3.8"
+# Vault key in the system keychain, read by the app itself (src/vault_key.rs)
+# with the same item and features as termoak-client.
+keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "crypto-rust", "tokio"] }
 
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
