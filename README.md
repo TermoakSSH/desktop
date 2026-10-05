@@ -105,9 +105,12 @@ Source: https://github.com/TermoakSSH/desktop
   sessions**. Everyone joins read only and one person types at a time: each
   share says whether guests may ask for the keyboard, when it expires,
   whether you let people in yourself and whether the keyboard is handed over
-  without asking; shares can be changed live or revoked. The tab shows who
-  is in and who drives, with your requests to answer (also as a toast when
-  the tab is not in view), and lets you give, take back, kick or block.
+  without asking (and for how long at most); shares can be changed live or
+  revoked. The tab shows who is in and who drives, with your requests to
+  answer (also as a toast when the tab is not in view), and lets you give
+  the keyboard until you take it back or for 5 to 60 minutes (with a
+  countdown next to the driver), take it back, kick or block. **Activity**
+  in Server sessions shows who typed and when in a recorded session.
   Guests see a waiting room, ask for and give back the keyboard, and get a
   clear message when they are sent away. **Join with link** (or a
   `termoak://join` link opened from the browser) joins as a guest, no
@@ -286,7 +289,6 @@ src/
   app.rs             main window: tabs, split views, sidebar, sections and AI copilot
   panes.rs           split view logic: grid layout, pane navigation, broadcast routing
   menus.rs           menu bar (macOS) and ☰ menu (Windows/Linux), shortcuts list
-  vault_key.rs       vault key in the system keychain
   theme.rs           dark/light themes and terminal palettes
   runtime.rs         bridge between tokio and GPUI
   state.rs           model: data, server session, sync, port forwards

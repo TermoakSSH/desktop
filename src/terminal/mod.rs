@@ -701,7 +701,9 @@ impl TerminalView {
                     driver,
                     driver_name,
                     can_write,
-                } => self.on_control(driver, driver_name, Some(can_write), cx),
+                    until,
+                } => self.on_control(driver, driver_name, Some(can_write), until, cx),
+                Out::ControlExpired(participant) => self.on_control_expired(participant, cx),
                 Out::Participants { list, driver } => self.on_participants(list, driver, cx),
                 Out::Waiting { owner, title } => {
                     self.share.waiting = Some((owner, title));

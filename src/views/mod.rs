@@ -1,5 +1,6 @@
 //! Sections of the main window.
 
+pub mod activity;
 pub mod admin;
 pub mod ai;
 pub mod ai_chat;

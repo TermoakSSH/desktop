@@ -2,7 +2,8 @@
 //! share with one of your teams or create a link for guests without an
 //! account. Each share says how far guests can go (only watch, or ask for
 //! the keyboard), when it expires, whether you let people in yourself and
-//! whether the keyboard is handed over without asking. The shares in use
+//! whether the keyboard is handed over without asking (and for how long at
+//! most). The shares in use
 //! are listed below: they can be changed live or revoked, and "Stop
 //! sharing" revokes them all. It works for the terminals of this computer
 //! (relay) and for server sessions.
@@ -104,16 +105,19 @@ pub struct ShareDialog {
     /// follows the kind of share until then).
     approval_touched: bool,
     auto_grant: bool,
+    /// Limit of the automatic grants (minutes).
+    control_limit: ChoiceState<Option<u32>>,
     busy: bool,
     /// Link just created: web link and app link (shown only now).
     created: Option<(String, String)>,
     shares: Vec<ShareRow>,
     loading: bool,
     load_error: Option<String>,
-    /// Share being edited and its expiry dropdown (`None`: unchanged).
-    editing: Option<(Id, ChoiceState<Option<Expiry>>)>,
+    /// Share being edited, its expiry dropdown (`None`: unchanged) and the
+    /// limit of its automatic grants.
+    editing: Option<(Id, ChoiceState<Option<Expiry>>, ChoiceState<Option<u32>>)>,
     _subs: Vec<Subscription>,
-    _edit_sub: Option<Subscription>,
+    _edit_subs: Vec<Subscription>,
 }
 
 fn team_choices(model: &AppModel) -> Vec<Choice<Id>> {
@@ -133,6 +137,17 @@ fn expiry_choices() -> Vec<Choice<Expiry>> {
     Expiry::ALL
         .iter()
         .map(|e| Choice::new(e.label(), *e))
+        .collect()
+}
+
+/// Limits of the automatic grants (`None`: no limit).
+fn control_limit_choices() -> Vec<Choice<Option<u32>>> {
+    std::iter::once(Choice::new(t!("share.control_limit_none"), None))
+        .chain(
+            crate::sharing::CONTROL_MINUTES
+                .iter()
+                .map(|&m| Choice::new(tn!("share.control_limit_minutes", m), Some(m))),
+        )
         .collect()
 }
 
@@ -161,6 +176,7 @@ impl ShareDialog {
         let first = team_ids.first().copied();
         let team = ui::choice_state(choices, first.as_ref(), window, cx);
         let expiry = ui::choice_state(expiry_choices(), Some(&Expiry::Never), window, cx);
+        let control_limit = ui::choice_state(control_limit_choices(), Some(&None), window, cx);
         // The teams may have changed from another device.
         model.update(cx, |m, cx| m.refresh_teams(cx));
         let sub = cx.observe_in(&model, window, |this, model, window, cx| {
@@ -193,6 +209,7 @@ impl ShareDialog {
             require_approval: false,
             approval_touched: false,
             auto_grant: false,
+            control_limit,
             busy: false,
             created: None,
             shares: Vec::new(),
@@ -200,7 +217,7 @@ impl ShareDialog {
             load_error: None,
             editing: None,
             _subs: vec![sub],
-            _edit_sub: None,
+            _edit_subs: Vec::new(),
         };
         this.load(window, cx);
         this
@@ -231,11 +248,11 @@ impl ShareDialog {
                     Ok(v) => {
                         this.shares = ShareRow::active_list(&v);
                         this.load_error = None;
-                        if let Some((id, _)) = &this.editing
+                        if let Some((id, _, _)) = &this.editing
                             && !this.shares.iter().any(|s| s.id == *id)
                         {
                             this.editing = None;
-                            this._edit_sub = None;
+                            this._edit_subs.clear();
                         }
                     }
                     Err(e) => this.load_error = Some(e),
@@ -265,6 +282,7 @@ impl ShareDialog {
             expiry: ui::chosen(&self.expiry, cx).unwrap_or(Expiry::Never),
             require_approval: self.require_approval,
             auto_grant: self.auto_grant,
+            control_minutes: ui::chosen(&self.control_limit, cx).flatten(),
             ..ShareForm::new(target)
         }
     }
@@ -336,25 +354,42 @@ impl ShareDialog {
     }
 
     fn start_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editing.as_ref().is_some_and(|(e, _)| *e == id) {
+        if self.editing.as_ref().is_some_and(|(e, _, _)| *e == id) {
             self.editing = None;
-            self._edit_sub = None;
+            self._edit_subs.clear();
             cx.notify();
             return;
         }
         let mut choices = vec![Choice::new(t!("share.expiry.keep"), None)];
         choices.extend(Expiry::ALL.iter().map(|e| Choice::new(e.label(), Some(*e))));
         let state = ui::choice_state(choices, Some(&None), window, cx);
-        self._edit_sub = Some(cx.subscribe_in(
-            &state,
-            window,
-            move |this, _, ev: &SelectEvent<Vec<Choice<Option<Expiry>>>>, window, cx| {
-                if let SelectEvent::Confirm(Some(Some(e))) = ev {
-                    this.change(id, ShareChange::Expiry(*e), window, cx);
-                }
-            },
-        ));
-        self.editing = Some((id, state));
+        let current = self
+            .shares
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.control_minutes);
+        let limit = ui::choice_state(control_limit_choices(), Some(&current), window, cx);
+        self._edit_subs = vec![
+            cx.subscribe_in(
+                &state,
+                window,
+                move |this, _, ev: &SelectEvent<Vec<Choice<Option<Expiry>>>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(Some(e))) = ev {
+                        this.change(id, ShareChange::Expiry(*e), window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &limit,
+                window,
+                move |this, _, ev: &SelectEvent<Vec<Choice<Option<u32>>>>, window, cx| {
+                    if let SelectEvent::Confirm(Some(m)) = ev {
+                        this.change(id, ShareChange::ControlMinutes(*m), window, cx);
+                    }
+                },
+            ),
+        ];
+        self.editing = Some((id, state, limit));
         cx.notify();
     }
 
@@ -371,6 +406,7 @@ impl ShareDialog {
                 }
                 ShareChange::RequireApproval(r) => row.require_approval = r,
                 ShareChange::AutoGrant(a) => row.auto_grant = a,
+                ShareChange::ControlMinutes(m) => row.control_minutes = m,
                 ShareChange::Expiry(_) => {}
             }
         }
@@ -598,6 +634,9 @@ impl ShareDialog {
                         cx.notify();
                     })),
             )
+            .when(control && self.auto_grant, |this| {
+                this.child(control_limit_row(&self.control_limit, false, cx))
+            })
             .child(
                 h_flex().justify_end().child(
                     Button::new("share-create")
@@ -724,8 +763,8 @@ impl ShareDialog {
         let editing = self
             .editing
             .as_ref()
-            .filter(|(id, _)| *id == r.id)
-            .map(|(_, s)| s.clone());
+            .filter(|(id, _, _)| *id == r.id)
+            .map(|(_, s, l)| (s.clone(), l.clone()));
         let id = r.id;
         let row = r.clone();
         let mut facts = vec![
@@ -741,6 +780,9 @@ impl ShareDialog {
         }
         if r.auto_grant {
             facts.push(t!("share.row.auto_grant"));
+            if let Some(m) = r.control_minutes {
+                facts.push(tn!("share.row.control_minutes", m));
+            }
         }
         if r.participants > 0 {
             facts.push(tn!("share.row.inside", r.participants));
@@ -807,8 +849,9 @@ impl ShareDialog {
                             })),
                     ),
             )
-            .when_some(editing, |this, expiry| {
+            .when_some(editing, |this, (expiry, limit)| {
                 let control = r.control;
+                let auto_grant = r.auto_grant;
                 this.child(
                     v_flex()
                         .gap_2()
@@ -877,11 +920,35 @@ impl ShareDialog {
                                 .on_click(cx.listener(move |this, v: &bool, window, cx| {
                                     this.change(id, ShareChange::AutoGrant(*v), window, cx)
                                 })),
-                        ),
+                        )
+                        .when(control && auto_grant, |this| {
+                            this.child(control_limit_row(&limit, true, cx))
+                        }),
                 )
             })
             .into_any_element()
     }
+}
+
+/// "Limit automatic control to [N minutes]", under "Give control
+/// automatically".
+fn control_limit_row(state: &ChoiceState<Option<u32>>, compact: bool, cx: &App) -> gpui::Div {
+    h_flex()
+        .gap_2()
+        .items_center()
+        .pl(px(24.))
+        .child(
+            div()
+                .text_sm()
+                .when(compact, |d| d.text_xs())
+                .text_color(cx.theme().muted_foreground)
+                .child(t!("share.control_limit")),
+        )
+        .child(div().w(px(150.)).child(if compact {
+            Select::new(state).xsmall()
+        } else {
+            Select::new(state).small()
+        }))
 }
 
 impl Render for ShareDialog {

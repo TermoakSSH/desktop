@@ -43,7 +43,9 @@ pub enum ShareAction {
     RequestControl,
     /// Gives the keyboard back (or withdraws the request).
     ReleaseControl,
-    GrantControl(Id),
+    /// Hands the keyboard over for these minutes (`None`: until the owner
+    /// takes it back).
+    GrantControl(Id, Option<u32>),
     DenyControl(Id),
     TakeControl,
     AllowJoin(Id),
@@ -89,6 +91,8 @@ pub struct RemoteSeat {
     pub owner_name: Option<String>,
     pub participants: Vec<Participant>,
     pub driver: Option<Id>,
+    /// End of the driver's timed grant (ms).
+    pub until: Option<i64>,
 }
 
 /// Events for the view.
@@ -101,12 +105,16 @@ pub enum Out {
     Shell,
     /// Attached to a server session.
     Remote(RemoteSeat),
-    /// The keyboard changed hands (`driver`: `None` = the owner).
+    /// The keyboard changed hands (`driver`: `None` = the owner; `until`:
+    /// end of a timed grant, ms).
     Control {
         driver: Option<Id>,
         driver_name: Option<String>,
         can_write: bool,
+        until: Option<i64>,
     },
+    /// A timed grant ended (`participant`: who had the keyboard).
+    ControlExpired(Option<Id>),
     /// Who is in the session (and, for the owner, who waits).
     Participants {
         list: Vec<Participant>,
@@ -436,6 +444,7 @@ async fn run_server(
                                 owner_name: None,
                                 participants: Vec::new(),
                                 driver: None,
+                                until: None,
                             }));
                             announced = true;
                         }
@@ -458,8 +467,11 @@ async fn run_server(
                     RemoteEvent::Participants { participants, driver } => {
                         let _ = out.send(Out::Participants { list: participants, driver });
                     }
-                    RemoteEvent::Control { driver, driver_name, can_write } => {
-                        let _ = out.send(Out::Control { driver, driver_name, can_write });
+                    RemoteEvent::Control { driver, driver_name, can_write, until } => {
+                        let _ = out.send(Out::Control { driver, driver_name, can_write, until });
+                    }
+                    RemoteEvent::ControlExpired { participant } => {
+                        let _ = out.send(Out::ControlExpired(participant));
                     }
                     RemoteEvent::Waiting(v) => {
                         let _ = out.send(Out::Waiting {
@@ -525,6 +537,7 @@ fn seat_from_hello(session_id: Id, v: &Value, remote: &RemoteTerminal) -> Remote
             .map(str::to_string),
         participants: Participant::list_from_json(&session["participants"]),
         driver: remote.driver(),
+        until: remote.control_until(),
     }
 }
 
@@ -533,7 +546,7 @@ async fn share_action(remote: &RemoteTerminal, action: ShareAction) {
     match action {
         ShareAction::RequestControl => remote.request_control().await,
         ShareAction::ReleaseControl => remote.release_control().await,
-        ShareAction::GrantControl(p) => remote.grant_control(p).await,
+        ShareAction::GrantControl(p, minutes) => remote.grant_control(p, minutes).await,
         ShareAction::DenyControl(p) => remote.deny_control(p).await,
         ShareAction::TakeControl => remote.take_control().await,
         ShareAction::AllowJoin(p) => remote.allow_join(p).await,

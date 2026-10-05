@@ -1,7 +1,7 @@
 [package]
 name = "termoak-desktop"
 description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
-version = "0.3.0-next.1"
+version = "0.3.0-next.2"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.2" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.2" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.2" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.2" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.2", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
@@ -32,9 +32,6 @@ gpui-kit-assets = "0.6.6"
 alacritty_terminal = "0.26"
 # PTY I/O of the local terminal (the same one alacritty_terminal uses).
 polling = "3.8"
-# Vault key in the system keychain, read by the app itself (src/vault_key.rs)
-# with the same item and features as termoak-client.
-keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "crypto-rust", "tokio"] }
 
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"

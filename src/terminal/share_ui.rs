@@ -1,7 +1,8 @@
 //! Live sharing inside a terminal tab: who is in the session and who has
 //! the keyboard (participants button and popover), the banners to ask for
 //! the keyboard, give it back or take it back, the owner's requests to
-//! answer (letting people in, handing over the keyboard), the waiting room
+//! answer (letting people in, handing over the keyboard, for a while or
+//! until taken back), the time left of a timed hand-over, the waiting room
 //! and the screen shown when the server sends you away.
 //!
 //! The same view works for a server session (as owner or guest) and for a
@@ -9,12 +10,14 @@
 //! owner).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use gpui::{
     Anchor, AnyElement, App, ClickEvent, Context, Div, Hsla, IntoElement, ParentElement,
     SharedString, Styled, WeakEntity, div, hsla, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
@@ -71,6 +74,10 @@ pub(super) struct ShareState {
     /// Participant with the keyboard (`None`: the owner).
     pub driver: Option<Id>,
     pub driver_name: Option<String>,
+    /// End of the driver's timed grant (ms; `None`: not timed).
+    pub until: Option<i64>,
+    /// Repaints every second while a grant is timed (the countdown).
+    pub countdown: Option<gpui::Task<()>>,
     pub owner_name: Option<String>,
     /// In the waiting room: (owner, session title).
     pub waiting: Option<(String, String)>,
@@ -132,6 +139,23 @@ impl ShareState {
                     .map(|r| (RequestKind::Control, r)),
             )
             .collect()
+    }
+
+    /// Time left of the driver's timed grant: `12:34 left`.
+    pub fn time_left(&self) -> Option<String> {
+        let until = self.until?;
+        let left = sharing::time_left(until, termoak_core::time::now_ms());
+        Some(t!("share.time_left", time = left).to_string())
+    }
+
+    /// Name of a participant (for the owner's notices).
+    fn name_of(&self, id: Id) -> Option<String> {
+        let (inside, _) = self.rows();
+        inside
+            .into_iter()
+            .find(|r| r.id == id)
+            .map(|r| r.name)
+            .filter(|n| !n.is_empty())
     }
 
     /// Name of the owner, for guests.
@@ -197,7 +221,28 @@ impl TerminalView {
         self.share.owner_name = seat.owner_name;
         self.share.waiting = None;
         self.can_write = seat.can_write;
+        self.share.until = seat.until.filter(|_| seat.driver.is_some());
+        self.sync_countdown(cx);
         self.on_participants(seat.participants, seat.driver, cx);
+    }
+
+    /// Starts or stops the second-by-second repaint of the countdown.
+    fn sync_countdown(&mut self, cx: &mut Context<Self>) {
+        if self.share.until.is_none() {
+            self.share.countdown = None;
+            return;
+        }
+        if self.share.countdown.is_some() {
+            return;
+        }
+        self.share.countdown = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     /// New list of participants: tells the window which requests were
@@ -210,6 +255,10 @@ impl TerminalView {
     ) {
         self.share.participants = list;
         self.share.driver = driver;
+        if driver.is_none() {
+            self.share.until = None;
+            self.sync_countdown(cx);
+        }
         let pending: HashSet<(RequestKind, Id)> = self
             .share
             .pending()
@@ -246,11 +295,15 @@ impl TerminalView {
         driver: Option<Id>,
         driver_name: Option<String>,
         can_write: Option<bool>,
+        until: Option<i64>,
         cx: &mut Context<Self>,
     ) {
         let was_driver = self.share.is_driver();
+        let old_until = self.share.until;
         self.share.driver = driver;
         self.share.driver_name = driver_name.clone();
+        self.share.until = until.filter(|_| driver.is_some());
+        self.sync_countdown(cx);
         if let Some(w) = can_write {
             self.can_write = w;
         }
@@ -265,8 +318,17 @@ impl TerminalView {
         if self.share.owner || was_driver == is_driver {
             return;
         }
+        // The server takes a timed grant back by itself when the time is up
+        // (`control` first, then `control_expired`).
+        let time_up = driver.is_none()
+            && old_until.is_some_and(|u| termoak_core::time::now_ms() >= u - 5_000);
         let text = if is_driver {
-            t!("share.toast.you_drive")
+            match self.share.time_left() {
+                Some(left) => t!("share.toast.you_drive_timed", time = left),
+                None => t!("share.toast.you_drive"),
+            }
+        } else if time_up {
+            t!("share.toast.your_time_up")
         } else {
             match driver_name.filter(|n| !n.is_empty()) {
                 Some(name) if driver.is_some() => t!("share.toast.control_to", name = name),
@@ -279,6 +341,21 @@ impl TerminalView {
             you_drive: is_driver,
             text,
         });
+    }
+
+    /// A timed grant ended. The driver already heard it with the `control`
+    /// that came first; the owner is told here.
+    pub(super) fn on_control_expired(&mut self, participant: Option<Id>, cx: &mut Context<Self>) {
+        if !self.share.owner {
+            return;
+        }
+        let text = match participant.and_then(|p| self.share.name_of(p)) {
+            Some(name) => t!("share.toast.time_up", name = name),
+            None => t!("share.toast.time_up_someone"),
+        };
+        self.app
+            .update(cx, |m, cx| m.toast(ToastKind::Info, text.to_string(), cx));
+        cx.notify();
     }
 
     /// Someone waits or asks for the keyboard (owner).
@@ -361,7 +438,7 @@ impl TerminalView {
                 let guard = relay.lock().await;
                 let Some(r) = guard.as_ref() else { return };
                 match action {
-                    ShareAction::GrantControl(p) => r.grant_control(p).await,
+                    ShareAction::GrantControl(p, minutes) => r.grant_control(p, minutes).await,
                     ShareAction::DenyControl(p) => r.deny_control(p).await,
                     ShareAction::TakeControl => r.take_control().await,
                     ShareAction::AllowJoin(p) => r.allow_join(p).await,
@@ -389,7 +466,7 @@ impl TerminalView {
         let action = match (kind, yes) {
             (RequestKind::Join, true) => ShareAction::AllowJoin(participant),
             (RequestKind::Join, false) => ShareAction::DenyJoin(participant),
-            (RequestKind::Control, true) => ShareAction::GrantControl(participant),
+            (RequestKind::Control, true) => ShareAction::GrantControl(participant, None),
             (RequestKind::Control, false) => ShareAction::DenyControl(participant),
         };
         self.share_action(action, cx);
@@ -428,7 +505,9 @@ impl TerminalView {
             RelayEvent::Control {
                 driver,
                 driver_name,
-            } => self.on_control(driver, driver_name, None, cx),
+                until,
+            } => self.on_control(driver, driver_name, None, until, cx),
+            RelayEvent::ControlExpired { participant } => self.on_control_expired(participant, cx),
             RelayEvent::JoinRequest(p) => self.on_share_request(RequestKind::Join, p, cx),
             RelayEvent::ControlRequest(p) => self.on_share_request(RequestKind::Control, p, cx),
             // The terminal is here: its size is the window's.
@@ -448,6 +527,8 @@ impl TerminalView {
                 }
                 self.share.participants.clear();
                 self.share.driver = None;
+                self.share.until = None;
+                self.sync_countdown(cx);
                 self.share.relay_offline = false;
                 let done: Vec<_> = self.share.announced.drain().collect();
                 for (kind, participant) in done {
@@ -544,6 +625,7 @@ impl TerminalView {
                 .border_b_1()
                 .border_color(theme.border)
         };
+        let time_left = self.share.time_left();
         if self.share.owner {
             if let Some(d) = sharing::other_driver(&inside) {
                 rows.push(
@@ -558,6 +640,9 @@ impl TerminalView {
                                 .flex_1()
                                 .child(t!("share.banner.driving", name = d.name.clone())),
                         )
+                        .when_some(time_left.clone(), |this, left| {
+                            this.child(time_pill(left, theme.info))
+                        })
                         .child(
                             Button::new("take-control")
                                 .xsmall()
@@ -584,6 +669,7 @@ impl TerminalView {
                         t!("share.deny"),
                     ),
                 };
+                let weak = cx.entity().downgrade();
                 rows.push(
                     banner(theme.warning)
                         .child(avatar(&r, 18.))
@@ -597,6 +683,19 @@ impl TerminalView {
                                     this.answer_request(kind, id, true, cx)
                                 })),
                         )
+                        // Give the keyboard for a while.
+                        .when(kind == RequestKind::Control, |this| {
+                            this.child(
+                                Button::new(("request-yes-for", i))
+                                    .xsmall()
+                                    .primary()
+                                    .icon(ui::icon(IconName::ChevronDown))
+                                    .tooltip(t!("share.give_for"))
+                                    .dropdown_menu(move |menu, _, _| {
+                                        grant_menu(menu, weak.clone(), id)
+                                    }),
+                            )
+                        })
                         .child(
                             Button::new(("request-no", i))
                                 .xsmall()
@@ -630,6 +729,9 @@ impl TerminalView {
                             .flex_1()
                             .child(t!("share.banner.you_drive", owner = owner)),
                     )
+                    .when_some(time_left.clone(), |this, left| {
+                        this.child(time_pill(left, theme.success))
+                    })
                     .child(
                         Button::new("release-control")
                             .xsmall()
@@ -657,7 +759,10 @@ impl TerminalView {
                                 .items_center()
                                 .text_color(theme.info)
                                 .child(ui::icon(IconName::Keyboard).size(px(14.)))
-                                .child(t!("share.banner.driving", name = d.name.clone())),
+                                .child(t!("share.banner.driving", name = d.name.clone()))
+                                .when_some(time_left.clone(), |this, left| {
+                                    this.child(format!("· {left}"))
+                                }),
                         )
                     })
                     .when(can_ask && !requested, |this| {
@@ -809,10 +914,10 @@ fn participants_popover(weak: &WeakEntity<TerminalView>, cx: &mut App) -> AnyEle
     let Some(view) = weak.upgrade() else {
         return div().into_any_element();
     };
-    let (inside, waiting, owner) = {
+    let (inside, waiting, owner, time_left) = {
         let v = view.read(cx);
         let (inside, waiting) = v.share.rows();
-        (inside, waiting, v.share.owner)
+        (inside, waiting, v.share.owner, v.share.time_left())
     };
     let theme = cx.theme().clone();
     let action_button =
@@ -835,6 +940,12 @@ fn participants_popover(weak: &WeakEntity<TerminalView>, cx: &mut App) -> AnyEle
             details.push(tn!("share.participants.devices", r.devices).to_string());
         } else if r.devices == 0 && !waiting {
             details.push(t!("share.participants.reconnecting").to_string());
+        }
+        if r.is_driver
+            && r.role != Role::Owner
+            && let Some(left) = &time_left
+        {
+            details.push(left.clone());
         }
         let id = r.id;
         let name = if r.you {
@@ -920,8 +1031,40 @@ fn participants_popover(weak: &WeakEntity<TerminalView>, cx: &mut App) -> AnyEle
                             ("p-give", i),
                             t!("share.give_control"),
                             IconName::Keyboard,
-                            ShareAction::GrantControl(id),
+                            ShareAction::GrantControl(id, None),
                         ));
+                    }
+                    // Already driving: the same buttons change the time.
+                    if r.can_control {
+                        actions = actions.child(
+                            h_flex()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(t!("share.give_for_short")),
+                                )
+                                .children(sharing::CONTROL_MINUTES.iter().map(|&m| {
+                                    let weak = weak.clone();
+                                    Button::new(SharedString::from(format!("p-give-{i}-{m}")))
+                                        .xsmall()
+                                        .ghost()
+                                        .label(tn!("share.minutes_short", m))
+                                        .tooltip(tn!("share.give_control_minutes", m))
+                                        .on_click(move |_: &ClickEvent, _, cx| {
+                                            if let Some(v) = weak.upgrade() {
+                                                v.update(cx, |v, cx| {
+                                                    v.share_action(
+                                                        ShareAction::GrantControl(id, Some(m)),
+                                                        cx,
+                                                    )
+                                                });
+                                            }
+                                        })
+                                })),
+                        );
                     }
                     if r.requested_control && !r.is_driver {
                         actions = actions.child(action_button(
@@ -1024,4 +1167,36 @@ fn participants_popover(weak: &WeakEntity<TerminalView>, cx: &mut App) -> AnyEle
             )
         })
         .into_any_element()
+}
+
+/// Time left of a timed hand-over, next to the driver.
+fn time_pill(text: String, color: Hsla) -> Div {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .child(ui::icon(IconName::Timer).size(px(12.)))
+        .child(ui::pill(text, color))
+        .text_color(color)
+}
+
+/// Menu of the "Give" split button: until taken back, or for a while.
+fn grant_menu(
+    mut menu: gpui_component::menu::PopupMenu,
+    weak: WeakEntity<TerminalView>,
+    participant: Id,
+) -> gpui_component::menu::PopupMenu {
+    let choices = std::iter::once(None).chain(sharing::CONTROL_MINUTES.iter().map(|&m| Some(m)));
+    for minutes in choices {
+        let weak = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::new(sharing::control_for_label(minutes)).on_click(move |_, _, cx| {
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |v, cx| {
+                        v.share_action(ShareAction::GrantControl(participant, minutes), cx)
+                    });
+                }
+            }),
+        );
+    }
+    menu
 }

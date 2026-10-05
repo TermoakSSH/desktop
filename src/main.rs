@@ -6,8 +6,9 @@
 //!    the app relaunches already updated, before opening any window.
 //! 2. The tokio runtime used by the SSH engine and the API is created.
 //! 3. The local vault is opened. Its key is in the system keychain, read
-//!    once (see `vault_key`); if the keychain refuses and there is already
-//!    data, an error screen offers to try again instead of inventing a key.
+//!    once (`termoak_client::vault::load_or_create_key`); if the keychain
+//!    refuses and there is already data, an error screen offers to try
+//!    again instead of inventing a key.
 //! 4. The interface language is chosen and the window is opened.
 
 #![cfg_attr(
@@ -37,7 +38,6 @@ mod terminal;
 mod theme;
 mod ui;
 mod update;
-mod vault_key;
 mod views;
 
 use std::sync::Arc;
@@ -157,24 +157,64 @@ fn init_tracing() {
 /// Opens the local vault. Its key is in the system keychain and `keyring`
 /// must not be used from the main thread nor inside tokio: it runs in its
 /// own thread, with a time limit in case the keychain does not respond.
-fn open_workspace() -> Result<Workspace, vault_key::OpenError> {
+fn open_workspace() -> Result<Workspace, OpenError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("termoak-vault".into())
         .spawn(move || {
-            let _ = tx.send(vault_key::open_workspace());
+            let _ = tx.send(open_vault());
         })
-        .map_err(|e| vault_key::OpenError {
-            message: e.to_string(),
-            keychain: false,
-        })?;
+        .map_err(|e| OpenError::other(e.to_string()))?;
     rx.recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|_| {
-            Err(vault_key::OpenError {
+            Err(OpenError {
                 message: t!("startup.keychain_timeout").to_string(),
                 keychain: true,
             })
         })
+}
+
+/// Why the local vault could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenError {
+    message: String,
+    /// The system keychain refused or failed: allowing access and trying
+    /// again may fix it.
+    keychain: bool,
+}
+
+impl OpenError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            keychain: false,
+        }
+    }
+}
+
+impl From<termoak_client::ClientError> for OpenError {
+    fn from(e: termoak_client::ClientError) -> Self {
+        match e {
+            termoak_client::ClientError::KeychainUnavailable(error) => Self {
+                message: t!("startup.keychain_denied", error = error).to_string(),
+                keychain: true,
+            },
+            e => Self::other(e.to_string()),
+        }
+    }
+}
+
+/// Opens the user's workspace (data directory and database) with the vault
+/// key from `TERMOAK_VAULT_KEY` or the system keychain. The rules about the
+/// keychain (read once, never a new key when it refuses and there is data,
+/// the AceitunoakSSH item, `vault.key`) are the core's
+/// (`termoak_client::vault::load_key` with the system keychain).
+fn open_vault() -> Result<Workspace, OpenError> {
+    use termoak_client::vault;
+    let dir = vault::data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| OpenError::other(e.to_string()))?;
+    let key = vault::load_or_create_key(&dir)?;
+    Ok(Workspace::open(&dir, key)?)
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {

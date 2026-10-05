@@ -57,6 +57,35 @@ impl Expiry {
     }
 }
 
+/// Timed hand-overs of the keyboard offered by the app, in minutes (the
+/// server takes the keyboard back by itself when the time is up).
+pub const CONTROL_MINUTES: [u32; 4] = [5, 15, 30, 60];
+
+/// How long the keyboard is handed over, in words (`None`: until the owner
+/// takes it back).
+pub fn control_for_label(minutes: Option<u32>) -> SharedString {
+    match minutes {
+        None => t!("share.control_for.unlimited"),
+        Some(m) => tn!("share.control_for.minutes", m),
+    }
+}
+
+/// Time left of a timed grant that ends at `until` (ms), as `m:ss` or
+/// `h:mm:ss` (rounded up, never negative).
+pub fn time_left(until: i64, now: i64) -> String {
+    clock(((until - now).max(0) + 999) / 1000)
+}
+
+/// `m:ss` or `h:mm:ss`.
+fn clock(secs: i64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// Who a new share is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -79,6 +108,9 @@ pub struct ShareForm {
     pub require_approval: bool,
     /// Requests for the keyboard are granted without asking.
     pub auto_grant: bool,
+    /// Each automatic grant lasts at most this many minutes (`None`: until
+    /// the owner takes it back).
+    pub control_minutes: Option<u32>,
 }
 
 /// Why a share form cannot be sent.
@@ -126,6 +158,7 @@ impl ShareForm {
             control: false,
             expiry: Expiry::Never,
             auto_grant: false,
+            control_minutes: None,
         }
     }
 
@@ -147,6 +180,12 @@ impl ShareForm {
         body["require_approval"] = json!(self.require_approval);
         // Without the keyboard there is nothing to grant.
         body["auto_grant"] = json!(self.control && self.auto_grant);
+        if self.control
+            && self.auto_grant
+            && let Some(m) = self.control_minutes
+        {
+            body["control_minutes"] = json!(m);
+        }
         if let Some(m) = self.expiry.minutes() {
             body["expires_in_minutes"] = json!(m);
         }
@@ -166,6 +205,8 @@ pub enum ShareChange {
     Expiry(Expiry),
     RequireApproval(bool),
     AutoGrant(bool),
+    /// Limit of the automatic grants (`None`: no limit).
+    ControlMinutes(Option<u32>),
 }
 
 impl ShareChange {
@@ -184,6 +225,8 @@ impl ShareChange {
             },
             ShareChange::RequireApproval(r) => json!({"require_approval": r}),
             ShareChange::AutoGrant(a) => json!({"auto_grant": a}),
+            ShareChange::ControlMinutes(Some(m)) => json!({"control_minutes": m}),
+            ShareChange::ControlMinutes(None) => json!({"no_control_limit": true}),
         }
     }
 }
@@ -209,6 +252,8 @@ pub struct ShareRow {
     pub participants: usize,
     pub require_approval: bool,
     pub auto_grant: bool,
+    /// Limit of the automatic grants, in minutes.
+    pub control_minutes: Option<u32>,
     pub created_at: i64,
 }
 
@@ -242,6 +287,7 @@ impl ShareRow {
             participants: v["participants"].as_u64().unwrap_or(0) as usize,
             require_approval: v["require_approval"].as_bool().unwrap_or(false),
             auto_grant: v["auto_grant"].as_bool().unwrap_or(false),
+            control_minutes: v["control_minutes"].as_u64().map(|m| m as u32),
             created_at: v["created_at"].as_i64().unwrap_or(0),
         })
     }
@@ -614,6 +660,71 @@ pub fn owner_name(rows: &[ParticipantRow]) -> Option<&str> {
         .map(|r| r.name.as_str())
 }
 
+// ----- Who typed (recordings) -----
+
+/// A stretch of a recording in which one person typed (from `GET
+/// /sessions/{id}/recording/authors`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorPeriod {
+    pub name: String,
+    /// `owner`, `user`, `guest` or `ai`.
+    pub kind: String,
+    /// Seconds since the start of the recording.
+    pub from: f64,
+    /// Until the next person (`None`: the last one, until the end).
+    pub to: Option<f64>,
+}
+
+impl AuthorPeriod {
+    /// `00:12 – 05:30` (or `from 05:30` for the last one).
+    pub fn span(&self) -> String {
+        let from = clock(self.from.max(0.) as i64);
+        match self.to {
+            Some(to) => format!("{from} – {}", clock(to.max(0.) as i64)),
+            None => t!("server_sessions.activity.from", time = from).to_string(),
+        }
+    }
+
+    /// The kind of person, in words.
+    pub fn kind_label(&self) -> SharedString {
+        match self.kind.as_str() {
+            "owner" => t!("share.role.owner"),
+            "guest" => t!("share.role.guest"),
+            "ai" => t!("share.role.ai"),
+            _ => t!("share.role.user"),
+        }
+    }
+}
+
+/// When the recording started (ms) and who typed, in order. Marks in a row
+/// of the same person are one period.
+pub fn author_periods(v: &Value) -> (Option<i64>, Vec<AuthorPeriod>) {
+    let mut out: Vec<AuthorPeriod> = Vec::new();
+    let mut last = None;
+    for a in v["authors"].as_array().into_iter().flatten() {
+        let Some(time) = a["time"].as_f64() else {
+            continue;
+        };
+        let kind = a["kind"].as_str().unwrap_or("user").to_string();
+        let name = a["name"].as_str().unwrap_or("").trim().to_string();
+        let who = (a["participant"].as_str().map(str::to_string), name.clone());
+        if last.as_ref() == Some(&who) {
+            continue;
+        }
+        if let Some(prev) = out.last_mut() {
+            prev.to = Some(time);
+        }
+        out.push(AuthorPeriod {
+            name,
+            kind,
+            from: time,
+            to: None,
+        });
+        last = Some(who);
+    }
+    (v["started_at"].as_i64(), out)
+}
+
 // ----- Notices of the events WebSocket -----
 
 /// A notice about a shared session (`{"type":"session","notice":{…}}` of
@@ -855,6 +966,52 @@ mod tests {
             ShareForm::new(Target::Team(None)).body(),
             Err(FormError::NoTeam)
         );
+    }
+
+    #[test]
+    fn timed_control() {
+        let mut f = ShareForm::new(Target::Link);
+        f.control = true;
+        f.auto_grant = true;
+        f.control_minutes = Some(15);
+        assert_eq!(f.body().unwrap()["control_minutes"], 15);
+        // Only with automatic grants.
+        f.auto_grant = false;
+        assert!(f.body().unwrap().get("control_minutes").is_none());
+        assert_eq!(
+            ShareChange::ControlMinutes(Some(30)).body(),
+            json!({"control_minutes": 30})
+        );
+        assert_eq!(
+            ShareChange::ControlMinutes(None).body(),
+            json!({"no_control_limit": true})
+        );
+        assert_eq!(time_left(10_000, 0), "0:10");
+        assert_eq!(time_left(10_001, 0), "0:11");
+        assert_eq!(time_left(754_000, 0), "12:34");
+        assert_eq!(time_left(3_723_000, 0), "1:02:03");
+        assert_eq!(time_left(0, 5_000), "0:00");
+    }
+
+    #[test]
+    fn who_typed() {
+        let ana = termoak_core::new_id();
+        let v = json!({"started_at": 1_000, "authors": [
+            {"time": 0.5, "participant": ana, "name": "Owner", "kind": "owner"},
+            {"time": 12.0, "participant": termoak_core::new_id(), "name": "Zoe", "kind": "guest"},
+            {"time": 20.0, "name": "AI", "kind": "ai"},
+            {"time": 21.0, "name": "AI", "kind": "ai"},
+            {"time": 75.9, "participant": ana, "name": "Owner", "kind": "owner"},
+        ]});
+        let (start, periods) = author_periods(&v);
+        assert_eq!(start, Some(1_000));
+        assert_eq!(periods.len(), 4);
+        assert_eq!(periods[1].name, "Zoe");
+        assert_eq!(periods[1].to, Some(20.0));
+        assert_eq!(periods[1].span(), "0:12 – 0:20");
+        assert_eq!(periods[2].to, Some(75.9));
+        assert_eq!(periods[3].to, None);
+        assert_eq!(author_periods(&json!({})).1, Vec::new());
     }
 
     #[test]

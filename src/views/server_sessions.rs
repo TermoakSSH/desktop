@@ -1,6 +1,7 @@
 //! Server sessions: terminals that live on the Termoak server (they stay
 //! open even if you close the app) and sessions others have shared with
-//! you. From here you get back into them.
+//! you. From here you get back into them, share yours and see who typed in
+//! them (Activity).
 
 use gpui::{
     AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
@@ -445,6 +446,29 @@ impl ServerSessionsView {
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                     this.terminate(row.clone(), window, cx)
                                 })),
+                        )
+                    })
+                    // Who typed and when (from the recording).
+                    .when(r.access == "owner", |this| {
+                        let model = self.model.clone();
+                        let (session_id, title) = (r.id, r.title.clone());
+                        this.child(
+                            Button::new(("activity", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Activity))
+                                .tooltip(t!("server_sessions.activity.tooltip"))
+                                .on_click(move |_: &ClickEvent, window, cx| {
+                                    if let Some(api) = model.read(cx).api.clone() {
+                                        super::activity::open(
+                                            api,
+                                            session_id,
+                                            title.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
                         )
                     })
             }))
