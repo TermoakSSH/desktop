@@ -1,15 +1,22 @@
-//! Host editor (side panel): address, credentials, group, jumps, startup
-//! snippet, environment, keep-alive, tags, notes and "only on this device".
+//! Host editor (side panel, in the style of Termius): the address first and
+//! big, then the label, group, tags and color; the SSH credentials with a
+//! "Connect" button at the top; and a collapsible "Advanced" section with
+//! jumps, proxy, agent forwarding, keep-alive, startup snippet, environment,
+//! recording, terminal type and theme. Errors are shown under each field.
+//!
+//! Keyboard: Enter saves, Ctrl+Enter (⌘↩ on macOS) saves and connects and
+//! Escape closes the panel.
 
 use std::collections::BTreeMap;
 
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
 use gpui_component::switch::Switch;
@@ -19,6 +26,7 @@ use termoak_core::model::{Host, HostSettings, ProxyKind, ProxySettings, Record, 
 
 use super::OpenRequest;
 use crate::state::AppModel;
+use crate::theme;
 use crate::ui::{self, Choice, ChoiceState, IconName};
 
 pub enum EditorEvent {
@@ -26,9 +34,222 @@ pub enum EditorEvent {
     Open(OpenRequest),
 }
 
+/// Colors offered for a host (the same ones used for hosts without a color).
+const HOST_COLORS: [&str; 8] = [
+    "#4f7cff", "#30a46c", "#f5a524", "#e5484d", "#8e4ec6", "#0ea5e9", "#d6409f", "#12a594",
+];
+
+/// Form field that can show an error under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Field {
+    Address,
+    Port,
+    Keepalive,
+    Env,
+    ProxyAddress,
+    ProxyPort,
+}
+
+impl Field {
+    /// Is the field inside the "Advanced" section?
+    fn advanced(self) -> bool {
+        matches!(
+            self,
+            Field::Keepalive | Field::Env | Field::ProxyAddress | Field::ProxyPort
+        )
+    }
+}
+
+/// Why a field is not valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FieldError {
+    AddressMissing,
+    AddressSpaces,
+    Port,
+    Keepalive,
+    /// Line that is not `KEY=value`.
+    Env(String),
+    ProxyAddress,
+    ProxyPort,
+}
+
+impl FieldError {
+    pub(crate) fn field(&self) -> Field {
+        match self {
+            FieldError::AddressMissing | FieldError::AddressSpaces => Field::Address,
+            FieldError::Port => Field::Port,
+            FieldError::Keepalive => Field::Keepalive,
+            FieldError::Env(_) => Field::Env,
+            FieldError::ProxyAddress => Field::ProxyAddress,
+            FieldError::ProxyPort => Field::ProxyPort,
+        }
+    }
+
+    fn message(&self) -> SharedString {
+        match self {
+            FieldError::AddressMissing => t!("host_editor.error.address"),
+            FieldError::AddressSpaces => t!("host_editor.error.address_spaces"),
+            FieldError::Port => t!("host_editor.error.port"),
+            FieldError::Keepalive => t!("host_editor.error.keepalive"),
+            FieldError::Env(line) => t!("host_editor.error.env", line = line),
+            FieldError::ProxyAddress => t!("host_editor.error.proxy_address"),
+            FieldError::ProxyPort => t!("host_editor.error.proxy_port"),
+        }
+    }
+}
+
+/// Text of the form fields that need checking.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FormText<'a> {
+    pub label: &'a str,
+    pub address: &'a str,
+    pub port: &'a str,
+    pub keepalive: &'a str,
+    pub env: &'a str,
+    pub tags: &'a str,
+    /// Proxy address and port, if a proxy type is chosen.
+    pub proxy: Option<(&'a str, &'a str)>,
+}
+
+/// Checked values of the form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormValues {
+    pub label: String,
+    pub address: String,
+    pub port: Option<u16>,
+    pub keepalive: Option<u32>,
+    pub env: BTreeMap<String, String>,
+    pub tags: Vec<String>,
+    pub proxy: Option<(String, u16)>,
+}
+
+/// A TCP port (1-65535).
+fn parse_port(text: &str) -> Option<u16> {
+    text.trim().parse::<u16>().ok().filter(|p| *p > 0)
+}
+
+/// `KEY=value` lines (blank lines are ignored); the first wrong line on error.
+pub(crate) fn parse_env(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut env = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() && !k.trim().contains(char::is_whitespace) => {
+                env.insert(k.trim().to_string(), v.trim().to_string());
+            }
+            _ => return Err(line.to_string()),
+        }
+    }
+    Ok(env)
+}
+
+/// Comma-separated tags, without empty ones or repetitions.
+pub(crate) fn parse_tags(text: &str) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in text.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !tags.iter().any(|t| t == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    tags
+}
+
+/// Optional text: `None` when empty.
+fn optional(text: &str) -> Option<String> {
+    Some(text.trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Checks the form. Returns every error found, so all of them can be shown
+/// at once under their fields.
+pub(crate) fn parse_form(f: &FormText) -> Result<FormValues, Vec<FieldError>> {
+    let mut errors = Vec::new();
+    let address = f.address.trim().to_string();
+    if address.is_empty() {
+        errors.push(FieldError::AddressMissing);
+    } else if address.contains(char::is_whitespace) {
+        errors.push(FieldError::AddressSpaces);
+    }
+    // Without a label, the host is called by its address.
+    let label = optional(f.label).unwrap_or_else(|| address.clone());
+    let port = match f.port.trim() {
+        "" => None,
+        p => {
+            let parsed = parse_port(p);
+            if parsed.is_none() {
+                errors.push(FieldError::Port);
+            }
+            parsed
+        }
+    };
+    let keepalive = match f.keepalive.trim() {
+        "" => None,
+        k => match k.parse::<u32>() {
+            Ok(k) => Some(k),
+            Err(_) => {
+                errors.push(FieldError::Keepalive);
+                None
+            }
+        },
+    };
+    let env = parse_env(f.env).unwrap_or_else(|line| {
+        errors.push(FieldError::Env(line));
+        BTreeMap::new()
+    });
+    let proxy = match f.proxy {
+        None => None,
+        Some((host, port)) => {
+            let host = host.trim().to_string();
+            if host.is_empty() {
+                errors.push(FieldError::ProxyAddress);
+            }
+            let port = parse_port(port);
+            if port.is_none() {
+                errors.push(FieldError::ProxyPort);
+            }
+            port.filter(|_| !host.is_empty()).map(|p| (host, p))
+        }
+    };
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(FormValues {
+        label,
+        address,
+        port,
+        keepalive,
+        env,
+        tags: parse_tags(f.tags),
+        proxy,
+    })
+}
+
+/// Does the host use anything of the "Advanced" section? (Then it starts open.)
+pub(crate) fn has_advanced(s: &HostSettings) -> bool {
+    s.jump_host_ids.as_ref().is_some_and(|j| !j.is_empty())
+        || s.proxy.is_some()
+        || s.agent_forwarding == Some(true)
+        || s.keepalive_secs.is_some()
+        || s.startup_snippet_id.is_some()
+        || !s.env.is_empty()
+        || s.record_sessions == Some(true)
+        || s.term.as_deref().is_some_and(|t| !t.trim().is_empty())
+        || s.theme.is_some()
+}
+
+/// Same color, written in any case and with or without `#`.
+fn same_color(a: &str, b: &str) -> bool {
+    a.trim()
+        .trim_start_matches('#')
+        .eq_ignore_ascii_case(b.trim().trim_start_matches('#'))
+}
+
 pub struct HostEditor {
     model: Entity<AppModel>,
     original: Option<Record<Host>>,
+    focus: FocusHandle,
     label: Entity<InputState>,
     address: Entity<InputState>,
     port: Entity<InputState>,
@@ -39,6 +260,10 @@ pub struct HostEditor {
     identity: ChoiceState<Option<Id>>,
     key: ChoiceState<Option<Id>>,
     snippet: ChoiceState<Option<Id>>,
+    /// Terminal theme of the host: `None` follows the app, `"dark"`, `"light"`.
+    theme: ChoiceState<Option<String>>,
+    term: Entity<InputState>,
+    color: Option<String>,
     jumps: Vec<Id>,
     proxy_kind: ChoiceState<Option<ProxyKind>>,
     proxy_host: Entity<InputState>,
@@ -54,7 +279,12 @@ pub struct HostEditor {
     favorite: bool,
     agent_forwarding: bool,
     record: bool,
+    /// The "Advanced" section is open.
+    advanced_open: bool,
+    /// Errors of the last save attempt, shown under their fields.
+    errors: Vec<FieldError>,
     saving: bool,
+    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<EditorEvent> for HostEditor {}
@@ -110,6 +340,11 @@ impl HostEditor {
                 .iter()
                 .map(|sn| Choice::new(sn.data.name.clone(), Some(sn.data.id))),
         );
+        let themes = vec![
+            Choice::new(t!("host_editor.theme.follow"), None),
+            Choice::new(t!("host_editor.theme.dark"), Some("dark".to_string())),
+            Choice::new(t!("host_editor.theme.light"), Some("light".to_string())),
+        ];
 
         let group_sel = h.as_ref().map(|h| h.group_id).unwrap_or(default_group);
         let env_text = s
@@ -165,6 +400,12 @@ impl HostEditor {
             t!("host_editor.tags_placeholder"),
             h.as_ref().map(|h| h.tags.join(", ")).unwrap_or_default(),
         );
+        let term = input(
+            window,
+            cx,
+            "xterm-256color".into(),
+            s.term.clone().unwrap_or_default(),
+        );
         let env = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 10)
@@ -174,7 +415,7 @@ impl HostEditor {
         let notes = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 10)
-                .placeholder(t!("host_editor.notes"))
+                .placeholder(t!("host_editor.notes_placeholder"))
                 .default_value(notes_text)
         });
         let proxy = s.proxy.clone();
@@ -222,8 +463,60 @@ impl HostEditor {
         let identity = ui::choice_state(identities, Some(&s.identity_id), window, cx);
         let key = ui::choice_state(keys, Some(&s.key_id), window, cx);
         let snippet = ui::choice_state(snippets, Some(&s.startup_snippet_id), window, cx);
+        let theme = ui::choice_state(themes, Some(&s.theme), window, cx);
         if original.is_none() {
-            label.update(cx, |i, cx| i.focus(window, cx));
+            address.update(cx, |i, cx| i.focus(window, cx));
+        }
+
+        // Enter saves and Ctrl/Cmd+Enter saves and connects; editing a field
+        // clears its error.
+        let mut subs = Vec::new();
+        let single_line: [(&Entity<InputState>, Option<Field>); 12] = [
+            (&address, Some(Field::Address)),
+            (&label, None),
+            (&port, Some(Field::Port)),
+            (&username, None),
+            (&password, None),
+            (&tags, None),
+            (&keepalive, Some(Field::Keepalive)),
+            (&term, None),
+            (&proxy_host, Some(Field::ProxyAddress)),
+            (&proxy_port, Some(Field::ProxyPort)),
+            (&proxy_user, None),
+            (&proxy_password, None),
+        ];
+        for (state, field) in single_line {
+            subs.push(cx.subscribe_in(
+                state,
+                window,
+                move |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { secondary, .. } => this.save(*secondary, window, cx),
+                    InputEvent::Change => {
+                        if let Some(field) = field {
+                            this.clear_error(field, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            ));
+        }
+        // In the text areas Enter is a new line: only Ctrl/Cmd+Enter acts.
+        for (state, field) in [(&env, Some(Field::Env)), (&notes, None)] {
+            subs.push(cx.subscribe_in(
+                state,
+                window,
+                move |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter {
+                        secondary: true, ..
+                    } => this.save(true, window, cx),
+                    InputEvent::Change => {
+                        if let Some(field) = field {
+                            this.clear_error(field, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            ));
         }
 
         Self {
@@ -234,6 +527,8 @@ impl HostEditor {
             agent_forwarding: s.agent_forwarding.unwrap_or(false),
             record: s.record_sessions.unwrap_or(false),
             jumps: s.jump_host_ids.clone().unwrap_or_default(),
+            advanced_open: has_advanced(&s),
+            color: h.as_ref().and_then(|h| h.color.clone()),
             proxy_kind,
             proxy_host,
             proxy_port,
@@ -242,6 +537,7 @@ impl HostEditor {
             clear_proxy_password: false,
             model,
             original,
+            focus: cx.focus_handle(),
             label,
             address,
             port,
@@ -252,11 +548,15 @@ impl HostEditor {
             identity,
             key,
             snippet,
+            theme,
+            term,
             env,
             keepalive,
             tags,
             notes,
+            errors: Vec::new(),
             saving: false,
+            _subs: subs,
         }
     }
 
@@ -264,7 +564,23 @@ impl HostEditor {
         self.original.as_ref().map(|r| r.data.id)
     }
 
+    fn clear_error(&mut self, field: Field, cx: &mut Context<Self>) {
+        let before = self.errors.len();
+        self.errors.retain(|e| e.field() != field);
+        if self.errors.len() != before {
+            cx.notify();
+        }
+    }
+
+    fn error_for(&self, field: Field) -> Option<SharedString> {
+        self.errors
+            .iter()
+            .find(|e| e.field() == field)
+            .map(FieldError::message)
+    }
+
     /// Builds the host from the form.
+    #[allow(clippy::type_complexity)]
     fn build(
         &self,
         cx: &Context<Self>,
@@ -275,53 +591,28 @@ impl HostEditor {
             Option<Option<String>>,
             SyncMode,
         ),
-        String,
+        Vec<FieldError>,
     > {
-        let text = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
-        let label = text(&self.label);
-        let address = text(&self.address);
-        if label.is_empty() {
-            return Err(t!("host_editor.error.name").to_string());
-        }
-        if address.is_empty() {
-            return Err(t!("host_editor.error.address").to_string());
-        }
-        let port = match text(&self.port) {
-            p if p.is_empty() => None,
-            p => Some(
-                p.parse::<u16>()
-                    .ok()
-                    .filter(|p| *p > 0)
-                    .ok_or_else(|| t!("host_editor.error.port").to_string())?,
-            ),
-        };
-        let keepalive = match text(&self.keepalive) {
-            k if k.is_empty() => None,
-            k => Some(
-                k.parse::<u32>()
-                    .map_err(|_| t!("host_editor.error.keepalive").to_string())?,
-            ),
-        };
-        let mut env = BTreeMap::new();
-        for line in self.env.read(cx).value().lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match line.split_once('=') {
-                Some((k, v)) if !k.trim().is_empty() => {
-                    env.insert(k.trim().to_string(), v.trim().to_string());
-                }
-                _ => {
-                    return Err(t!("host_editor.error.env", line = line).to_string());
-                }
-            }
-        }
-        let tags: Vec<String> = text(&self.tags)
-            .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
+        let text = |e: &Entity<InputState>| e.read(cx).value().to_string();
+        let proxy_kind = ui::chosen(&self.proxy_kind, cx).flatten();
+        let (label, address, port, keepalive, tags) = (
+            text(&self.label),
+            text(&self.address),
+            text(&self.port),
+            text(&self.keepalive),
+            text(&self.tags),
+        );
+        let (proxy_host, proxy_port) = (text(&self.proxy_host), text(&self.proxy_port));
+        let env_text = self.env.read(cx).value().to_string();
+        let values = parse_form(&FormText {
+            label: &label,
+            address: &address,
+            port: &port,
+            keepalive: &keepalive,
+            env: &env_text,
+            tags: &tags,
+            proxy: proxy_kind.map(|_| (proxy_host.as_str(), proxy_port.as_str())),
+        })?;
 
         let mut host = self
             .original
@@ -340,42 +631,37 @@ impl HostEditor {
                 os_version: None,
                 favorite: false,
             });
-        host.label = label;
-        host.address = address;
+        host.label = values.label;
+        host.address = values.address;
         host.group_id = ui::chosen(&self.group, cx).flatten();
-        host.tags = tags;
+        host.tags = values.tags;
         host.notes = self.notes.read(cx).value().to_string();
         host.favorite = self.favorite;
+        host.color = self.color.clone();
         let s = &mut host.settings;
-        s.port = port;
-        s.username = Some(text(&self.username)).filter(|u| !u.is_empty());
+        s.port = values.port;
+        s.username = optional(&text(&self.username));
         s.identity_id = ui::chosen(&self.identity, cx).flatten();
         s.key_id = ui::chosen(&self.key, cx).flatten();
         s.startup_snippet_id = ui::chosen(&self.snippet, cx).flatten();
         s.jump_host_ids = (!self.jumps.is_empty()).then(|| self.jumps.clone());
-        s.env = env;
-        s.keepalive_secs = keepalive;
+        s.env = values.env;
+        s.keepalive_secs = values.keepalive;
         s.agent_forwarding = self.agent_forwarding.then_some(true);
         s.record_sessions = self.record.then_some(true);
-        s.proxy = match ui::chosen(&self.proxy_kind, cx).flatten() {
-            None => None,
-            Some(kind) => {
-                let host = text(&self.proxy_host);
-                if host.is_empty() {
-                    return Err(t!("host_editor.error.proxy_address").to_string());
-                }
-                let port = text(&self.proxy_port)
-                    .parse::<u16>()
-                    .ok()
-                    .filter(|p| *p > 0)
-                    .ok_or_else(|| t!("host_editor.error.proxy_port").to_string())?;
-                Some(ProxySettings {
-                    kind,
-                    host,
-                    port,
-                    username: Some(text(&self.proxy_user)).filter(|u| !u.is_empty()),
-                })
-            }
+        s.term = optional(&text(&self.term));
+        // A theme this version does not know (nothing selected) is kept.
+        if let Some(theme) = ui::chosen(&self.theme, cx) {
+            s.theme = theme;
+        }
+        s.proxy = match (proxy_kind, values.proxy) {
+            (Some(kind), Some((host, port))) => Some(ProxySettings {
+                kind,
+                host,
+                port,
+                username: optional(&text(&self.proxy_user)),
+            }),
+            _ => None,
         };
 
         // `None`: keep; `Some(None)`: delete.
@@ -404,10 +690,25 @@ impl HostEditor {
     }
 
     fn save(&mut self, then_connect: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
         let (host, password, proxy_password, mode) = match self.build(cx) {
-            Ok(v) => v,
-            Err(e) => {
-                ui::error(window, cx, e);
+            Ok(v) => {
+                self.errors.clear();
+                v
+            }
+            Err(errors) => {
+                // The field may be out of sight (or inside the closed
+                // "Advanced" section): the first error also as a notice.
+                if errors.iter().any(|e| e.field().advanced()) {
+                    self.advanced_open = true;
+                }
+                if let Some(first) = errors.first() {
+                    ui::error(window, cx, first.message());
+                }
+                self.errors = errors;
+                cx.notify();
                 return;
             }
         };
@@ -492,12 +793,87 @@ impl HostEditor {
         }
         cx.notify();
     }
-}
 
-impl Render for HostEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        if ev.keystroke.key == "escape" && !m.control && !m.alt && !m.shift && !m.platform {
+            cx.stop_propagation();
+            cx.emit(EditorEvent::Close);
+        }
+    }
+
+    // ----- Rendering -----
+
+    /// Field with its error (if any) under it.
+    fn checked_field(
+        &self,
+        field: Field,
+        label: SharedString,
+        control: impl IntoElement,
+        cx: &App,
+    ) -> gpui::Div {
+        let error = self.error_for(field);
+        ui::field(label, control, cx).when_some(error, |this, e| this.child(error_text(e, cx)))
+    }
+
+    fn render_colors(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let editing = self.original.is_some();
+        let selected = self.color.clone();
+        let ring = theme.foreground;
+        let border = theme.border;
+        let muted = theme.muted_foreground;
+        let none_selected = selected.is_none();
+        h_flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(
+                div()
+                    .id("host-color-none")
+                    .size(px(22.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if none_selected { ring } else { border })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(ui::icon(IconName::Ban).size(px(12.)).text_color(muted))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.color = None;
+                        cx.notify();
+                    })),
+            )
+            .children(HOST_COLORS.iter().enumerate().map(|(i, hex)| {
+                let color = theme::parse_color(hex).unwrap_or(muted);
+                let active = selected.as_deref().is_some_and(|c| same_color(c, hex));
+                div()
+                    .id(("host-color", i))
+                    .size(px(22.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if active { ring } else { color })
+                    .bg(color)
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(active, |this| {
+                        this.child(
+                            ui::icon(IconName::Check)
+                                .size(px(12.))
+                                .text_color(gpui::white()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.color = Some(hex.to_string());
+                        cx.notify();
+                    }))
+            }))
+    }
+
+    fn render_advanced(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
         let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret);
         let own_id = self.host_id();
         let other_hosts: Vec<(Id, String)> = self
@@ -508,6 +884,166 @@ impl Render for HostEditor {
             .filter(|h| Some(h.data.id) != own_id)
             .map(|h| (h.data.id, h.data.label.clone()))
             .collect();
+        let jumps: AnyElement = if other_hosts.is_empty() {
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(t!("host_editor.jumps_none"))
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("host-jumps")
+                .gap_1()
+                .max_h(px(160.))
+                .overflow_y_scrollbar()
+                .children(other_hosts.iter().enumerate().map(|(i, (id, label))| {
+                    let id = *id;
+                    let pos = self.jumps.iter().position(|j| *j == id);
+                    Checkbox::new(("jump", i))
+                        .label(match pos {
+                            Some(p) => format!("{}. {label}", p + 1),
+                            None => label.clone(),
+                        })
+                        .checked(pos.is_some())
+                        .on_click(
+                            cx.listener(move |this, _: &bool, _, cx| this.toggle_jump(id, cx)),
+                        )
+                }))
+                .into_any_element()
+        };
+        let proxy_on = ui::chosen(&self.proxy_kind, cx).flatten().is_some();
+
+        v_flex()
+            .gap_4()
+            // Connection: jumps and proxy.
+            .child(sub_title(t!("host_editor.section.connection"), cx))
+            .child(ui::field_with_hint(
+                t!("host_editor.jumps"),
+                jumps,
+                t!("host_editor.jumps_hint"),
+                cx,
+            ))
+            .child(ui::field_with_hint(
+                t!("host_editor.proxy.kind"),
+                Select::new(&self.proxy_kind),
+                t!("host_editor.proxy.kind_hint"),
+                cx,
+            ))
+            .when(proxy_on, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(div().flex_1().min_w_0().child(self.checked_field(
+                            Field::ProxyAddress,
+                            t!("host_editor.proxy.address"),
+                            Input::new(&self.proxy_host),
+                            cx,
+                        )))
+                        .child(div().w(px(96.)).flex_shrink_0().child(self.checked_field(
+                            Field::ProxyPort,
+                            t!("host_editor.port"),
+                            Input::new(&self.proxy_port),
+                            cx,
+                        ))),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(ui::field(
+                            t!("host_editor.username"),
+                            Input::new(&self.proxy_user),
+                            cx,
+                        )))
+                        .child(div().flex_1().min_w_0().child(ui::field(
+                            t!("host_editor.password"),
+                            Input::new(&self.proxy_password).mask_toggle(),
+                            cx,
+                        ))),
+                )
+                .when(has_secret, |this| {
+                    this.child(
+                        Checkbox::new("clear-proxy-password")
+                            .label(t!("host_editor.proxy.clear_password"))
+                            .checked(self.clear_proxy_password)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                this.clear_proxy_password = *v;
+                                cx.notify();
+                            })),
+                    )
+                })
+            })
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("agent-forwarding")
+                            .label(t!("host_editor.agent_forwarding"))
+                            .checked(self.agent_forwarding)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                this.agent_forwarding = *v;
+                                cx.notify();
+                            })),
+                    )
+                    .child(hint(t!("host_editor.agent_forwarding_hint"), cx)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(self.checked_field(
+                        Field::Keepalive,
+                        t!("host_editor.keepalive"),
+                        div().w(px(120.)).child(Input::new(&self.keepalive)),
+                        cx,
+                    ))
+                    .child(hint(t!("host_editor.keepalive_hint"), cx)),
+            )
+            // Terminal: startup, environment, recording, TERM and theme.
+            .child(sub_title(t!("host_editor.section.terminal"), cx))
+            .child(ui::field(
+                t!("host_editor.startup_snippet"),
+                Select::new(&self.snippet),
+                cx,
+            ))
+            .child(self.checked_field(
+                Field::Env,
+                t!("host_editor.env"),
+                Textarea::new(&self.env),
+                cx,
+            ))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(ui::field_with_hint(
+                        t!("host_editor.term"),
+                        Input::new(&self.term),
+                        t!("host_editor.term_hint"),
+                        cx,
+                    )))
+                    .child(div().flex_1().min_w_0().child(ui::field(
+                        t!("host_editor.theme"),
+                        Select::new(&self.theme),
+                        cx,
+                    ))),
+            )
+            .child(
+                Switch::new("record")
+                    .label(t!("host_editor.record"))
+                    .checked(self.record)
+                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                        this.record = *v;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for HostEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editing = self.original.is_some();
+        let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret);
         let title: SharedString = if editing {
             self.original
                 .as_ref()
@@ -517,60 +1053,309 @@ impl Render for HostEditor {
         } else {
             t!("host_editor.new_title")
         };
+        let colors = self.render_colors(cx).into_any_element();
+        let advanced = self.advanced_open.then(|| self.render_advanced(cx));
+        let advanced_open = self.advanced_open;
+        let shortcut = if cfg!(target_os = "macos") {
+            SharedString::from("⌘↩")
+        } else {
+            t!("host_editor.shortcut.save_connect")
+        };
+        let theme = cx.theme();
 
-        let jumps_list = v_flex()
-            .gap_1()
-            .max_h(px(160.))
-            .overflow_y_scrollbar()
-            .children(other_hosts.iter().enumerate().map(|(i, (id, label))| {
-                let id = *id;
-                let pos = self.jumps.iter().position(|j| *j == id);
-                Checkbox::new(("jump", i))
-                    .label(match pos {
-                        Some(p) => format!("{}. {label}", p + 1),
-                        None => label.clone(),
-                    })
-                    .checked(pos.is_some())
-                    .on_click(cx.listener(move |this, _: &bool, _, cx| this.toggle_jump(id, cx)))
-            }));
-
-        v_flex()
-            .size_full()
+        // Header: title, Connect and close.
+        let header = h_flex()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
             .child(
-                h_flex()
-                    .px_4()
-                    .py_3()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        ui::icon(if editing {
-                            IconName::Pencil
-                        } else {
-                            IconName::ServerPlus
-                        })
-                        .size(px(16.)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_semibold()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(title),
-                    )
-                    .child(
-                        Button::new("editor-close")
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::X))
-                            .on_click(
-                                cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(EditorEvent::Close)),
-                            ),
+                ui::icon(if editing {
+                    IconName::Pencil
+                } else {
+                    IconName::ServerPlus
+                })
+                .size(px(16.))
+                .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_semibold()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(title),
+            )
+            .child(
+                Button::new("editor-connect")
+                    .small()
+                    .primary()
+                    .icon(ui::icon(IconName::SquareTerminal))
+                    .label(t!("host_editor.connect"))
+                    .tooltip(t!(
+                        "host_editor.connect_tooltip",
+                        shortcut = shortcut.clone()
+                    ))
+                    .loading(self.saving)
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.save(true, window, cx)),
                     ),
             )
+            .child(
+                Button::new("editor-close")
+                    .small()
+                    .ghost()
+                    .icon(ui::icon(IconName::X))
+                    .tooltip(t!("host_editor.close_tooltip"))
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(EditorEvent::Close))),
+            );
+
+        // Address (big) and label.
+        let address_error = self.error_for(Field::Address);
+        let identity_block = v_flex()
+            .gap_3()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .w_full()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child(t!("host_editor.address")),
+                    )
+                    .child(
+                        Input::new(&self.address)
+                            .large()
+                            .prefix(ui::icon(IconName::Server).size(px(16.))),
+                    )
+                    .when_some(address_error, |this, e| this.child(error_text(e, cx))),
+            )
+            .child(ui::field(
+                t!("host_editor.label"),
+                Input::new(&self.label),
+                cx,
+            ));
+
+        // Organization: group, tags and color.
+        let organize = section(
+            t!("host_editor.section.general"),
+            IconName::Folder,
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(div().flex_1().min_w_0().child(ui::field(
+                            t!("host_editor.group"),
+                            Select::new(&self.group),
+                            cx,
+                        )))
+                        .child(div().flex_1().min_w_0().child(ui::field(
+                            t!("host_editor.tags"),
+                            Input::new(&self.tags),
+                            cx,
+                        ))),
+                )
+                .child(ui::field(t!("host_editor.color"), colors, cx)),
+            cx,
+        );
+
+        // SSH: port, user and credentials.
+        let ssh = section(
+            t!("host_editor.section.ssh"),
+            IconName::KeyRound,
+            v_flex()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(div().flex_1().min_w_0().child(ui::field(
+                            t!("host_editor.username"),
+                            Input::new(&self.username),
+                            cx,
+                        )))
+                        .child(div().w(px(96.)).flex_shrink_0().child(self.checked_field(
+                            Field::Port,
+                            t!("host_editor.port"),
+                            Input::new(&self.port),
+                            cx,
+                        ))),
+                )
+                .child(ui::field(
+                    t!("host_editor.password"),
+                    Input::new(&self.password).mask_toggle(),
+                    cx,
+                ))
+                .when(has_secret, |this| {
+                    this.child(
+                        Checkbox::new("clear-password")
+                            .label(t!("host_editor.clear_password"))
+                            .checked(self.clear_password)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                this.clear_password = *v;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .child(ui::field_with_hint(
+                    t!("host_editor.key"),
+                    Select::new(&self.key),
+                    t!("host_editor.key_hint"),
+                    cx,
+                ))
+                .child(ui::field_with_hint(
+                    t!("host_editor.identity"),
+                    Select::new(&self.identity),
+                    t!("host_editor.identity_hint"),
+                    cx,
+                )),
+            cx,
+        );
+
+        // Advanced (collapsible).
+        let advanced_errors = self.errors.iter().any(|e| e.field().advanced());
+        let advanced_header = h_flex()
+            .id("host-advanced-toggle")
+            .gap_2()
+            .items_center()
+            .cursor_pointer()
+            .text_color(theme.muted_foreground)
+            .hover(|s| s.text_color(theme.foreground))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.advanced_open = !this.advanced_open;
+                cx.notify();
+            }))
+            .child(
+                ui::icon(if advanced_open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(px(14.)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .child(t!("host_editor.section.advanced").to_uppercase()),
+            )
+            .when(advanced_errors && !advanced_open, |this| {
+                this.child(
+                    ui::icon(IconName::CircleAlert)
+                        .size(px(14.))
+                        .text_color(theme.danger),
+                )
+            })
+            .when(!advanced_open, |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .child(t!("host_editor.advanced_summary")),
+                )
+            });
+        let advanced_block = v_flex()
+            .gap_2()
+            .child(advanced_header)
+            .when_some(advanced, |this, content| {
+                this.child(card(cx).child(content))
+            });
+
+        // Notes, favorite and "this device only".
+        let other = section(
+            t!("host_editor.section.organization"),
+            IconName::Star,
+            v_flex()
+                .gap_3()
+                .child(ui::field(
+                    t!("host_editor.notes"),
+                    Textarea::new(&self.notes),
+                    cx,
+                ))
+                .child(
+                    Switch::new("favorite")
+                        .label(t!("host_editor.favorite"))
+                        .checked(self.favorite)
+                        .on_click(cx.listener(|this, v: &bool, _, cx| {
+                            this.favorite = *v;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Switch::new("device-only")
+                                .label(t!("host_editor.device_only"))
+                                .checked(self.device_only)
+                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                    this.device_only = *v;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(hint(t!("host_editor.device_only_hint"), cx)),
+                ),
+            cx,
+        );
+
+        let footer =
+            h_flex()
+                .p_3()
+                .gap_2()
+                .items_center()
+                .border_t_1()
+                .border_color(theme.border)
+                .when(editing, |this| {
+                    this.child(
+                        Button::new("delete-host")
+                            .ghost()
+                            .icon(ui::icon(IconName::Trash))
+                            .tooltip(t!("host_editor.delete.title"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.delete(window, cx)
+                            })),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("host_editor.keyboard_hint", connect = shortcut)),
+                )
+                .child(
+                    Button::new("save-host")
+                        .primary()
+                        .icon(ui::icon(IconName::Save))
+                        .label(t!("common.save"))
+                        .loading(self.saving)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.save(false, window, cx)
+                        })),
+                );
+
+        v_flex()
+            .id("host-editor")
+            .key_context("HostEditor")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .size_full()
+            .child(header)
             .child(
                 div().flex_1().min_h_0().child(
                     v_flex()
@@ -580,256 +1365,210 @@ impl Render for HostEditor {
                         .child(
                             v_flex()
                                 .p_4()
-                                .gap_4()
-                                .child(ui::field(t!("common.name"), Input::new(&self.label), cx))
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(div().flex_1().child(ui::field(
-                                            t!("host_editor.address"),
-                                            Input::new(&self.address),
-                                            cx,
-                                        )))
-                                        .child(div().w(px(90.)).child(ui::field(
-                                            t!("host_editor.port"),
-                                            Input::new(&self.port),
-                                            cx,
-                                        ))),
-                                )
-                                .child(ui::field(
-                                    t!("host_editor.group"),
-                                    Select::new(&self.group),
-                                    cx,
-                                ))
-                                .child(section_title(t!("host_editor.section.credentials"), cx))
-                                .child(ui::field(
-                                    t!("host_editor.username"),
-                                    Input::new(&self.username),
-                                    cx,
-                                ))
-                                .child(ui::field(
-                                    t!("host_editor.password"),
-                                    Input::new(&self.password).mask_toggle(),
-                                    cx,
-                                ))
-                                .when(has_secret, |this| {
-                                    this.child(
-                                        Checkbox::new("clear-password")
-                                            .label(t!("host_editor.clear_password"))
-                                            .checked(self.clear_password)
-                                            .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                                this.clear_password = *v;
-                                                cx.notify();
-                                            })),
-                                    )
-                                })
-                                .child(ui::field_with_hint(
-                                    t!("host_editor.identity"),
-                                    Select::new(&self.identity),
-                                    t!("host_editor.identity_hint"),
-                                    cx,
-                                ))
-                                .child(ui::field_with_hint(
-                                    t!("host_editor.key"),
-                                    Select::new(&self.key),
-                                    t!("host_editor.key_hint"),
-                                    cx,
-                                ))
-                                .child(section_title(t!("host_editor.section.connection"), cx))
-                                .child(ui::field_with_hint(
-                                    t!("host_editor.jumps"),
-                                    if other_hosts.is_empty() {
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .child(t!("host_editor.jumps_none"))
-                                            .into_any_element()
-                                    } else {
-                                        jumps_list.into_any_element()
-                                    },
-                                    t!("host_editor.jumps_hint"),
-                                    cx,
-                                ))
-                                .child(section_title(t!("host_editor.section.proxy"), cx))
-                                .child(ui::field_with_hint(
-                                    t!("host_editor.proxy.kind"),
-                                    Select::new(&self.proxy_kind),
-                                    t!("host_editor.proxy.kind_hint"),
-                                    cx,
-                                ))
-                                .when(
-                                    ui::chosen(&self.proxy_kind, cx).flatten().is_some(),
-                                    |this| {
-                                        this.child(
-                                            h_flex()
-                                                .gap_2()
-                                                .child(div().flex_1().child(ui::field(
-                                                    t!("host_editor.proxy.address"),
-                                                    Input::new(&self.proxy_host),
-                                                    cx,
-                                                )))
-                                                .child(div().w(px(90.)).child(ui::field(
-                                                    t!("host_editor.port"),
-                                                    Input::new(&self.proxy_port),
-                                                    cx,
-                                                ))),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .gap_2()
-                                                .child(div().flex_1().child(ui::field(
-                                                    t!("host_editor.username"),
-                                                    Input::new(&self.proxy_user),
-                                                    cx,
-                                                )))
-                                                .child(div().flex_1().child(ui::field(
-                                                    t!("host_editor.password"),
-                                                    Input::new(&self.proxy_password).mask_toggle(),
-                                                    cx,
-                                                ))),
-                                        )
-                                        .when(
-                                            has_secret,
-                                            |this| {
-                                                this.child(
-                                                    Checkbox::new("clear-proxy-password")
-                                                        .label(t!(
-                                                            "host_editor.proxy.clear_password"
-                                                        ))
-                                                        .checked(self.clear_proxy_password)
-                                                        .on_click(cx.listener(
-                                                            |this, v: &bool, _, cx| {
-                                                                this.clear_proxy_password = *v;
-                                                                cx.notify();
-                                                            },
-                                                        )),
-                                                )
-                                            },
-                                        )
-                                    },
-                                )
-                                .child(section_title(t!("host_editor.section.terminal"), cx))
-                                .child(ui::field(
-                                    t!("host_editor.startup_snippet"),
-                                    Select::new(&self.snippet),
-                                    cx,
-                                ))
-                                .child(ui::field(
-                                    t!("host_editor.env"),
-                                    Textarea::new(&self.env),
-                                    cx,
-                                ))
-                                .child(ui::field_with_hint(
-                                    t!("host_editor.keepalive"),
-                                    Input::new(&self.keepalive),
-                                    t!("host_editor.keepalive_hint"),
-                                    cx,
-                                ))
-                                .child(
-                                    Switch::new("agent-forwarding")
-                                        .label(t!("host_editor.agent_forwarding"))
-                                        .checked(self.agent_forwarding)
-                                        .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                            this.agent_forwarding = *v;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Switch::new("record")
-                                        .label(t!("host_editor.record"))
-                                        .checked(self.record)
-                                        .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                            this.record = *v;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(section_title(t!("host_editor.section.organization"), cx))
-                                .child(ui::field(
-                                    t!("host_editor.tags"),
-                                    Input::new(&self.tags),
-                                    cx,
-                                ))
-                                .child(ui::field(
-                                    t!("host_editor.notes"),
-                                    Textarea::new(&self.notes),
-                                    cx,
-                                ))
-                                .child(
-                                    Switch::new("favorite")
-                                        .label(t!("host_editor.favorite"))
-                                        .checked(self.favorite)
-                                        .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                            this.favorite = *v;
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    v_flex()
-                                        .gap_1()
-                                        .child(
-                                            Switch::new("device-only")
-                                                .label(t!("host_editor.device_only"))
-                                                .checked(self.device_only)
-                                                .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                                    this.device_only = *v;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(t!("host_editor.device_only_hint")),
-                                        ),
-                                ),
+                                .gap_5()
+                                .child(identity_block)
+                                .child(ssh)
+                                .child(organize)
+                                .child(advanced_block)
+                                .child(other),
                         ),
                 ),
             )
-            .child(
-                h_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .when(editing, |this| {
-                        this.child(
-                            Button::new("delete-host")
-                                .ghost()
-                                .icon(ui::icon(IconName::Trash))
-                                .tooltip(t!("host_editor.delete.title"))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.delete(window, cx)
-                                })),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("save-connect")
-                            .icon(ui::icon(IconName::SquareTerminal))
-                            .label(t!("host_editor.save_connect"))
-                            .loading(self.saving)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.save(true, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("save-host")
-                            .primary()
-                            .label(t!("common.save"))
-                            .loading(self.saving)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.save(false, window, cx)
-                            })),
-                    ),
-            )
+            .child(footer)
     }
 }
 
-fn section_title(text: SharedString, cx: &gpui::App) -> gpui::Div {
+/// Section: small uppercase title with an icon over a card.
+fn section(title: SharedString, icon: IconName, content: impl IntoElement, cx: &App) -> gpui::Div {
+    v_flex()
+        .gap_2()
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_color(cx.theme().muted_foreground)
+                .child(ui::icon(icon).size(px(14.)))
+                .child(div().text_xs().font_semibold().child(title.to_uppercase())),
+        )
+        .child(card(cx).child(content))
+}
+
+/// Box of a section.
+fn card(cx: &App) -> gpui::Div {
+    v_flex()
+        .w_full()
+        .p_3()
+        .gap_3()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+}
+
+/// Title of a group of fields inside a card.
+fn sub_title(text: SharedString, cx: &App) -> gpui::Div {
     div()
-        .pt_2()
         .text_xs()
         .font_semibold()
         .text_color(cx.theme().muted_foreground)
         .child(text.to_uppercase())
+}
+
+fn hint(text: SharedString, cx: &App) -> gpui::Div {
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+fn error_text(text: SharedString, cx: &App) -> gpui::Div {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(cx.theme().danger)
+        .child(
+            ui::icon(IconName::CircleAlert)
+                .size(px(12.))
+                .flex_shrink_0(),
+        )
+        .child(div().min_w_0().child(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form<'a>(address: &'a str) -> FormText<'a> {
+        FormText {
+            address,
+            ..FormText::default()
+        }
+    }
+
+    #[test]
+    fn the_label_defaults_to_the_address() {
+        let v = parse_form(&form(" example.com ")).unwrap();
+        assert_eq!(v.label, "example.com");
+        assert_eq!(v.address, "example.com");
+        let v = parse_form(&FormText {
+            label: "  Web  ",
+            ..form("10.0.0.1")
+        })
+        .unwrap();
+        assert_eq!(v.label, "Web");
+    }
+
+    #[test]
+    fn address_is_required_and_has_no_spaces() {
+        assert_eq!(
+            parse_form(&form("  ")).unwrap_err(),
+            vec![FieldError::AddressMissing]
+        );
+        assert_eq!(
+            parse_form(&form("my host")).unwrap_err(),
+            vec![FieldError::AddressSpaces]
+        );
+    }
+
+    #[test]
+    fn ports() {
+        assert_eq!(parse_form(&form("h")).unwrap().port, None);
+        let with = |port| parse_form(&FormText { port, ..form("h") });
+        assert_eq!(with("2222").unwrap().port, Some(2222));
+        assert_eq!(with(" 65535 ").unwrap().port, Some(65535));
+        for bad in ["0", "65536", "-1", "ssh"] {
+            assert_eq!(with(bad).unwrap_err(), vec![FieldError::Port], "{bad}");
+        }
+    }
+
+    #[test]
+    fn keepalive() {
+        let with = |keepalive| {
+            parse_form(&FormText {
+                keepalive,
+                ..form("h")
+            })
+        };
+        assert_eq!(with("").unwrap().keepalive, None);
+        assert_eq!(with("0").unwrap().keepalive, Some(0));
+        assert_eq!(with("abc").unwrap_err(), vec![FieldError::Keepalive]);
+    }
+
+    #[test]
+    fn environment() {
+        let env = parse_env("A=1\n\n  B = two words \nC=").unwrap();
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("two words"));
+        assert_eq!(env.get("C").map(String::as_str), Some(""));
+        assert_eq!(parse_env("A=1\nnot a pair").unwrap_err(), "not a pair");
+        assert_eq!(parse_env("=x").unwrap_err(), "=x");
+        assert_eq!(parse_env("MY VAR=x").unwrap_err(), "MY VAR=x");
+    }
+
+    #[test]
+    fn tags_without_blanks_or_repeats() {
+        assert_eq!(parse_tags(" web, ,db,web ,"), vec!["web", "db"]);
+        assert!(parse_tags("").is_empty());
+    }
+
+    #[test]
+    fn proxy_is_checked_only_when_chosen() {
+        assert_eq!(parse_form(&form("h")).unwrap().proxy, None);
+        let with = |host, port| {
+            parse_form(&FormText {
+                proxy: Some((host, port)),
+                ..form("h")
+            })
+        };
+        assert_eq!(
+            with("proxy", "1080").unwrap().proxy,
+            Some(("proxy".to_string(), 1080))
+        );
+        assert_eq!(
+            with("", "0").unwrap_err(),
+            vec![FieldError::ProxyAddress, FieldError::ProxyPort]
+        );
+    }
+
+    #[test]
+    fn every_error_is_reported_at_once() {
+        let errors = parse_form(&FormText {
+            address: "",
+            port: "x",
+            keepalive: "y",
+            env: "bad",
+            ..FormText::default()
+        })
+        .unwrap_err();
+        let fields: Vec<Field> = errors.iter().map(FieldError::field).collect();
+        assert_eq!(
+            fields,
+            vec![Field::Address, Field::Port, Field::Keepalive, Field::Env]
+        );
+        assert!(Field::Env.advanced() && !Field::Port.advanced());
+    }
+
+    #[test]
+    fn advanced_section_opens_for_hosts_that_use_it() {
+        let mut s = HostSettings::default();
+        assert!(!has_advanced(&s));
+        s.term = Some("  ".into());
+        assert!(!has_advanced(&s));
+        s.theme = Some("light".into());
+        assert!(has_advanced(&s));
+        let mut s = HostSettings::default();
+        s.jump_host_ids = Some(Vec::new());
+        assert!(!has_advanced(&s));
+        s.keepalive_secs = Some(0);
+        assert!(has_advanced(&s));
+    }
+
+    #[test]
+    fn colors_compare_loosely() {
+        assert!(same_color("#4F7CFF", "#4f7cff"));
+        assert!(same_color("4f7cff", "#4f7cff"));
+        assert!(!same_color("#4f7cff", "#30a46c"));
+        assert!(HOST_COLORS.iter().all(|c| theme::parse_color(c).is_some()));
+    }
 }
