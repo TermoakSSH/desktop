@@ -9,6 +9,7 @@ pub mod host_editor;
 pub mod host_picker;
 pub mod hosts;
 pub mod import;
+pub mod join;
 pub mod keychain;
 pub mod known_hosts;
 pub mod serial;
@@ -34,6 +35,12 @@ pub enum OpenRequest {
     Server { host_id: Id },
     /// Attach to a server session.
     Attach { session_id: Id, title: String },
+    /// Join a session shared with a link (maybe on another server).
+    JoinLink {
+        session_id: Id,
+        title: String,
+        link: crate::terminal::backend::LinkJoin,
+    },
     /// SFTP browser (reusing a connection if there is one).
     Sftp {
         host_id: Id,

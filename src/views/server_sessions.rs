@@ -3,10 +3,12 @@
 //! you. From here you get back into them.
 
 use gpui::{
-    ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 use serde_json::Value;
@@ -25,9 +27,21 @@ struct SessionRow {
     kind: String,
     state: String,
     detail: String,
+    /// People inside (or sockets, for servers before live sharing).
     viewers: usize,
     created_at: i64,
     access: String,
+    /// Who shared it with you.
+    owner_name: Option<String>,
+}
+
+/// People inside a session as listed (`participants`, without those in the
+/// waiting room; servers before live sharing only have `viewers`).
+fn people_inside(v: &Value) -> usize {
+    match v["participants"].as_array() {
+        Some(list) if !list.is_empty() => list.iter().filter(|p| p["waiting"] != true).count(),
+        _ => v["viewers"].as_array().map(|a| a.len()).unwrap_or(0),
+    }
 }
 
 impl SessionRow {
@@ -45,9 +59,13 @@ impl SessionRow {
                 .or_else(|| v["state"]["reason"].as_str())
                 .unwrap_or("")
                 .to_string(),
-            viewers: v["viewers"].as_array().map(|a| a.len()).unwrap_or(0),
+            viewers: people_inside(v),
             created_at: v["created_at"].as_i64().unwrap_or(0),
             access: v["access"].as_str().unwrap_or("owner").to_string(),
+            owner_name: v["owner_name"]
+                .as_str()
+                .filter(|n| !n.trim().is_empty())
+                .map(str::to_string),
         })
     }
 
@@ -67,6 +85,7 @@ impl SessionRow {
                 .or(v["created_at"].as_i64())
                 .unwrap_or(0),
             access: "owner".into(),
+            owner_name: None,
         })
     }
 }
@@ -78,6 +97,8 @@ pub struct ServerSessionsView {
     recent: Vec<SessionRow>,
     loading: bool,
     error: Option<String>,
+    /// "Join with link" field.
+    join_link: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -85,8 +106,10 @@ impl EventEmitter<OpenRequest> for ServerSessionsView {}
 
 impl ServerSessionsView {
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subs =
-            vec![cx.subscribe_in(
+        let join_link =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("join.link_placeholder")));
+        let subs = vec![
+            cx.subscribe_in(
                 &model,
                 window,
                 |this, _, ev: &ModelEvent, window, cx| match ev {
@@ -94,7 +117,19 @@ impl ServerSessionsView {
                     ModelEvent::Server(v) if v["type"] == "session" => this.refresh(window, cx),
                     _ => {}
                 },
-            )];
+            ),
+            // The badges of the rows.
+            cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &join_link,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = ev {
+                        this.join(window, cx);
+                    }
+                },
+            ),
+        ];
         let mut view = Self {
             model,
             active: Vec::new(),
@@ -102,6 +137,7 @@ impl ServerSessionsView {
             recent: Vec::new(),
             loading: false,
             error: None,
+            join_link,
             _subs: subs,
         };
         view.refresh(window, cx);
@@ -143,6 +179,64 @@ impl ServerSessionsView {
                 cx.notify();
             },
         );
+    }
+
+    /// Opens the "Join with link" dialog with what was pasted.
+    fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.join_link.read(cx).value().trim().to_string();
+        if !text.is_empty() && crate::sharing::parse_join_link(&text).is_none() {
+            ui::error(window, cx, t!("join.invalid_link"));
+            return;
+        }
+        self.join_link
+            .update(cx, |i, cx| i.set_value("", window, cx));
+        let weak = cx.entity().downgrade();
+        super::join::open(
+            self.model.clone(),
+            Some(text).filter(|t| !t.is_empty()),
+            std::rc::Rc::new(move |req, _, cx| {
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |_, cx| cx.emit(req));
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn render_join(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        ui::card(cx)
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(ui::icon(IconName::Link).size(px(16.)))
+                    .child(div().font_semibold().text_sm().child(t!("join.title")))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("join.section_hint")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.join_link)))
+                    .child(
+                        Button::new("join-with-link")
+                            .primary()
+                            .icon(ui::icon(IconName::LogIn))
+                            .label(t!("join.join"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.join(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn terminate(&mut self, row: SessionRow, window: &mut Window, cx: &mut Context<Self>) {
@@ -191,6 +285,7 @@ impl ServerSessionsView {
         closed: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let alerts = self.model.read(cx).session_alerts.clone();
         let theme = cx.theme();
         v_flex()
             .gap_2()
@@ -256,10 +351,27 @@ impl ServerSessionsView {
                                     .items_center()
                                     .child(div().font_semibold().text_sm().child(r.title.clone()))
                                     .child(ui::pill(state_label, color))
+                                    // A terminal of someone's computer, shared through
+                                    // the server (not necessarily with a team).
                                     .when(r.kind == "relay", |this| {
                                         this.child(ui::pill(
-                                            t!("server_sessions.shared_from_team"),
+                                            t!("server_sessions.kind_relay"),
                                             theme.info,
+                                        ))
+                                    })
+                                    .when_some(
+                                        r.owner_name.clone().filter(|_| r.access != "owner"),
+                                        |this, owner| {
+                                            this.child(ui::pill(
+                                                t!("server_sessions.shared_by", name = owner),
+                                                theme.muted_foreground,
+                                            ))
+                                        },
+                                    )
+                                    .when_some(alerts.get(&r.id).copied(), |this, n| {
+                                        this.child(ui::pill(
+                                            tn!("server_sessions.waiting_for_you", n),
+                                            theme.warning,
                                         ))
                                     })
                                     .when(r.access == "view", |this| {
@@ -344,13 +456,17 @@ impl Render for ServerSessionsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let logged_in = self.model.read(cx).logged_in();
         let body: gpui::AnyElement = if !logged_in {
-            ui::empty_state(
-                IconName::Cloud,
-                t!("server_sessions.no_server_title"),
-                t!("server_sessions.no_server_detail"),
-                cx,
-            )
-            .into_any_element()
+            // Links work without an account.
+            v_flex()
+                .gap_6()
+                .child(self.render_join(cx))
+                .child(ui::empty_state(
+                    IconName::Cloud,
+                    t!("server_sessions.no_server_title"),
+                    t!("server_sessions.no_server_detail"),
+                    cx,
+                ))
+                .into_any_element()
         } else {
             let active = self.active.clone();
             let shared = self.shared.clone();
@@ -365,6 +481,7 @@ impl Render for ServerSessionsView {
                             .child(t!("server_sessions.load_failed", error = e)),
                     )
                 })
+                .child(self.render_join(cx))
                 .child(self.render_rows("active", t!("server_sessions.active"), &active, false, cx))
                 .child(self.render_rows("shared", t!("server_sessions.shared"), &shared, false, cx))
                 .child(self.render_rows("recent", t!("server_sessions.recent"), &recent, true, cx))

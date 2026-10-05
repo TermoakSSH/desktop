@@ -369,6 +369,10 @@ pub struct AppModel {
     pub running_forwards: HashMap<Id, RunningForward>,
     /// Tunnels starting (to disable their button).
     pub starting_forwards: Vec<Id>,
+    /// Server sessions with something waiting for you that you are not
+    /// watching (someone wants in or asks for the keyboard, a prompt): the
+    /// badge of Sessions.
+    pub session_alerts: HashMap<Id, usize>,
     bg_tx: mpsc::UnboundedSender<BgMsg>,
     background: Vec<tokio::task::JoinHandle<()>>,
     _bg_task: Task<()>,
@@ -415,6 +419,7 @@ impl AppModel {
             events_online: false,
             running_forwards: HashMap::new(),
             starting_forwards: Vec::new(),
+            session_alerts: HashMap::new(),
             bg_tx,
             background: Vec::new(),
             _bg_task: bg_task,
@@ -425,6 +430,24 @@ impl AppModel {
     }
 
     // ----- Notifications -----
+
+    /// Something waits for you in a server session you are not watching.
+    pub fn add_session_alert(&mut self, session_id: Id, cx: &mut Context<Self>) {
+        *self.session_alerts.entry(session_id).or_default() += 1;
+        cx.notify();
+    }
+
+    /// The session was opened (or ended): nothing waits there any more.
+    pub fn clear_session_alert(&mut self, session_id: Id, cx: &mut Context<Self>) {
+        if self.session_alerts.remove(&session_id).is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Total for the badge.
+    pub fn session_alert_count(&self) -> usize {
+        self.session_alerts.values().sum()
+    }
 
     pub fn toast(&self, kind: ToastKind, msg: impl Into<String>, cx: &mut Context<Self>) {
         cx.emit(ModelEvent::Toast(kind, msg.into()));
@@ -1149,6 +1172,7 @@ impl AppModel {
         self.me = None;
         self.teams.clear();
         self.last_sync = None;
+        self.session_alerts.clear();
         let ws = self.ws.clone();
         runtime::run(cx, async move { ws.logout().await }, |m, res, cx| {
             match res {

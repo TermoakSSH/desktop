@@ -316,6 +316,31 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// A `termoak://invite?...` link opened from outside the app: the sign
+    /// up form, filled in.
+    pub fn open_invite_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((server, token)) = parse_invite_link(link) else {
+            return;
+        };
+        self.show_page(SettingsPage::General, window, cx);
+        if self.model.read(cx).logged_in() {
+            ui::notify(
+                window,
+                cx,
+                crate::state::ToastKind::Info,
+                t!("settings.invite.already_signed_in"),
+            );
+            return;
+        }
+        self.register = true;
+        self.server_url
+            .update(cx, |i, cx| i.set_value(server, window, cx));
+        self.invite
+            .update(cx, |i, cx| i.set_value(token, window, cx));
+        self.schedule_invite_check(window, cx);
+        cx.notify();
+    }
+
     fn set_dark(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
         theme::apply(dark, Some(window), cx);
         self.model.update(cx, |m, cx| {

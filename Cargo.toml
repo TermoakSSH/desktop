@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.2.1", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.1", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
@@ -63,6 +63,9 @@ semver = "1"
 # them when its own TLS asks for them, not rustls.
 serialport = { version = "4.10", default-features = false }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+# Public data of a share link (`GET /api/v1/join/{token}`, no account); the
+# same version and features termoak-client already uses.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Native GPUI platform (Metal on macOS, DirectX on Windows, Vulkan on Linux).
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]

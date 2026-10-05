@@ -33,9 +33,11 @@ use crate::menus::{self, MenuState};
 use crate::panes::{self, Dir, MAX_PANES};
 use crate::prompts::{self, PromptRequest};
 use crate::runtime;
+use crate::sharing::{self, SessionNotice};
 use crate::state::{AppModel, ModelEvent, ToastKind};
 use crate::terminal::{
-    PaneAction, PaneChrome, TermKind, TermState, TerminalEvent, TerminalView, serial::SerialParams,
+    PaneAction, PaneChrome, RequestKind, ShareRequest, TermKind, TermState, TerminalEvent,
+    TerminalView, serial::SerialParams,
 };
 use crate::ui::{self, IconName};
 use crate::update::{self, UpdateEvent, UpdateModel, UpdateStatus};
@@ -102,6 +104,17 @@ actions!(
 );
 
 const CONTEXT: &str = "Workspace";
+
+/// Toasts of requests from a shared terminal tab (one per request).
+struct ShareRequestToast;
+
+/// Toasts of notices about server sessions you are not watching.
+struct SessionNoticeToast;
+
+/// Key of the toast of a request.
+fn request_key(kind: RequestKind, participant: Id) -> SharedString {
+    format!("{kind:?}-{participant}").into()
+}
 
 /// Default terminal font size (View → Actual size).
 const DEFAULT_FONT_SIZE: f32 = 14.;
@@ -457,7 +470,17 @@ impl AppView {
                     // sessions, as dormant tabs.
                     ModelEvent::SessionChanged => this.restore_cloud_tabs(true, window, cx),
                     ModelEvent::Server(v) if v["type"] == "session" => {
-                        this.restore_cloud_tabs(false, window, cx)
+                        this.restore_cloud_tabs(false, window, cx);
+                        if v["notice"]["type"] == "session_closed"
+                            && let Some(id) = v["notice"]["session_id"]
+                                .as_str()
+                                .and_then(|s| s.parse::<Id>().ok())
+                        {
+                            this.model.update(cx, |m, cx| m.clear_session_alert(id, cx));
+                        }
+                        if let Some(notice) = SessionNotice::from_event(v) {
+                            this.on_session_notice(notice, window, cx);
+                        }
                     }
                     _ => {}
                 }
@@ -505,7 +528,212 @@ impl AppView {
         if logged_in {
             view.restore_cloud_tabs(true, window, cx);
         }
+        // `termoak://` links opened from outside (at startup or later).
+        if let Some(mut links) = crate::links::take_receiver() {
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(link) = links.recv().await {
+                    if this
+                        .update_in(cx, |app, window, cx| app.open_link(&link, window, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         view
+    }
+
+    /// A `termoak://` (or web join) link: join a shared session or sign up
+    /// with an invitation.
+    pub fn open_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        if sharing::parse_join_link(link).is_some() {
+            self.open_join_dialog(Some(link.to_string()), window, cx);
+        } else if crate::views::settings::parse_invite_link(link).is_some() {
+            self.select_section(Section::Settings, window, cx);
+            self.settings
+                .update(cx, |s, cx| s.open_invite_link(link, window, cx));
+        } else {
+            ui::notify(window, cx, ToastKind::Warning, t!("join.unknown_link"));
+        }
+    }
+
+    /// "Join with link".
+    pub fn open_join_dialog(
+        &mut self,
+        link: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.entity().downgrade();
+        crate::views::join::open(
+            self.model.clone(),
+            link,
+            std::rc::Rc::new(move |req, window, cx| {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |app, cx| app.open(req, window, cx));
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Shows the tab (and pane) of a terminal.
+    fn show_terminal(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((tab, pane)) = self.find_pane(id) {
+            self.activate(Some(tab), window, cx);
+            self.focus_pane(tab, pane, window, cx);
+        }
+    }
+
+    /// A terminal is in view: its tab is the active one and the window has
+    /// the focus.
+    fn terminal_in_view(&self, id: EntityId, window: &Window) -> bool {
+        window.is_window_active()
+            && self
+                .find_pane(id)
+                .is_some_and(|(tab, _)| self.active == Some(tab))
+    }
+
+    /// A request from a shared terminal: if its tab is not in view, a toast
+    /// to answer it from anywhere.
+    fn on_share_request(
+        &mut self,
+        id: EntityId,
+        req: &ShareRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_in_view(id, window) {
+            return;
+        }
+        let Some(view) = self
+            .find_pane(id)
+            .and_then(|(tab, _)| self.tabs[tab].panes())
+            .and_then(|p| p.views().find(|v| v.entity_id() == id).cloned())
+        else {
+            return;
+        };
+        let terminal = view.downgrade();
+        let app = cx.entity().downgrade();
+        let (kind, participant) = (req.kind, req.participant);
+        let yes_label = match kind {
+            RequestKind::Join => t!("share.allow"),
+            RequestKind::Control => t!("share.give"),
+        };
+        window.push_notification(
+            Notification::new()
+                .id1::<ShareRequestToast>(request_key(kind, participant))
+                .icon(ui::icon(match kind {
+                    RequestKind::Join => IconName::DoorOpen,
+                    RequestKind::Control => IconName::Keyboard,
+                }))
+                .title(req.title.clone())
+                .message(req.text())
+                .autohide(false)
+                .content(move |_, _, cx| {
+                    let answer = |yes: bool| {
+                        let terminal = terminal.clone();
+                        cx.listener(move |note: &mut Notification, _: &ClickEvent, window, cx| {
+                            if let Some(t) = terminal.upgrade() {
+                                t.update(cx, |t, cx| t.answer_request(kind, participant, yes, cx));
+                            }
+                            note.dismiss(window, cx);
+                        })
+                    };
+                    let app = app.clone();
+                    h_flex()
+                        .pt_2()
+                        .gap_2()
+                        .child(
+                            Button::new("request-yes")
+                                .small()
+                                .primary()
+                                .label(yes_label.clone())
+                                .on_click(answer(true)),
+                        )
+                        .child(
+                            Button::new("request-no")
+                                .small()
+                                .label(t!("share.deny"))
+                                .on_click(answer(false)),
+                        )
+                        .child(
+                            Button::new("request-show")
+                                .small()
+                                .ghost()
+                                .label(t!("share.show"))
+                                .on_click(cx.listener(
+                                    move |note: &mut Notification, _: &ClickEvent, window, cx| {
+                                        if let Some(a) = app.upgrade() {
+                                            a.update(cx, |a, cx| a.show_terminal(id, window, cx));
+                                        }
+                                        note.dismiss(window, cx);
+                                    },
+                                )),
+                        )
+                        .into_any_element()
+                }),
+            cx,
+        );
+    }
+
+    /// A notice of the events WebSocket about a shared session. Sessions
+    /// open in a tab show it themselves.
+    fn on_session_notice(
+        &mut self,
+        notice: SessionNotice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = notice.session_id();
+        let watching = self.tabs.iter().any(|t| {
+            matches!(t.content, TabContent::Terminal(_))
+                && t.server_sessions(cx).contains(&session_id)
+        });
+        if watching {
+            return;
+        }
+        if notice.needs_owner() {
+            self.model
+                .update(cx, |m, cx| m.add_session_alert(session_id, cx));
+        }
+        let title = match &notice {
+            SessionNotice::JoinRequest { title, .. }
+            | SessionNotice::ControlRequest { title, .. }
+                if !title.is_empty() =>
+            {
+                title.clone()
+            }
+            _ => t!("server_sessions.default_title").to_string(),
+        };
+        let mut note = Notification::info(notice.text())
+            .id1::<SessionNoticeToast>(SharedString::from(session_id.to_string()))
+            .title(t!("share.notice.title"));
+        if notice.needs_owner() {
+            let app = cx.entity().downgrade();
+            note = note.action(move |_, _, _| {
+                let app = app.clone();
+                let title = title.clone();
+                Button::new("notice-open")
+                    .small()
+                    .primary()
+                    .label(t!("server_sessions.open"))
+                    .on_click(move |_, window, cx| {
+                        if let Some(a) = app.upgrade() {
+                            let req = OpenRequest::Attach {
+                                session_id,
+                                title: title.clone(),
+                            };
+                            a.update(cx, |a, cx| a.open(req, window, cx));
+                        }
+                    })
+            });
+        }
+        window.push_notification(note, cx);
     }
 
     /// Starts the engine of the AI tasks on this computer and passes its
@@ -838,6 +1066,14 @@ impl AppView {
                 let (session_id, title) = (*session_id, title.clone());
                 cx.new(|cx| TerminalView::server(model, None, Some(session_id), title, window, cx))
             }
+            OpenRequest::JoinLink {
+                session_id,
+                title,
+                link,
+            } => {
+                let (session_id, title, link) = (*session_id, title.clone(), link.clone());
+                cx.new(|cx| TerminalView::join_link(model, session_id, link, title, window, cx))
+            }
             OpenRequest::Shell => cx.new(|cx| TerminalView::shell(model, window, cx)),
             OpenRequest::Serial(params) => {
                 let params = params.clone();
@@ -849,6 +1085,12 @@ impl AppView {
 
     /// Opens a new tab.
     pub fn open(&mut self, req: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if let OpenRequest::Attach { session_id, .. } = &req {
+            let id = *session_id;
+            self.model.update(cx, |m, cx| m.clear_session_alert(id, cx));
+            window
+                .remove_notification1::<SessionNoticeToast>(SharedString::from(id.to_string()), cx);
+        }
         match req {
             OpenRequest::Attach { session_id, .. }
                 if let Some(ix) = self
@@ -1011,6 +1253,13 @@ impl AppView {
     ) {
         match ev {
             TerminalEvent::TitleChanged => cx.notify(),
+            TerminalEvent::ShareRequest(req) => self.on_share_request(id, req, window, cx),
+            TerminalEvent::ShareRequestDone { kind, participant } => {
+                window.remove_notification1::<ShareRequestToast>(
+                    request_key(*kind, *participant),
+                    cx,
+                );
+            }
             TerminalEvent::OpenSftp { host_id, conn } => {
                 self.open_sftp(*host_id, conn.clone(), window, cx);
             }
@@ -2352,12 +2601,15 @@ impl AppView {
         let user = model.server_user.clone();
         let syncing = model.syncing;
         let events_online = model.events_online;
+        // Requests waiting in sessions you are not watching.
+        let alerts = model.session_alert_count();
         let section = self.section;
         let item = |s: Section, cx: &mut Context<Self>| {
+            let badge = (s == Section::ServerSessions && alerts > 0).then_some(alerts);
             // Taller and with bigger text and icons than the stock ones (28 px):
             // the fixed height of the component is applied later, but the
             // minimum wins.
-            SidebarMenuItem::new(s.label())
+            let item = SidebarMenuItem::new(s.label())
                 .icon(ui::icon(s.icon()).size(px(18.)))
                 .min_h(px(38.))
                 .px_3()
@@ -2366,7 +2618,25 @@ impl AppView {
                 .active(section == s)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.select_section(s, window, cx)
-                }))
+                }));
+            match badge {
+                Some(n) => item.suffix(move |_, cx| {
+                    div()
+                        .min_w(px(18.))
+                        .h(px(18.))
+                        .px_1()
+                        .rounded_full()
+                        .bg(cx.theme().warning)
+                        .text_color(cx.theme().warning_foreground)
+                        .text_xs()
+                        .font_semibold()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(n.to_string())
+                }),
+                None => item,
+            }
         };
         let theme = cx.theme();
         let account = h_flex()

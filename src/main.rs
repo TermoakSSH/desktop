@@ -23,12 +23,14 @@ rust_i18n::i18n!("locales", fallback = "en");
 mod i18n;
 
 mod app;
+mod links;
 mod local_ai;
 mod menus;
 mod panes;
 mod prompts;
 mod qr;
 mod runtime;
+mod sharing;
 mod state;
 mod terminal;
 mod theme;
@@ -57,6 +59,15 @@ use crate::update::UpdateModel;
 fn main() {
     init_tracing();
     let data_dir = termoak_client::vault::data_dir();
+
+    // A `termoak://` link opened from outside: to the running instance if
+    // there is one, otherwise to the window of this one.
+    if let Some(link) = links::from_args(std::env::args()) {
+        if links::forward_to_running(&data_dir, &link) {
+            return;
+        }
+        links::deliver(link);
+    }
 
     // System language until the saved choice is read (startup errors).
     i18n::apply(None);
@@ -89,43 +100,45 @@ fn main() {
 
     // 4. Interface, in the saved language.
     i18n::apply(settings.language.as_deref());
-    gpui_platform::application()
-        .with_assets(gpui_kit_assets::AllAssets)
-        .run(move |cx: &mut App| {
-            gpui_component::init(cx);
-            runtime::init(cx, rt);
-            theme::init(cx, settings.dark);
-            // The terminal keys first: the menu bar shows the shortcuts
-            // bound when it is built (in `app::init`).
-            terminal::init(cx);
-            app::init(cx);
+    links::listen(&data_dir);
+    links::register_scheme(&data_dir);
+    let application = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
+    application.on_open_urls(|urls| urls.into_iter().for_each(links::deliver));
+    application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        runtime::init(cx, rt);
+        theme::init(cx, settings.dark);
+        // The terminal keys first: the menu bar shows the shortcuts
+        // bound when it is built (in `app::init`).
+        terminal::init(cx);
+        app::init(cx);
 
-            let options = window_options(cx);
-            let opened = match workspace {
-                Ok(ws) => cx.open_window(options, move |window, cx| {
-                    let (prompter, prompts_rx) = DesktopPrompter::new();
-                    let prompter = Arc::new(prompter);
-                    let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
-                    let updates = cx.new(|cx| UpdateModel::new(updater, cx));
-                    let view = cx.new(|cx| AppView::new(model, updates, prompts_rx, window, cx));
-                    window.focus(&view.focus_handle(cx), cx);
-                    cx.new(|cx| Root::new(view, window, cx))
-                }),
-                Err(error) => cx.open_window(options, move |window, cx| {
-                    let view = cx.new(|_| StartupError {
-                        message: error.message.into(),
-                        keychain: error.keychain,
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                }),
-            };
-            if let Err(e) = opened {
-                eprintln!("could not open the window: {e}");
-                cx.quit();
-                return;
-            }
-            cx.activate(true);
-        });
+        let options = window_options(cx);
+        let opened = match workspace {
+            Ok(ws) => cx.open_window(options, move |window, cx| {
+                let (prompter, prompts_rx) = DesktopPrompter::new();
+                let prompter = Arc::new(prompter);
+                let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
+                let updates = cx.new(|cx| UpdateModel::new(updater, cx));
+                let view = cx.new(|cx| AppView::new(model, updates, prompts_rx, window, cx));
+                window.focus(&view.focus_handle(cx), cx);
+                cx.new(|cx| Root::new(view, window, cx))
+            }),
+            Err(error) => cx.open_window(options, move |window, cx| {
+                let view = cx.new(|_| StartupError {
+                    message: error.message.into(),
+                    keychain: error.keychain,
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            }),
+        };
+        if let Err(e) = opened {
+            eprintln!("could not open the window: {e}");
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+    });
 }
 
 fn init_tracing() {

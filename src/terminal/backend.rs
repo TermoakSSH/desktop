@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{Value, json};
-use termoak_client::remote::{RemoteEvent, RemoteTerminal};
+use termoak_client::remote::{Participant, RemoteEvent, RemoteTerminal};
 use termoak_client::{ApiClient, LOCAL_OWNER, Workspace};
 use termoak_core::Id;
 use termoak_core::model::{Host, SecretUpdate};
@@ -32,6 +32,63 @@ pub enum Cmd {
     Close,
     /// Ends the server session (owner only).
     CloseSession,
+    /// Something about the keyboard or the people in a shared session.
+    Share(ShareAction),
+}
+
+/// Actions in a shared session: asking for the keyboard (participants) and
+/// deciding (the owner). See the server's `WEBSOCKET-PROTOCOL.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareAction {
+    RequestControl,
+    /// Gives the keyboard back (or withdraws the request).
+    ReleaseControl,
+    GrantControl(Id),
+    DenyControl(Id),
+    TakeControl,
+    AllowJoin(Id),
+    DenyJoin(Id),
+    /// Sends a participant away (`true`: and revokes the share they used).
+    Kick(Id, bool),
+    StopSharing,
+}
+
+/// A link to join a session shared with a link: the server (signed in to
+/// it or not) and the path of its WebSocket.
+#[derive(Clone)]
+pub struct LinkJoin {
+    pub api: ApiClient,
+    /// `/api/v1/sessions/{id}/ws?share_token=…`.
+    pub ws_path: String,
+    /// Display name of a guest without an account on that server.
+    pub guest_name: Option<String>,
+}
+
+impl std::fmt::Debug for LinkJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The path carries the token: not printed.
+        f.debug_struct("LinkJoin")
+            .field("server", &self.api.base_url())
+            .field("guest_name", &self.guest_name)
+            .finish()
+    }
+}
+
+/// What this side learns when it gets into a server session (`hello`).
+#[derive(Debug, Clone)]
+pub struct RemoteSeat {
+    pub session_id: Id,
+    /// Input and resizes reach the terminal now.
+    pub can_write: bool,
+    pub owner: bool,
+    /// Your participant id.
+    pub participant: Option<Id>,
+    /// `owner`, `control` (can ask for the keyboard) or `view`.
+    pub access: String,
+    /// Name of the session's owner (sessions shared with you).
+    pub owner_name: Option<String>,
+    pub participants: Vec<Participant>,
+    pub driver: Option<Id>,
 }
 
 /// Events for the view.
@@ -43,10 +100,31 @@ pub enum Out {
     /// Local shell running.
     Shell,
     /// Attached to a server session.
-    Remote {
-        session_id: Id,
+    Remote(RemoteSeat),
+    /// The keyboard changed hands (`driver`: `None` = the owner).
+    Control {
+        driver: Option<Id>,
+        driver_name: Option<String>,
         can_write: bool,
     },
+    /// Who is in the session (and, for the owner, who waits).
+    Participants {
+        list: Vec<Participant>,
+        driver: Option<Id>,
+    },
+    /// In the waiting room until the owner lets you in.
+    Waiting {
+        owner: String,
+        title: String,
+    },
+    /// Owner: someone waits to be let in.
+    JoinRequest(Participant),
+    /// Owner: someone asks for the keyboard.
+    ControlRequest(Participant),
+    /// The owner said no to your request for the keyboard.
+    ControlDenied,
+    /// The server sent you away for good (`revoked`, `kicked`...).
+    Ended(String),
     Data(Bytes),
     /// The screen must be cleared: the full history is coming.
     Reset,
@@ -157,7 +235,7 @@ async fn run_local(
                     cmd = cmd_rx.recv() => match cmd {
                         Some(Cmd::Close) | Some(Cmd::CloseSession) | None => return,
                         Some(Cmd::Resize(c, r)) => size = (c, r),
-                        Some(Cmd::Input(_)) => {}
+                        Some(Cmd::Input(_)) | Some(Cmd::Share(_)) => {}
                     }
                 }
             }
@@ -219,6 +297,8 @@ async fn run_local(
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Input(b)) => { let _ = term.write(b).await; }
                 Some(Cmd::Resize(c, r)) => { let _ = term.resize(c, r).await; }
+                // Sharing a local terminal goes through its relay.
+                Some(Cmd::Share(_)) => {}
                 Some(Cmd::Close) | Some(Cmd::CloseSession) | None => {
                     term.close().await;
                     return;
@@ -254,6 +334,8 @@ pub enum ServerTarget {
     New { host_id: Id },
     /// Attach to an existing session (own or shared).
     Attach { session_id: Id },
+    /// Join with a link (maybe on another server, maybe as a guest).
+    Link { session_id: Id, link: LinkJoin },
 }
 
 /// Starts a terminal that lives on the server.
@@ -280,8 +362,9 @@ async fn run_server(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<Out>,
 ) {
-    let session_id = match target {
-        ServerTarget::Attach { session_id } => session_id,
+    let (session_id, link) = match target {
+        ServerTarget::Attach { session_id } => (session_id, None),
+        ServerTarget::Link { session_id, link } => (session_id, Some(link)),
         ServerTarget::New { host_id } => {
             let _ = out.send(Out::Status(
                 t!("terminal.status.opening_server_session").to_string(),
@@ -294,7 +377,7 @@ async fn run_server(
                 .await;
             match created {
                 Ok(v) => match v["id"].as_str().and_then(|s| s.parse::<Id>().ok()) {
-                    Some(id) => id,
+                    Some(id) => (id, None),
                     None => {
                         let _ =
                             out.send(Out::Failed(t!("terminal.status.no_session_id").to_string()));
@@ -311,13 +394,19 @@ async fn run_server(
     let _ = out.send(Out::Status(
         t!("terminal.status.connecting_server_session").to_string(),
     ));
-    let (remote, mut events) = match RemoteTerminal::attach(&api, session_id).await {
+    let attached = match &link {
+        Some(l) => RemoteTerminal::attach_as(&l.api, &l.ws_path, l.guest_name.as_deref()).await,
+        None => RemoteTerminal::attach(&api, session_id).await,
+    };
+    let (remote, mut events) = match attached {
         Ok(r) => r,
         Err(e) => {
             let _ = out.send(Out::Failed(api_error(e)));
             return;
         }
     };
+    // Remembered by the client and sent only while this side can write
+    // (the owner or whoever has the keyboard decides the size).
     remote.resize(cols, rows).await;
     let mut announced = false;
     loop {
@@ -329,20 +418,25 @@ async fn run_server(
                 };
                 match ev {
                     RemoteEvent::Hello(v) => {
-                        let access = v["you"]["access"].as_str().unwrap_or("view");
-                        let can_write = access == "owner" || access == "control";
-                        let _ = out.send(Out::Remote { session_id, can_write });
+                        let _ = out.send(Out::Remote(seat_from_hello(session_id, &v, &remote)));
                         announced = true;
-                        if let Some(n) = v["session"]["viewers"].as_array().map(|a| a.len()) {
-                            let _ = out.send(Out::Presence(n));
-                        }
                         if let Some(msg) = state_message(&v["session"]["state"]) {
                             let _ = out.send(Out::Status(msg));
                         }
                     }
                     RemoteEvent::Output(b) => {
                         if !announced {
-                            let _ = out.send(Out::Remote { session_id, can_write: true });
+                            // Servers that do not say hello: the owner.
+                            let _ = out.send(Out::Remote(RemoteSeat {
+                                session_id,
+                                can_write: true,
+                                owner: true,
+                                participant: None,
+                                access: "owner".into(),
+                                owner_name: None,
+                                participants: Vec::new(),
+                                driver: None,
+                            }));
                             announced = true;
                         }
                         let _ = out.send(Out::Data(b));
@@ -361,8 +455,24 @@ async fn run_server(
                     RemoteEvent::Presence(v) => {
                         let _ = out.send(Out::Presence(v.as_array().map(|a| a.len()).unwrap_or(0)));
                     }
+                    RemoteEvent::Participants { participants, driver } => {
+                        let _ = out.send(Out::Participants { list: participants, driver });
+                    }
+                    RemoteEvent::Control { driver, driver_name, can_write } => {
+                        let _ = out.send(Out::Control { driver, driver_name, can_write });
+                    }
+                    RemoteEvent::Waiting(v) => {
+                        let _ = out.send(Out::Waiting {
+                            owner: v["session"]["owner"].as_str().unwrap_or("").to_string(),
+                            title: v["session"]["title"].as_str().unwrap_or("").to_string(),
+                        });
+                    }
+                    RemoteEvent::JoinRequest(p) => { let _ = out.send(Out::JoinRequest(p)); }
+                    RemoteEvent::ControlRequest(p) => { let _ = out.send(Out::ControlRequest(p)); }
+                    RemoteEvent::ControlDenied => { let _ = out.send(Out::ControlDenied); }
                     RemoteEvent::Prompt(v) => forward_prompt(&prompter, &remote, v),
                     RemoteEvent::Error(msg) => { let _ = out.send(Out::Notice(msg)); }
+                    RemoteEvent::Ended { code, .. } => { let _ = out.send(Out::Ended(code)); }
                     RemoteEvent::Reconnecting => {
                         let _ = out.send(Out::Status(t!("terminal.status.reconnecting").to_string()));
                     }
@@ -374,9 +484,11 @@ async fn run_server(
                 }
             }
             cmd = cmd_rx.recv() => match cmd {
-                Some(Cmd::Input(b)) => remote.input(b).await,
+                // Read-only: nothing is sent (the client drops it too).
+                Some(Cmd::Input(b)) => if remote.can_write() { remote.input(b).await },
                 Some(Cmd::Resize(c, r)) => remote.resize(c, r).await,
                 Some(Cmd::CloseSession) => remote.close_session().await,
+                Some(Cmd::Share(action)) => share_action(&remote, action).await,
                 Some(Cmd::Close) | None => {
                     remote.detach().await;
                     return;
@@ -390,6 +502,45 @@ async fn run_server(
         }
     }
     remote.detach().await;
+}
+
+/// What the `hello` says about this side.
+fn seat_from_hello(session_id: Id, v: &Value, remote: &RemoteTerminal) -> RemoteSeat {
+    let you = &v["you"];
+    let session = &v["session"];
+    let access = you["access"]
+        .as_str()
+        .or_else(|| session["access"].as_str())
+        .unwrap_or("view")
+        .to_string();
+    RemoteSeat {
+        session_id,
+        can_write: remote.can_write(),
+        owner: remote.is_owner(),
+        participant: remote.participant_id(),
+        access,
+        owner_name: session["owner_name"]
+            .as_str()
+            .filter(|n| !n.trim().is_empty())
+            .map(str::to_string),
+        participants: Participant::list_from_json(&session["participants"]),
+        driver: remote.driver(),
+    }
+}
+
+/// Sends an action of a shared session.
+async fn share_action(remote: &RemoteTerminal, action: ShareAction) {
+    match action {
+        ShareAction::RequestControl => remote.request_control().await,
+        ShareAction::ReleaseControl => remote.release_control().await,
+        ShareAction::GrantControl(p) => remote.grant_control(p).await,
+        ShareAction::DenyControl(p) => remote.deny_control(p).await,
+        ShareAction::TakeControl => remote.take_control().await,
+        ShareAction::AllowJoin(p) => remote.allow_join(p).await,
+        ShareAction::DenyJoin(p) => remote.deny_join(p).await,
+        ShareAction::Kick(p, revoke) => remote.kick(p, revoke).await,
+        ShareAction::StopSharing => remote.stop_sharing().await,
+    }
 }
 
 /// Text for a server session state (`{"state": ...}`).

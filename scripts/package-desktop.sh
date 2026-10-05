@@ -26,10 +26,11 @@ case "$platform" in
 Type=Application
 Name=Termoak
 Comment=SSH client with AI
-Exec=termoak-desktop
+Exec=termoak-desktop %u
 Icon=termoak
 Categories=Network;System;TerminalEmulator;
 Terminal=false
+MimeType=x-scheme-handler/termoak;x-scheme-handler/aceitunoak;
 DESKTOP
     ln -s usr/bin/termoak-desktop "$appdir/AppRun"
     tool="$(mktemp -d)/appimagetool"
@@ -68,7 +69,7 @@ DESKTOP
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundleURLTypes</key>
-  <array><dict><key>CFBundleURLSchemes</key><array><string>termoak</string></array></dict></array>
+  <array><dict><key>CFBundleURLName</key><string>com.termoak.Termoak</string><key>CFBundleURLSchemes</key><array><string>termoak</string><string>aceitunoak</string></array></dict></array>
 </dict>
 </plist>
 PLIST

@@ -11,6 +11,7 @@ pub mod model;
 pub mod mouse;
 pub mod paste;
 pub mod serial;
+mod share_ui;
 pub mod shell;
 
 use std::ops::Range;
@@ -39,10 +40,12 @@ use termoak_core::Id;
 use termoak_ssh::terminal::OutputHub;
 use termoak_ssh::{Connection, TerminalSession};
 
-use self::backend::{Backend, Cmd, LocalParams, Out, ServerTarget};
+use self::backend::{Backend, Cmd, LinkJoin, LocalParams, Out, ServerTarget};
 use self::complete::{LineTracker, Suggestions};
 use self::element::{PADDING, TerminalElement};
 use self::model::{Snapshot, TermEvent, TermModel};
+use self::share_ui::ShareState;
+pub use self::share_ui::{RequestKind, ShareRequest};
 use crate::runtime;
 use crate::state::{AppModel, ToastKind, api_error};
 use crate::theme::TermPalette;
@@ -126,6 +129,8 @@ pub enum TermKind {
     Server {
         host_id: Option<Id>,
         session_id: Option<Id>,
+        /// Joined with a link (maybe on another server, maybe as a guest).
+        link: Option<LinkJoin>,
     },
     /// Shell of this computer (local terminal, no SSH).
     Shell,
@@ -167,6 +172,13 @@ pub enum TerminalEvent {
     Broadcast(BroadcastInput),
     /// A button of the pane controls (split view) was pressed.
     Pane(PaneAction),
+    /// Someone waits to be let in or asks for the keyboard (owner).
+    ShareRequest(ShareRequest),
+    /// That request was answered (here, from another device or by leaving).
+    ShareRequestDone {
+        kind: RequestKind,
+        participant: Id,
+    },
 }
 
 /// User input repeated in the other panes while broadcasting. It is kept as
@@ -276,6 +288,8 @@ pub struct TerminalView {
     /// Right-click menu open, where it was opened.
     context_menu: Option<(Entity<PopupMenu>, Point<Pixels>, gpui::Subscription)>,
     find: Option<FindBar>,
+    /// Live sharing: participants, keyboard, requests.
+    share: ShareState,
     _reader: Option<Task<()>>,
 }
 
@@ -332,6 +346,7 @@ impl TerminalView {
             pane: None,
             context_menu: None,
             find: None,
+            share: ShareState::default(),
             _reader: None,
         }
     }
@@ -363,6 +378,31 @@ impl TerminalView {
             TermKind::Server {
                 host_id,
                 session_id,
+                link: None,
+            },
+            title,
+            cx,
+        );
+        view.connect(window, cx);
+        view
+    }
+
+    /// Session shared with a link: joins it (as a guest if not signed in
+    /// to that server).
+    pub fn join_link(
+        app: Entity<AppModel>,
+        session_id: Id,
+        link: LinkJoin,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::base(
+            app,
+            TermKind::Server {
+                host_id: None,
+                session_id: Some(session_id),
+                link: Some(link),
             },
             title,
             cx,
@@ -417,9 +457,13 @@ impl TerminalView {
     pub fn copilot_context(&self, cx: &App) -> AiContext {
         let (host_id, session_id) = match &self.kind {
             TermKind::Local { host_id } => (Some(*host_id), self.share_session),
+            // A session joined with a link may be on another server: the
+            // AI (on your server) cannot reach it.
+            TermKind::Server { link: Some(_), .. } => (None, None),
             TermKind::Server {
                 host_id,
                 session_id,
+                ..
             } => (*host_id, *session_id),
             TermKind::Shell | TermKind::Serial { .. } => (None, self.share_session),
         };
@@ -517,6 +561,7 @@ impl TerminalView {
         self.mouse_held = None;
         self.clear_line();
         self.model.reset();
+        self.reset_share();
         let (cols, rows) = (self.model.cols(), self.model.rows());
         let app = self.app.read(cx);
         let rt = runtime::handle(cx);
@@ -534,8 +579,24 @@ impl TerminalView {
                 },
             )),
             TermKind::Server {
+                session_id: Some(session_id),
+                link: Some(link),
+                ..
+            } => Some(backend::start_server(
+                &rt,
+                link.api.clone(),
+                ServerTarget::Link {
+                    session_id: *session_id,
+                    link: link.clone(),
+                },
+                app.prompter.clone(),
+                cols,
+                rows,
+            )),
+            TermKind::Server {
                 host_id,
                 session_id,
+                ..
             } => match app.api.clone() {
                 Some(api) => {
                     let target = match (session_id, host_id) {
@@ -621,18 +682,37 @@ impl TerminalView {
                     self.state = TermState::Running;
                     self.sync_size();
                 }
-                Out::Remote {
-                    session_id,
-                    can_write,
-                } => {
+                Out::Remote(seat) => {
                     if let TermKind::Server { session_id: s, .. } = &mut self.kind {
-                        *s = Some(session_id);
+                        *s = Some(seat.session_id);
                     }
-                    self.share_session = Some(session_id);
-                    self.can_write = can_write;
+                    self.share_session = Some(seat.session_id);
+                    self.on_remote_seat(seat, cx);
                     self.state = TermState::Running;
                     self.sync_size();
                 }
+                Out::Control {
+                    driver,
+                    driver_name,
+                    can_write,
+                } => self.on_control(driver, driver_name, Some(can_write), cx),
+                Out::Participants { list, driver } => self.on_participants(list, driver, cx),
+                Out::Waiting { owner, title } => {
+                    self.share.waiting = Some((owner, title));
+                    self.can_write = false;
+                }
+                Out::JoinRequest(p) => self.on_share_request(RequestKind::Join, p, cx),
+                Out::ControlRequest(p) => self.on_share_request(RequestKind::Control, p, cx),
+                Out::ControlDenied => {
+                    self.app.update(cx, |m, cx| {
+                        m.toast(
+                            ToastKind::Info,
+                            t!("share.toast.control_denied").to_string(),
+                            cx,
+                        )
+                    });
+                }
+                Out::Ended(code) => self.on_ended(code),
                 Out::Data(bytes) => {
                     if matches!(self.state, TermState::Connecting(_)) {
                         self.state = TermState::Running;
@@ -678,8 +758,15 @@ impl TerminalView {
                     }
                     self.ime_marked = None;
                     self.mouse_held = None;
-                    self.state = TermState::Closed(reason);
-                    self.stop_relay(cx);
+                    self.share.waiting = None;
+                    // The connection closing right after the reason (status,
+                    // end code) does not erase it.
+                    let keep =
+                        matches!(&self.state, TermState::Closed(Some(_))) && reason.is_none();
+                    if !keep {
+                        self.state = TermState::Closed(reason);
+                    }
+                    self.stop_relay(false, cx);
                 }
                 Out::Failed(e) => self.state = TermState::Failed(e),
             }
@@ -718,7 +805,7 @@ impl TerminalView {
 
     /// Closes the terminal (or detaches from the server session).
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
-        self.stop_relay(cx);
+        self.stop_relay(false, cx);
         if let Some(b) = self.backend.take() {
             b.send(Cmd::Close);
         }
@@ -1936,7 +2023,9 @@ impl TerminalView {
 
     // ----- Sharing -----
 
-    fn stop_relay(&mut self, cx: &mut Context<Self>) {
+    /// Stops sharing the terminal of this computer (`revoke`: revoking
+    /// every share first, so guests read "sharing stopped").
+    fn stop_relay(&mut self, revoke: bool, cx: &mut Context<Self>) {
         self.copilot_shared = false;
         if let Some((_, closed)) = self.local_feed.take() {
             let _ = closed.send(true);
@@ -1944,9 +2033,17 @@ impl TerminalView {
         if let Some(relay) = self.relay.take() {
             if !matches!(self.kind, TermKind::Server { .. }) {
                 self.share_session = None;
+                let done: Vec<_> = self.share.announced.drain().collect();
+                for (kind, participant) in done {
+                    cx.emit(TerminalEvent::ShareRequestDone { kind, participant });
+                }
+                self.share = ShareState::default();
             }
             runtime::handle(cx).spawn(async move {
                 if let Some(r) = relay.lock().await.take() {
+                    if revoke {
+                        r.stop_guests().await;
+                    }
                     r.stop().await;
                 }
             });
@@ -1965,7 +2062,10 @@ impl TerminalView {
             return;
         };
         if self.share_session.is_some() {
-            self.open_share_dialog(window, cx);
+            // Only the owner shares (a guest sees the participants instead).
+            if self.is_share_owner() {
+                self.open_share_dialog(window, cx);
+            }
             return;
         }
         let Some(term) = self.local.clone() else {
@@ -1989,6 +2089,7 @@ impl TerminalView {
             |this, res, window, cx| match res {
                 Ok(share) => {
                     this.share_session = Some(share.session_id);
+                    this.watch_relay(&share, cx);
                     this.relay = Some(Arc::new(tokio::sync::Mutex::new(Some(share))));
                     cx.notify();
                     this.open_share_dialog(window, cx);
@@ -2068,6 +2169,7 @@ impl TerminalView {
     /// The copilot has shared the terminal.
     pub fn adopt_share(&mut self, share: RelayShare, cx: &mut Context<Self>) {
         self.share_session = Some(share.session_id);
+        self.watch_relay(&share, cx);
         self.relay = Some(Arc::new(tokio::sync::Mutex::new(Some(share))));
         self.copilot_shared = true;
         cx.notify();
@@ -2077,7 +2179,7 @@ impl TerminalView {
     /// stops if the copilot shared it. What the user shared stays.
     pub fn stop_copilot_share(&mut self, cx: &mut Context<Self>) {
         if self.copilot_shared {
-            self.stop_relay(cx);
+            self.stop_relay(false, cx);
             cx.notify();
         }
     }
@@ -2092,7 +2194,7 @@ impl TerminalView {
 
     /// Stops sharing the terminal (asked by the share dialog).
     pub(crate) fn stop_sharing(&mut self, cx: &mut Context<Self>) {
-        self.stop_relay(cx);
+        self.stop_relay(false, cx);
     }
 
     // ----- AI -----
@@ -2443,6 +2545,12 @@ impl TerminalView {
         // stay in the right-click menu.
         let pane = self.pane;
         let compact = pane.is_some();
+        let participants = self.render_participants(cx);
+        let theme = cx.theme();
+        // You own what this tab shows: sharing and ending it are yours.
+        let owner = !is_server || self.is_share_owner();
+        // Sent away for good: coming back makes no sense.
+        let can_reconnect = self.share.ended.is_none() || self.share.owner;
         let (kind_label, kind_color) = match self.kind {
             TermKind::Local { .. } => (t!("terminal.kind.local"), theme.primary),
             TermKind::Server { .. } => (t!("terminal.kind.server"), theme.info),
@@ -2473,15 +2581,20 @@ impl TerminalView {
                 this.child(ui::pill(kind_label, kind_color))
             })
             .when(
-                self.share_session.is_some() && self.relay.is_some(),
+                self.share_session.is_some() && self.relay.is_some() && !compact,
                 |this| this.child(ui::pill(t!("terminal.shared"), theme.success)),
             )
-            .when(self.viewers > 1, |this| {
+            .when(self.share.relay_offline, |this| {
+                this.child(ui::pill(t!("share.relay_reconnecting"), theme.warning))
+            })
+            // Servers before live sharing only say how many are connected.
+            .when(participants.is_none() && self.viewers > 1, |this| {
                 this.child(ui::pill(tn!("terminal.viewers", self.viewers), theme.info))
             })
-            .when(!self.can_write && running && is_server, |this| {
-                this.child(ui::pill(t!("terminal.read_only"), theme.warning))
-            })
+            .when(
+                !self.can_write && running && is_server && !self.share.known,
+                |this| this.child(ui::pill(t!("terminal.read_only"), theme.warning)),
+            )
             .child(
                 div()
                     .flex_1()
@@ -2492,7 +2605,8 @@ impl TerminalView {
                     .whitespace_nowrap()
                     .child(status),
             )
-            .when(ended, |this| {
+            .children(participants)
+            .when(ended && can_reconnect, |this| {
                 this.child(
                     Button::new("reconnect")
                         .small()
@@ -2596,7 +2710,7 @@ impl TerminalView {
             })
             // Sharing goes through the SSH session (relay) or the server one;
             // the local shell is not shared.
-            .when(!is_shell, |this| {
+            .when(!is_shell && owner, |this| {
                 this.child(
                     Button::new("share")
                         .small()
@@ -2614,7 +2728,7 @@ impl TerminalView {
                         })),
                 )
             })
-            .when(is_server && running, |this| {
+            .when(is_server && running && owner, |this| {
                 this.child(
                     Button::new("close-server-session")
                         .small()
@@ -2773,7 +2887,11 @@ impl Render for TerminalView {
         let (font, font_size) = self.terminal_font(cx);
         let _ = window;
         let toolbar = self.render_toolbar(cx);
-        let overlay = self.render_overlay(cx);
+        let banners = self.render_share_banners(cx);
+        let overlay = self
+            .render_waiting(cx)
+            .or_else(|| self.render_ended(cx))
+            .or_else(|| self.render_overlay(cx));
         let suggestions = self.render_suggestions(cx);
         let find = self.render_find(cx);
         let context_menu = self.context_menu.as_ref().map(|(menu, position, _)| {
@@ -2790,6 +2908,7 @@ impl Render for TerminalView {
             .size_full()
             .bg(palette.background)
             .child(toolbar)
+            .children(banners)
             .child(
                 div()
                     .id("terminal-area")
