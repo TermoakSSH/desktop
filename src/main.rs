@@ -26,6 +26,7 @@ mod app;
 mod links;
 mod local_ai;
 mod menus;
+mod notifications;
 mod panes;
 mod prompts;
 mod qr;
@@ -105,6 +106,9 @@ fn main() {
     let application = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
     application.on_open_urls(|urls| urls.into_iter().for_each(links::deliver));
     application.run(move |cx: &mut App| {
+        // Before any window: Windows toasts need the AppUserModelID and
+        // Linux shows the name in the notifications.
+        cx.set_app_identity(notifications::APP_ID, notifications::APP_NAME);
         gpui_component::init(cx);
         runtime::init(cx, rt);
         theme::init(cx, settings.dark);
@@ -178,7 +182,7 @@ fn window_options(cx: &mut App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(860.), px(540.))),
-        app_id: Some("com.termoak.Termoak".into()),
+        app_id: Some(notifications::APP_ID.into()),
         ..TitleBar::window_options()
     }
 }

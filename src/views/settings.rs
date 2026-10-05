@@ -498,6 +498,100 @@ impl SettingsView {
             )
     }
 
+    /// Changes the notification preferences. Turning them on asks macOS
+    /// for permission (only the first time does the system ask).
+    fn set_notifications(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut crate::notifications::NotificationPrefs),
+    ) {
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            let was = s.notifications.enabled;
+            f(&mut s.notifications);
+            if s.notifications.enabled && !was {
+                crate::notifications::request_authorization();
+            }
+            m.save_settings(s, cx);
+        });
+    }
+
+    fn render_notifications(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let prefs = self.model.read(cx).settings.notifications;
+        let muted = cx.theme().muted_foreground;
+        let hint = |text: gpui::SharedString| div().text_xs().text_color(muted).child(text);
+        let off = !prefs.enabled;
+        self.render_card(t!("settings.notifications.title"), IconName::Bell, cx)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("notifications-enabled")
+                            .label(t!("settings.notifications.enabled"))
+                            .checked(prefs.enabled)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_notifications(cx, |p| p.enabled = v)
+                            })),
+                    )
+                    .child(hint(if cfg!(target_os = "macos") {
+                        t!("settings.notifications.enabled_hint_macos")
+                    } else {
+                        t!("settings.notifications.enabled_hint")
+                    })),
+            )
+            .child(
+                v_flex()
+                    .gap_3()
+                    .pl_4()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("notifications-sharing")
+                                    .label(t!("settings.notifications.sharing"))
+                                    .checked(prefs.sharing)
+                                    .disabled(off)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        let v = *v;
+                                        this.set_notifications(cx, |p| p.sharing = v)
+                                    })),
+                            )
+                            .child(hint(t!("settings.notifications.sharing_hint"))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("notifications-shared")
+                                    .label(t!("settings.notifications.shared_with_me"))
+                                    .checked(prefs.shared_with_me)
+                                    .disabled(off)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        let v = *v;
+                                        this.set_notifications(cx, |p| p.shared_with_me = v)
+                                    })),
+                            )
+                            .child(hint(t!("settings.notifications.shared_with_me_hint"))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("notifications-ai")
+                                    .label(t!("settings.notifications.ai"))
+                                    .checked(prefs.ai)
+                                    .disabled(off)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        let v = *v;
+                                        this.set_notifications(cx, |p| p.ai = v)
+                                    })),
+                            )
+                            .child(hint(t!("settings.notifications.ai_hint"))),
+                    ),
+            )
+    }
+
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ws = self.model.read(cx).ws.clone();
         ui::confirm(
@@ -1499,6 +1593,7 @@ impl Render for SettingsView {
         let account = self.render_account(cx);
         let appearance = self.render_appearance(cx);
         let paste = self.render_paste(cx);
+        let notifications = self.render_notifications(cx);
         let updates = self.render_updates(cx);
         let about = self.render_about(cx);
         v_flex().size_full().child(header).child(
@@ -1510,6 +1605,7 @@ impl Render for SettingsView {
                         .child(account)
                         .child(appearance)
                         .child(paste)
+                        .child(notifications)
                         .child(updates)
                         .child(about),
                 ),

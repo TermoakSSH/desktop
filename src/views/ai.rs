@@ -201,6 +201,11 @@ impl AiView {
         );
     }
 
+    /// Shows a task (from a notification).
+    pub fn open_task(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Some(id), window, cx);
+    }
+
     fn select(&mut self, id: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = id;
         self.chat.update(cx, |c, cx| c.set_task(id, window, cx));

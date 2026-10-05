@@ -624,11 +624,14 @@ pub enum SessionNotice {
         session_id: Id,
         title: String,
         name: String,
+        /// Who asks (the same id the open terminal sees).
+        participant: Option<Id>,
     },
     ControlRequest {
         session_id: Id,
         title: String,
         name: String,
+        participant: Option<Id>,
     },
     ControlGranted {
         session_id: Id,
@@ -640,6 +643,13 @@ pub enum SessionNotice {
         session_id: Id,
         host: String,
     },
+    /// Someone shared a session with you (directly or through a team).
+    SessionShared {
+        session_id: Id,
+        title: String,
+        by: String,
+        team: Option<String>,
+    },
 }
 
 impl SessionNotice {
@@ -648,7 +658,24 @@ impl SessionNotice {
             return None;
         }
         let n = &v["notice"];
+        if n["type"] == "session_shared" {
+            let s = &n["session"];
+            return Some(SessionNotice::SessionShared {
+                session_id: s["id"].as_str()?.parse().ok()?,
+                title: s["title"].as_str().unwrap_or("").to_string(),
+                by: n["by"]
+                    .as_str()
+                    .filter(|b| !b.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| t!("share.role.guest").to_string()),
+                team: n["team"]
+                    .as_str()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_string),
+            });
+        }
         let session_id: Id = n["session_id"].as_str()?.parse().ok()?;
+        let participant = n["participant"]["id"].as_str().and_then(|s| s.parse().ok());
         let title = || n["title"].as_str().unwrap_or("").to_string();
         let name = || {
             n["participant"]["name"]
@@ -662,11 +689,13 @@ impl SessionNotice {
                 session_id,
                 title: title(),
                 name: name(),
+                participant,
             },
             "control_request" => SessionNotice::ControlRequest {
                 session_id,
                 title: title(),
                 name: name(),
+                participant,
             },
             "control_granted" => SessionNotice::ControlGranted { session_id },
             "control_revoked" => SessionNotice::ControlRevoked { session_id },
@@ -684,7 +713,8 @@ impl SessionNotice {
             | SessionNotice::ControlRequest { session_id, .. }
             | SessionNotice::ControlGranted { session_id }
             | SessionNotice::ControlRevoked { session_id }
-            | SessionNotice::PromptPending { session_id, .. } => *session_id,
+            | SessionNotice::PromptPending { session_id, .. }
+            | SessionNotice::SessionShared { session_id, .. } => *session_id,
         }
     }
 
@@ -728,6 +758,24 @@ impl SessionNotice {
             SessionNotice::PromptPending { host, .. } => {
                 t!("share.notice.prompt_pending", host = host).to_string()
             }
+            SessionNotice::SessionShared {
+                title,
+                by,
+                team: Some(team),
+                ..
+            } => t!(
+                "share.notice.session_shared_team",
+                name = by,
+                team = team,
+                title = with_title(title)
+            )
+            .to_string(),
+            SessionNotice::SessionShared { title, by, .. } => t!(
+                "share.notice.session_shared",
+                name = by,
+                title = with_title(title)
+            )
+            .to_string(),
         }
     }
 }
@@ -1035,16 +1083,18 @@ mod tests {
     #[test]
     fn notices() {
         let sid = termoak_core::new_id();
+        let ana = termoak_core::new_id();
         let n = SessionNotice::from_event(&json!({"type": "session", "notice": {
             "type": "join_request", "session_id": sid, "title": "prod",
-            "participant": {"id": termoak_core::new_id(), "name": "Ana"}}}))
+            "participant": {"id": ana, "name": "Ana"}}}))
         .unwrap();
         assert_eq!(
             n,
             SessionNotice::JoinRequest {
                 session_id: sid,
                 title: "prod".into(),
-                name: "Ana".into()
+                name: "Ana".into(),
+                participant: Some(ana),
             }
         );
         assert!(n.needs_owner());
@@ -1060,5 +1110,18 @@ mod tests {
             .is_none()
         );
         assert!(SessionNotice::from_event(&json!({"type": "ai"})).is_none());
+
+        let shared = SessionNotice::from_event(&json!({"type": "session", "notice": {
+            "type": "session_shared", "by": "Ana",
+            "session": {"id": sid, "title": "prod", "kind": "server"}}}))
+        .unwrap();
+        assert_eq!(shared.session_id(), sid);
+        assert!(!shared.needs_owner());
+        assert_eq!(shared.text(), "Ana shared “prod” with you");
+        let team = SessionNotice::from_event(&json!({"type": "session", "notice": {
+            "type": "session_shared", "by": "Ana", "team": "Ops",
+            "session": {"id": sid, "title": ""}}}))
+        .unwrap();
+        assert_eq!(team.text(), "Ana (team “Ops”) shared “Session” with you");
     }
 }

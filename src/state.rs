@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::local_ai::{AiSettings, RunOn};
+use crate::notifications::NotificationPrefs;
 use crate::prompts::DesktopPrompter;
 use crate::runtime;
 use crate::terminal::paste::RightClick;
@@ -62,6 +63,8 @@ pub struct Settings {
     pub copy_on_select: bool,
     /// Ask before pasting more than one line.
     pub confirm_multiline_paste: bool,
+    /// Notifications of the system while the window is in the background.
+    pub notifications: NotificationPrefs,
 }
 
 impl Default for Settings {
@@ -79,6 +82,7 @@ impl Default for Settings {
             right_click: RightClick::Menu,
             copy_on_select: false,
             confirm_multiline_paste: true,
+            notifications: NotificationPrefs::default(),
         }
     }
 }

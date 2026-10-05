@@ -71,6 +71,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
+# macOS: asks for permission to notify before the first notification
+# (src/notifications.rs); the same crates GPUI uses for its notifications.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter"] }
+
 [profile.dev]
 debug = "line-tables-only"
 

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, EntityId, FocusHandle, Focusable,
@@ -30,6 +31,7 @@ use termoak_ssh::Connection;
 use crate::local_ai::copilot::{LocalAi, LocalAiGlobal};
 use crate::local_ai::terminals::{LocalTerminals, TermRequest, screen_tail};
 use crate::menus::{self, MenuState};
+use crate::notifications::{self, AiNotice, Category, Notice, Notifier, Target};
 use crate::panes::{self, Dir, MAX_PANES};
 use crate::prompts::{self, PromptRequest};
 use crate::runtime;
@@ -406,6 +408,9 @@ pub struct AppView {
     copilots: HashMap<EntityId, (Entity<AiChat>, Subscription)>,
     /// Own sessions running on the server (for the Home notice).
     cloud_sessions: usize,
+    /// Notifications of the system posted while the window was in the
+    /// background (repeats and where a click leads).
+    notifier: Notifier,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -466,6 +471,7 @@ impl AppView {
             cx.subscribe_in(&model, window, |this, _, ev: &ModelEvent, window, cx| {
                 match ev {
                     ModelEvent::Toast(kind, msg) => ui::notify(window, cx, *kind, msg.clone()),
+                    ModelEvent::Server(v) if v["type"] == "ai" => this.on_ai_event(v, window, cx),
                     // When starting signed in or when signing in: the running
                     // sessions, as dormant tabs.
                     ModelEvent::SessionChanged => this.restore_cloud_tabs(true, window, cx),
@@ -521,9 +527,27 @@ impl AppView {
             copilot_open: false,
             copilots: HashMap::new(),
             cloud_sessions: 0,
+            notifier: Notifier::default(),
             focus: cx.focus_handle(),
             _subs: subs,
         };
+        // A click on a notification of the system: the window comes to the
+        // front with what it was about.
+        let app = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.on_system_notification_response(move |response, cx| {
+            let Some(app) = app.upgrade() else { return };
+            let _ = handle.update(cx, |_, window, cx| {
+                app.update(cx, |app, cx| {
+                    app.on_notification_click(&response.tag, window, cx)
+                });
+            });
+        });
+        // macOS asks for permission once; before the first notice, so that
+        // one is not lost.
+        if view.model.read(cx).settings.notifications.enabled {
+            notifications::request_authorization();
+        }
         // If the server session was already restored, the event will not come.
         if logged_in {
             view.restore_cloud_tabs(true, window, cx);
@@ -607,6 +631,17 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.notify_system(
+            Notice {
+                category: Category::Sharing,
+                key: notifications::request_key(req.kind == RequestKind::Join, req.participant),
+                title: req.title.clone(),
+                body: req.text().to_string(),
+                target: Target::Terminal(id),
+            },
+            window,
+            cx,
+        );
         if self.terminal_in_view(id, window) {
             return;
         }
@@ -704,16 +739,38 @@ impl AppView {
         let title = match &notice {
             SessionNotice::JoinRequest { title, .. }
             | SessionNotice::ControlRequest { title, .. }
+            | SessionNotice::SessionShared { title, .. }
                 if !title.is_empty() =>
             {
                 title.clone()
             }
             _ => t!("server_sessions.default_title").to_string(),
         };
+        let shared = matches!(notice, SessionNotice::SessionShared { .. });
+        let heading = if shared {
+            t!("share.notice.shared_title")
+        } else {
+            t!("share.notice.title")
+        };
+        let (category, key) = notifications::session_notice_key(&notice);
+        self.notify_system(
+            Notice {
+                category,
+                key,
+                title: heading.to_string(),
+                body: notice.text(),
+                target: Target::Session {
+                    session_id,
+                    title: title.clone(),
+                },
+            },
+            window,
+            cx,
+        );
         let mut note = Notification::info(notice.text())
             .id1::<SessionNoticeToast>(SharedString::from(session_id.to_string()))
-            .title(t!("share.notice.title"));
-        if notice.needs_owner() {
+            .title(heading);
+        if notice.needs_owner() || shared {
             let app = cx.entity().downgrade();
             note = note.action(move |_, _, _| {
                 let app = app.clone();
@@ -736,9 +793,53 @@ impl AppView {
         window.push_notification(note, cx);
     }
 
+    /// An event of an AI task: a task on this computer needing approval or
+    /// ending shows a toast (the server's ones are in the AI section); both
+    /// become a notification of the system in the background.
+    fn on_ai_event(&mut self, v: &serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = AiNotice::from_event(v) else {
+            return;
+        };
+        let local = v["local"] == true;
+        if local {
+            let (kind, text) = notice.toast(true);
+            ui::notify(window, cx, kind, text);
+        }
+        self.notify_system(notice.notice(local), window, cx);
+    }
+
+    /// Posts a notice as a notification of the system if the window is in
+    /// the background and its kind is on in Settings (see `notifications`).
+    fn notify_system(&mut self, notice: Notice, window: &Window, cx: &mut Context<Self>) {
+        let prefs = self.model.read(cx).settings.notifications;
+        if let Some(n) =
+            self.notifier
+                .admit(&prefs, notice, window.is_window_active(), Instant::now())
+        {
+            cx.show_system_notification(n);
+        }
+    }
+
+    /// A notification of the system was clicked: the window comes to the
+    /// front and opens what it was about.
+    fn on_notification_click(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
+        match self.notifier.clicked(tag) {
+            Some(Target::Terminal(id)) => self.show_terminal(id, window, cx),
+            Some(Target::Session { session_id, title }) => {
+                self.open(OpenRequest::Attach { session_id, title }, window, cx)
+            }
+            Some(Target::AiTask(task_id)) => {
+                self.select_section(Section::Ai, window, cx);
+                self.ai.update(cx, |v, cx| v.open_task(task_id, window, cx));
+            }
+            None => {}
+        }
+    }
+
     /// Starts the engine of the AI tasks on this computer and passes its
-    /// events on like the server's (with a notification when a task needs
-    /// approval or ends).
+    /// events on like the server's (marked `"local"`).
     fn start_local_engine(
         local_ai: Arc<LocalAi>,
         model: Entity<AppModel>,
@@ -765,15 +866,13 @@ impl AppView {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let note = local_task_note(&ev.event);
                 let mut v = serde_json::to_value(&ev).unwrap_or_default();
                 v["type"] = "ai".into();
+                // The window shows its notices (`on_ai_event`).
+                v["local"] = true.into();
                 let alive = cx
-                    .update(|window, cx| {
+                    .update(|_, cx| {
                         model.update(cx, |_, cx| cx.emit(ModelEvent::Server(v)));
-                        if let Some((kind, text)) = note {
-                            ui::notify(window, cx, kind, text);
-                        }
                     })
                     .is_ok();
                 if !alive {
@@ -1257,6 +1356,29 @@ impl AppView {
             TerminalEvent::ShareRequestDone { kind, participant } => {
                 window.remove_notification1::<ShareRequestToast>(
                     request_key(*kind, *participant),
+                    cx,
+                );
+                let key = notifications::request_key(*kind == RequestKind::Join, *participant);
+                if let Some(tag) = self.notifier.forget(&key) {
+                    cx.dismiss_system_notification(&tag);
+                }
+            }
+            TerminalEvent::KeyboardChanged { you_drive, text } => {
+                let title = self
+                    .find_pane(id)
+                    .and_then(|(tab, _)| self.tabs[tab].panes())
+                    .and_then(|p| p.views().find(|v| v.entity_id() == id).cloned())
+                    .map(|v| v.read(cx).title(cx).to_string())
+                    .unwrap_or_else(|| t!("share.notice.title").to_string());
+                self.notify_system(
+                    Notice {
+                        category: Category::SharedWithMe,
+                        key: format!("keyboard:{id}:{you_drive}"),
+                        title,
+                        body: text.to_string(),
+                        target: Target::Terminal(id),
+                    },
+                    window,
                     cx,
                 );
             }
@@ -2983,31 +3105,5 @@ impl Render for AppView {
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
-    }
-}
-
-/// Notification for an event of a task on this computer: it needs approval
-/// or it ended.
-fn local_task_note(ev: &termoak_ai::TaskEvent) -> Option<(crate::state::ToastKind, SharedString)> {
-    use crate::state::ToastKind;
-    use termoak_ai::{TaskEvent, TaskStatus};
-    match ev {
-        TaskEvent::ApprovalRequested { summary, .. } => Some((
-            ToastKind::Warning,
-            t!("ai.local.approval_needed", action = summary.clone()),
-        )),
-        TaskEvent::Finished {
-            status: TaskStatus::Completed,
-            ..
-        } => Some((ToastKind::Success, t!("ai.local.finished"))),
-        TaskEvent::Finished {
-            status: TaskStatus::Failed,
-            error,
-            ..
-        } => Some((
-            ToastKind::Error,
-            t!("ai.local.failed", error = error.clone().unwrap_or_default()),
-        )),
-        _ => None,
     }
 }

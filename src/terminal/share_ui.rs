@@ -275,6 +275,10 @@ impl TerminalView {
         };
         self.app
             .update(cx, |m, cx| m.toast(ToastKind::Info, text.to_string(), cx));
+        cx.emit(TerminalEvent::KeyboardChanged {
+            you_drive: is_driver,
+            text,
+        });
     }
 
     /// Someone waits or asks for the keyboard (owner).

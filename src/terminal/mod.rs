@@ -179,6 +179,12 @@ pub enum TerminalEvent {
         kind: RequestKind,
         participant: Id,
     },
+    /// You got or lost the keyboard of a session shared with you (the
+    /// toast is already shown; the window may also notify the system).
+    KeyboardChanged {
+        you_drive: bool,
+        text: SharedString,
+    },
 }
 
 /// User input repeated in the other panes while broadcasting. It is kept as
