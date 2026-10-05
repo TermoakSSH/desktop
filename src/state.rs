@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::local_ai::{AiSettings, RunOn};
 use crate::prompts::DesktopPrompter;
 use crate::runtime;
+use crate::terminal::paste::RightClick;
 
 const SETTINGS_KEY: &str = "desktop.settings";
 const SYNC_EVERY: Duration = Duration::from_secs(60);
@@ -51,6 +52,16 @@ pub struct Settings {
     pub language: Option<String>,
     /// Where the AI runs on this device and with what (Settings → AI).
     pub ai: AiSettings,
+    /// A plain Ctrl+V pastes in the terminal (off macOS; off by default
+    /// because Ctrl+V is a control character there). Ctrl+Shift+V and
+    /// Shift+Insert always paste.
+    pub ctrl_v_pastes: bool,
+    /// What the right mouse button does in the terminal.
+    pub right_click: RightClick,
+    /// Selecting text in the terminal copies it.
+    pub copy_on_select: bool,
+    /// Ask before pasting more than one line.
+    pub confirm_multiline_paste: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +75,10 @@ impl Default for Settings {
             autocomplete: true,
             language: None,
             ai: AiSettings::default(),
+            ctrl_v_pastes: false,
+            right_click: RightClick::Menu,
+            copy_on_select: false,
+            confirm_multiline_paste: true,
         }
     }
 }
@@ -548,6 +563,133 @@ impl AppModel {
             }
             res
         })
+    }
+
+    /// Copies a host (with its password, in the same sync mode) as
+    /// "<label> (copy)".
+    pub fn duplicate_host(
+        &mut self,
+        id: Id,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Record<Host>, String>> {
+        let Some(rec) = self.host_record(id).cloned() else {
+            return Task::ready(Err(t!("hosts.error.not_found").to_string()));
+        };
+        let store = self.ws.store.clone();
+        let label = t!("hosts.copy_label", name = rec.data.label).to_string();
+        let fut = runtime::spawn(cx, async move {
+            let secret = if rec.meta.has_secret {
+                SecretUpdate::Set(store.secret::<Host>(LOCAL_OWNER, rec.data.id).await?)
+            } else {
+                SecretUpdate::Keep
+            };
+            let mut host = rec.data.clone();
+            host.id = Id::nil();
+            host.label = label;
+            host.favorite = false;
+            store
+                .save(LOCAL_OWNER, host, secret, Some(rec.meta.sync_mode))
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let res = fut.await;
+            if res.is_ok() {
+                let _ = this.update(cx, |m, cx| {
+                    m.reload(cx);
+                    m.sync_soon(cx);
+                });
+            }
+            res
+        })
+    }
+
+    /// Moves hosts to a group (`None`: no group).
+    pub fn move_hosts(
+        &mut self,
+        ids: Vec<Id>,
+        group: Option<Id>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let hosts: Vec<Host> = self
+            .hosts
+            .iter()
+            .filter(|h| ids.contains(&h.data.id) && h.data.group_id != group)
+            .map(|h| {
+                let mut host = h.data.clone();
+                host.group_id = group;
+                host
+            })
+            .collect();
+        let store = self.ws.store.clone();
+        let fut = runtime::spawn(cx, async move {
+            for host in hosts {
+                store
+                    .save(LOCAL_OWNER, host, SecretUpdate::Keep, None)
+                    .await?;
+            }
+            Ok::<_, CoreError>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let res = fut.await;
+            let _ = this.update(cx, |m, cx| {
+                m.reload(cx);
+                m.sync_soon(cx);
+            });
+            res
+        })
+    }
+
+    /// Deletes several hosts.
+    pub fn delete_hosts(
+        &mut self,
+        ids: Vec<Id>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let store = self.ws.store.clone();
+        let fut = runtime::spawn(cx, async move {
+            for id in ids {
+                store.delete::<Host>(LOCAL_OWNER, id).await?;
+            }
+            Ok::<_, CoreError>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let res = fut.await;
+            let _ = this.update(cx, |m, cx| {
+                m.reload(cx);
+                m.sync_soon(cx);
+            });
+            res
+        })
+    }
+
+    /// Effective SSH user of a host: its own, its group's or its identity's.
+    pub fn effective_user(&self, host: &Host) -> Option<String> {
+        host.settings
+            .username
+            .clone()
+            .or_else(|| {
+                host.group_id
+                    .and_then(|g| self.groups.iter().find(|x| x.data.id == g))
+                    .and_then(|g| g.data.settings.username.clone())
+            })
+            .or_else(|| {
+                host.settings
+                    .identity_id
+                    .and_then(|i| self.identities.iter().find(|x| x.data.id == i))
+                    .map(|i| i.data.username.clone())
+            })
+    }
+
+    /// Effective SSH port of a host: its own, its group's or 22.
+    pub fn effective_port(&self, host: &Host) -> u16 {
+        host.settings
+            .port
+            .or_else(|| {
+                host.group_id
+                    .and_then(|g| self.groups.iter().find(|x| x.data.id == g))
+                    .and_then(|g| g.data.settings.port)
+            })
+            .unwrap_or(22)
     }
 
     /// Saves the preferences.

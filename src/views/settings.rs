@@ -377,6 +377,102 @@ impl SettingsView {
         });
     }
 
+    /// Changes the copy and paste preferences.
+    fn set_paste(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut crate::state::Settings)) {
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            f(&mut s);
+            m.save_settings(s, cx);
+        });
+    }
+
+    fn render_paste(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let settings = self.model.read(cx).settings.clone();
+        let muted = cx.theme().muted_foreground;
+        let hint = |text: gpui::SharedString| div().text_xs().text_color(muted).child(text);
+        let mac = cfg!(target_os = "macos");
+        let right_click = settings.right_click;
+        self.render_card(t!("settings.paste.title"), IconName::ClipboardPaste, cx)
+            .child(hint(if mac {
+                t!("settings.paste.shortcuts_macos")
+            } else {
+                t!("settings.paste.shortcuts")
+            }))
+            .when(!mac, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Switch::new("ctrl-v-pastes")
+                                .label(t!("settings.paste.ctrl_v"))
+                                .checked(settings.ctrl_v_pastes)
+                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                    let v = *v;
+                                    this.set_paste(cx, |s| s.ctrl_v_pastes = v)
+                                })),
+                        )
+                        .child(hint(t!("settings.paste.ctrl_v_hint"))),
+                )
+            })
+            .child(ui::field_with_hint(
+                t!("settings.paste.right_click"),
+                h_flex().gap_2().flex_wrap().children(
+                    crate::terminal::paste::RightClick::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, choice)| {
+                            Button::new(("right-click", i))
+                                .small()
+                                .label(match choice {
+                                    crate::terminal::paste::RightClick::Menu => {
+                                        t!("settings.paste.right_click_menu")
+                                    }
+                                    crate::terminal::paste::RightClick::Paste => {
+                                        t!("settings.paste.right_click_paste")
+                                    }
+                                    crate::terminal::paste::RightClick::CopyOrPaste => {
+                                        t!("settings.paste.right_click_copy_paste")
+                                    }
+                                })
+                                .when(right_click == choice, |b| b.primary())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.set_paste(cx, |s| s.right_click = choice)
+                                }))
+                        }),
+                ),
+                t!("settings.paste.right_click_hint"),
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("copy-on-select")
+                            .label(t!("settings.paste.copy_on_select"))
+                            .checked(settings.copy_on_select)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_paste(cx, |s| s.copy_on_select = v)
+                            })),
+                    )
+                    .child(hint(t!("settings.paste.copy_on_select_hint"))),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("confirm-multiline")
+                            .label(t!("settings.paste.confirm_multiline"))
+                            .checked(settings.confirm_multiline_paste)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_paste(cx, |s| s.confirm_multiline_paste = v)
+                            })),
+                    )
+                    .child(hint(t!("settings.paste.confirm_multiline_hint"))),
+            )
+    }
+
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ws = self.model.read(cx).ws.clone();
         ui::confirm(
@@ -1377,6 +1473,7 @@ impl Render for SettingsView {
         self.start_countdown(cx);
         let account = self.render_account(cx);
         let appearance = self.render_appearance(cx);
+        let paste = self.render_paste(cx);
         let updates = self.render_updates(cx);
         let about = self.render_about(cx);
         v_flex().size_full().child(header).child(
@@ -1387,6 +1484,7 @@ impl Render for SettingsView {
                         .gap_5()
                         .child(account)
                         .child(appearance)
+                        .child(paste)
                         .child(updates)
                         .child(about),
                 ),

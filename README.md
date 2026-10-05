@@ -17,19 +17,57 @@ Source: https://github.com/TermoakSSH/desktop
 
 - **Hosts** as cards grouped by group, with search, favorites, tags and the
   operating system detected on connect, with its version ("Ubuntu 24.04.1
-  LTS"). A click opens the editor (address, port, user, group, identity,
-  key, password, ProxyJump hops, startup snippet, environment variables,
-  keep-alive, tags, notes and "this device only"); a double click connects.
-  Groups provide a default user and port to their hosts.
+  LTS"). A click opens the editor; a double click connects. Groups provide a
+  default user and port to their hosts.
+- **Host menu** (right click, the "…" button, or Shift+F10 / the menu key on
+  the focused card): Connect, Connect in split view, Connect on the server,
+  Open SFTP, Edit, Duplicate, Copy address (`user@host:port`), favorite,
+  Move to group and Delete. On a group header: Connect to all (one tab per
+  host) and Open all in split view.
+- **Several hosts at once**: Cmd/Ctrl+click and Shift+click select hosts
+  (Cmd/Ctrl+A selects all, Esc clears, arrows move, Enter connects); a bar
+  connects them in tabs or in a split view, moves them to a group or
+  deletes them.
+- **Host editor** (side panel): the address first, then the label (the
+  address if empty), group, tags and color; user, port and credentials
+  (password, key, identity) with a Connect button at the top; and an
+  Advanced section with ProxyJump hops, proxy, agent forwarding, keep-alive,
+  startup snippet, environment variables, recording, terminal type and
+  terminal theme. Errors show under each field; Enter saves and Ctrl+Enter
+  (⌘↩) saves and connects.
 - **Import `~/.ssh/config`** ("Import" in Hosts): a preview of what will
   happen (new hosts, skipped ones and why, ProxyJump hops, new and reused
   keys, port forwards and warnings), optionally into a group and as "this
   device only". It can be repeated: what already exists is skipped.
-- **Tabs** in the title bar: terminals and SFTP browsers.
+- **Tabs** in the title bar: terminals and SFTP browsers. Right click on a
+  tab: Rename, Duplicate session, Move to the split view of another tab,
+  Close and Close others.
+- **Split view**: several terminals in one tab, in a grid that adapts to
+  the number (2 side by side, 4 as 2 × 2... up to 16). Click a pane to focus
+  it, move between panes with Cmd+Option+arrows (Ctrl+Alt+arrows), close
+  one, or use focus mode (Cmd/Ctrl+Shift+M: the focused pane big and the
+  others small).
+- **Broadcast input** in a split view (Cmd+B, Ctrl+Alt+B elsewhere, or the
+  Broadcast button): what you type or paste in the focused pane goes to
+  every pane, each encoded for its own terminal mode. The included panes
+  have an orange border and a lit antenna (click it to leave a pane out),
+  and a banner says "Broadcasting to N terminals". "Send snippet" can run a
+  snippet in all the panes.
 - **Terminal**: colors (16, 256 and true color), bold, italic, underline,
   wide characters and emoji, cursor, scrollback with the mouse wheel, mouse
   selection (double click = word, triple = line), copy and paste (with
-  bracketed paste), automatic resizing and the remote program's title.
+  bracketed paste), find in the screen and history (Cmd/Ctrl+Shift+F),
+  clear (Cmd+K, Ctrl+Shift+K), automatic resizing and the remote program's
+  title.
+- **Copy and paste options** (Settings): plain Ctrl+V pasting (off by
+  default on Windows and Linux, where Ctrl+V is a control character), what
+  the right button does (menu with Copy, Paste, Select all, Clear, Find…;
+  paste like PuTTY; or copy the selection and paste otherwise), copy on
+  select, and a confirmation before pasting several lines (skipped when the
+  program uses bracketed paste).
+- **Menus**: the macOS menu bar (Termoak, File, Edit, View, Terminal,
+  Window, Help) and, on Windows and Linux, the same menus behind the ☰
+  button of the title bar. Help → Keyboard shortcuts lists them all.
   Authentication prompts in dialogs: fingerprint of new hosts, passwords,
   passphrases and 2FA (keyboard-interactive).
 - **Command autocompletion** in SSH and local terminals: while you type, the
@@ -105,7 +143,11 @@ Source: https://github.com/TermoakSSH/desktop
 
 Local data (hosts, keys, passwords...) is kept in an encrypted database; the
 vault key lives in the system keychain (macOS Keychain, Windows Credential
-Manager or Secret Service on Linux).
+Manager or Secret Service on Linux) and is read once at startup. On macOS,
+"Always Allow" only lasts across updates when releases are signed with a
+stable identity (see [docs/RELEASING.md](docs/RELEASING.md)). If the
+keychain refuses and there is already data, the app shows an error with
+"Try again" instead of creating a new key.
 
 ## Build and run
 
@@ -207,6 +249,19 @@ AppImage (Linux) and `.app` packed in a `.tar.gz` (macOS). See
 | Back to the bottom of the scrollback | Shift+End | Shift+End |
 | Paste | Middle mouse button | Middle mouse button |
 | Select even if the program uses the mouse | Shift + drag | Shift + drag |
+| Find in the terminal | Ctrl+Shift+F | Cmd+F |
+| Clear the terminal | Ctrl+Shift+K | Cmd+K |
+| Settings | Ctrl+, | Cmd+, |
+| New host | Ctrl+Shift+N | Cmd+N |
+| Split view: add a terminal | Ctrl+Shift+D | Cmd+D |
+| Move between panes | Ctrl+Alt+arrows | Cmd+Option+arrows |
+| Focus mode | Ctrl+Shift+M | Cmd+Shift+M |
+| Broadcast input to all panes | Ctrl+Alt+B | Cmd+B |
+| Send snippet | Ctrl+Shift+S | Cmd+Shift+S |
+| Reconnect | Ctrl+Shift+R | Cmd+Shift+R |
+| Bigger / smaller / actual size text | Ctrl+= / Ctrl+- / Ctrl+0 | Cmd+= / Cmd+- / Cmd+0 |
+| Full screen | F11 | Ctrl+Cmd+F |
+| Menu of the focused host | Shift+F10 or the menu key | Shift+F10 |
 
 With an autocompletion suggestion on screen, Tab or → accepts it and
 Alt+↑/↓ picks another one from the list.
@@ -219,7 +274,10 @@ terminal.
 ```
 src/
   main.rs            startup: pending update, tokio, vault and window
-  app.rs             main window: tabs, sidebar, sections and AI copilot
+  app.rs             main window: tabs, split views, sidebar, sections and AI copilot
+  panes.rs           split view logic: grid layout, pane navigation, broadcast routing
+  menus.rs           menu bar (macOS) and ☰ menu (Windows/Linux), shortcuts list
+  vault_key.rs       vault key in the system keychain
   theme.rs           dark/light themes and terminal palettes
   runtime.rs         bridge between tokio and GPUI
   state.rs           model: data, server session, sync, port forwards
@@ -227,8 +285,9 @@ src/
   update.rs          automatic updates
   ui.rs              reusable UI pieces
   qr.rs              QR codes painted with squares
-  terminal/          emulation, painting, keyboard (IME), mouse, autocompletion
-                     and connection (local SSH, server, local shell or serial port)
+  terminal/          emulation, painting, keyboard (IME), mouse, autocompletion,
+                     copy and paste options, find, and connection (local SSH,
+                     server, local shell or serial port)
   views/             hosts, ssh_config import, host editor, SFTP, keychain,
                      snippets, port forwards, known hosts, AI and copilot,
                      server sessions, sharing, teams, administration,

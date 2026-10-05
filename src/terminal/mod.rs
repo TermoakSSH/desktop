@@ -9,6 +9,7 @@ mod element;
 pub mod input;
 pub mod model;
 pub mod mouse;
+pub mod paste;
 pub mod serial;
 pub mod shell;
 
@@ -21,12 +22,13 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle,
     FontWeight, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Styled, Task, UTF16Selection, WeakEntity, Window, div, point,
-    prelude::FluentBuilder, px, size,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Task, UTF16Selection,
+    WeakEntity, Window, div, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::text::TextView;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, WindowExt, h_flex, v_flex};
@@ -60,10 +62,18 @@ gpui::actions!(
     [
         Copy,
         Paste,
+        /// Pastes the terminal's own selection (like the middle button).
+        PasteSelection,
         SelectAll,
+        /// Find in the terminal (screen and history).
+        Find,
+        /// Clears the history and asks the shell to clear the screen.
+        ClearTerminal,
         ScrollPageUp,
         ScrollPageDown,
-        ScrollToBottom
+        ScrollToBottom,
+        /// Closes the find bar.
+        Dismiss
     ]
 );
 
@@ -78,12 +88,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-pageup", ScrollPageUp, Some(CONTEXT)),
         KeyBinding::new("shift-pagedown", ScrollPageDown, Some(CONTEXT)),
         KeyBinding::new("shift-end", ScrollToBottom, Some(CONTEXT)),
+        KeyBinding::new("escape", Dismiss, Some(FIND_CONTEXT)),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("cmd-f", Find, Some(CONTEXT)),
+        KeyBinding::new("cmd-f", Find, Some(FIND_CONTEXT)),
+        KeyBinding::new("cmd-k", ClearTerminal, Some(CONTEXT)),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -94,8 +108,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-v", Paste, Some(CONTEXT)),
         KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-f", Find, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-f", Find, Some(FIND_CONTEXT)),
+        KeyBinding::new("ctrl-shift-k", ClearTerminal, Some(CONTEXT)),
     ]);
 }
+
+/// Key context of the find bar.
+const FIND_CONTEXT: &str = "TerminalFind";
 
 /// Source of the terminal.
 #[derive(Debug, Clone)]
@@ -142,6 +162,53 @@ pub enum TerminalEvent {
         host_id: Id,
         conn: Option<Arc<Connection>>,
     },
+    /// Input typed in this terminal while broadcasting: the workspace sends
+    /// it to the other panes.
+    Broadcast(BroadcastInput),
+    /// A button of the pane controls (split view) was pressed.
+    Pane(PaneAction),
+}
+
+/// User input repeated in the other panes while broadcasting. It is kept as
+/// what the user did (a key, text, a paste) and not as bytes, so each
+/// terminal encodes it for its own mode (application cursor keys, bracketed
+/// paste...).
+#[derive(Debug, Clone)]
+pub enum BroadcastInput {
+    Key {
+        keystroke: gpui::Keystroke,
+        prefer_character_input: bool,
+    },
+    Text(String),
+    Paste(String),
+    Bytes(Vec<u8>),
+}
+
+/// Pane controls shown in the toolbar of a terminal in a split view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneAction {
+    ToggleMaximize,
+    ToggleInclude,
+    Close,
+}
+
+/// State of the pane controls, set by the workspace (`None` outside a
+/// split view).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneChrome {
+    pub maximized: bool,
+    pub broadcasting: bool,
+    /// Receives the broadcast input (not excluded).
+    pub included: bool,
+}
+
+/// Find bar of the terminal.
+struct FindBar {
+    input: Entity<InputState>,
+    /// Text of the last search and the match it found (to continue from it).
+    last: Option<(String, model::FindMatch)>,
+    not_found: bool,
+    _sub: gpui::Subscription,
 }
 
 /// Sharing of a local terminal through the server.
@@ -201,6 +268,14 @@ pub struct TerminalView {
     /// Copy of the output for the AI on this computer (while it waits for
     /// what a command prints).
     ai_tap: Option<tokio::sync::broadcast::Sender<bytes::Bytes>>,
+    /// Part of a split view that is broadcasting: user input is also
+    /// emitted as [`TerminalEvent::Broadcast`].
+    broadcasting: bool,
+    /// Pane controls (split view).
+    pane: Option<PaneChrome>,
+    /// Right-click menu open, where it was opened.
+    context_menu: Option<(Entity<PopupMenu>, Point<Pixels>, gpui::Subscription)>,
+    find: Option<FindBar>,
     _reader: Option<Task<()>>,
 }
 
@@ -253,6 +328,10 @@ impl TerminalView {
             was_alt: false,
             ai_id: termoak_core::new_id(),
             ai_tap: None,
+            broadcasting: false,
+            pane: None,
+            context_menu: None,
+            find: None,
             _reader: None,
         }
     }
@@ -708,18 +787,42 @@ impl TerminalView {
     /// Special keys, Ctrl and Alt. Normal text is not handled here: it goes
     /// on to the input handler (`EntityInputHandler`), which receives it
     /// already composed (dead keys, AltGr, IME) and only once.
-    fn on_key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed in the find bar are not for the terminal.
+        if !self.focus.is_focused(window) {
+            return;
+        }
         if self.suggestion_key(ev, cx) {
             cx.stop_propagation();
             return;
         }
-        if let Some(bytes) =
-            input::to_bytes(&ev.keystroke, ev.prefer_character_input, self.model.mode())
-        {
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        if paste::ctrl_v_pastes(
+            cfg!(target_os = "macos"),
+            self.app.read(cx).settings.ctrl_v_pastes,
+            &ks.key,
+            m.control,
+            m.shift,
+            m.alt,
+            m.platform,
+        ) {
+            cx.stop_propagation();
+            self.paste(window, cx);
+            return;
+        }
+        if let Some(bytes) = input::to_bytes(ks, ev.prefer_character_input, self.model.mode()) {
             cx.stop_propagation();
             if self.model.has_selection() {
                 self.model.clear_selection();
             }
+            self.emit_broadcast(
+                BroadcastInput::Key {
+                    keystroke: ks.clone(),
+                    prefer_character_input: ev.prefer_character_input,
+                },
+                cx,
+            );
             self.write_input(bytes, cx);
         }
     }
@@ -729,7 +832,92 @@ impl TerminalView {
         if self.model.has_selection() {
             self.model.clear_selection();
         }
+        self.emit_broadcast(BroadcastInput::Text(text.to_string()), cx);
         self.write_input(input::text_bytes(text), cx);
+    }
+
+    // ----- Split view -----
+
+    /// Part of a split view that broadcasts (or not any more).
+    pub fn set_broadcasting(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.broadcasting != on {
+            self.broadcasting = on;
+            cx.notify();
+        }
+    }
+
+    /// Pane controls of the split view (`None` for a terminal alone).
+    pub fn set_pane(&mut self, pane: Option<PaneChrome>, cx: &mut Context<Self>) {
+        if self.pane != pane {
+            self.pane = pane;
+            cx.notify();
+        }
+    }
+
+    /// Repeats user input for the other panes while broadcasting.
+    fn emit_broadcast(&self, input: BroadcastInput, cx: &mut Context<Self>) {
+        if self.broadcasting {
+            cx.emit(TerminalEvent::Broadcast(input));
+        }
+    }
+
+    /// Input typed in another pane of the split view: encoded for this
+    /// terminal's own mode and sent as if typed here.
+    pub fn apply_broadcast(&mut self, input: &BroadcastInput, cx: &mut Context<Self>) {
+        if self.model.has_selection() {
+            self.model.clear_selection();
+        }
+        let mode = self.model.mode();
+        let bytes = match input {
+            BroadcastInput::Key {
+                keystroke,
+                prefer_character_input,
+            } => input::to_bytes(keystroke, *prefer_character_input, mode),
+            BroadcastInput::Text(text) => Some(input::text_bytes(text)),
+            BroadcastInput::Paste(text) => Some(input::paste_bytes(text, mode)),
+            BroadcastInput::Bytes(bytes) => Some(bytes.clone()),
+        };
+        if let Some(bytes) = bytes {
+            self.write_input(bytes, cx);
+        }
+    }
+
+    /// Types a snippet: "Run" (text ending with a line break) is typed as
+    /// is, so each line runs; "Paste" goes as a paste (bracketed if the
+    /// program asks for it), so nothing runs until Enter.
+    pub fn send_snippet(&mut self, text: &str, cx: &mut Context<Self>) {
+        let bytes = if text.ends_with('\n') {
+            input::text_bytes(text)
+        } else {
+            input::paste_bytes(text, self.model.mode())
+        };
+        self.write_input(bytes, cx);
+    }
+
+    /// Whether some text is selected.
+    pub fn has_selection(&self) -> bool {
+        self.model.has_selection()
+    }
+
+    /// Whether the terminal can be written to now.
+    pub fn writable(&self) -> bool {
+        self.can_write && matches!(self.state, TermState::Running)
+    }
+
+    /// Host of the terminal, if it has one (SSH or server session).
+    pub fn host(&self) -> Option<Id> {
+        self.host_id()
+    }
+
+    /// Connection of an SSH terminal from this computer (to reuse it for
+    /// SFTP).
+    pub fn ssh_connection(&self) -> Option<Arc<Connection>> {
+        self.local.as_ref().map(|t| t.connection().clone())
+    }
+
+    /// Whether the session ended or failed (reconnect makes sense).
+    pub fn ended(&self) -> bool {
+        matches!(self.state, TermState::Closed(_) | TermState::Failed(_))
     }
 
     // ----- Autocompletion -----
@@ -897,6 +1085,7 @@ impl TerminalView {
         else {
             return false;
         };
+        self.emit_broadcast(BroadcastInput::Text(insert.clone()), cx);
         self.write_input(input::text_bytes(&insert), cx);
         true
     }
@@ -1032,11 +1221,16 @@ impl TerminalView {
         Some((text, row, col))
     }
 
-    fn on_send_text(&mut self, action: &SendText, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_send_text(&mut self, action: &SendText, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
         // Tab accepts the visible suggestion; if there is none, the shell completes.
         if action.text == "\t" && self.accept_suggestion(cx) {
             return;
         }
+        self.emit_broadcast(BroadcastInput::Bytes(action.text.clone().into_bytes()), cx);
         self.write_input(action.text.clone().into_bytes(), cx);
     }
 
@@ -1044,8 +1238,41 @@ impl TerminalView {
         self.copy_selection(window, cx);
     }
 
-    fn on_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        self.paste(cx);
+    fn on_paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        self.paste(window, cx);
+    }
+
+    fn on_paste_selection(
+        &mut self,
+        _: &PasteSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(text) = self.model.selection_text() {
+            self.paste_text(text, window, cx);
+        }
+    }
+
+    fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(window, cx);
+    }
+
+    fn on_clear(&mut self, _: &ClearTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_terminal(cx);
+    }
+
+    fn on_dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_find(window, cx);
+    }
+
+    /// Clears the history and, outside full-screen programs, asks the shell
+    /// to clear the screen (Ctrl+L), so its idea of the cursor stays right.
+    pub fn clear_terminal(&mut self, cx: &mut Context<Self>) {
+        self.model.clear_history();
+        if !self.model.mode().contains(TermMode::ALT_SCREEN) {
+            self.write(vec![0x0c], cx);
+        }
+        cx.notify();
     }
 
     fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -1078,15 +1305,392 @@ impl TerminalView {
         }
     }
 
-    pub fn paste(&mut self, cx: &mut Context<Self>) {
+    /// Pastes the clipboard.
+    pub fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-            let bytes = input::paste_bytes(&text, self.model.mode());
-            self.write_input(bytes, cx);
+            self.paste_text(text, window, cx);
+        }
+    }
+
+    /// Pastes text, asking first if it has several lines (and the option is
+    /// on and the program does not use bracketed paste).
+    pub fn paste_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if text.is_empty() || !self.writable() {
+            return;
+        }
+        let bracketed = self.model.mode().contains(TermMode::BRACKETED_PASTE);
+        let confirm = self.app.read(cx).settings.confirm_multiline_paste;
+        if !paste::needs_confirmation(&text, confirm, bracketed) {
+            self.paste_now(&text, cx);
+            return;
+        }
+        let lines = paste::line_count(&text);
+        let preview: SharedString = paste::preview(&text, 12).into();
+        let weak = cx.entity().downgrade();
+        let app = self.app.clone();
+        let dont_ask = std::rc::Rc::new(std::cell::Cell::new(false));
+        window.open_dialog(cx, move |d, _, cx| {
+            let (weak_ok, weak_enter) = (weak.clone(), weak.clone());
+            let (text_ok, text_enter) = (text.clone(), text.clone());
+            let (app_ok, app_enter) = (app.clone(), app.clone());
+            let (ask_ok, ask_enter, ask_box) =
+                (dont_ask.clone(), dont_ask.clone(), dont_ask.clone());
+            let checked = dont_ask.get();
+            let accept = move |weak: &WeakEntity<TerminalView>,
+                               app: &Entity<AppModel>,
+                               text: &str,
+                               dont_ask: bool,
+                               window: &mut Window,
+                               cx: &mut App| {
+                if dont_ask {
+                    app.update(cx, |m, cx| {
+                        let mut s = m.settings.clone();
+                        s.confirm_multiline_paste = false;
+                        m.save_settings(s, cx);
+                    });
+                }
+                if let Some(view) = weak.upgrade() {
+                    view.update(cx, |v, cx| {
+                        v.paste_now(text, cx);
+                        v.focus.focus(window, cx);
+                    });
+                }
+            };
+            let accept_enter = accept.clone();
+            d.title(tn!("terminal.paste_confirm.title", lines))
+                .w(px(560.))
+                .on_ok(move |_, window, cx| {
+                    accept_enter(
+                        &weak_enter,
+                        &app_enter,
+                        &text_enter,
+                        ask_enter.get(),
+                        window,
+                        cx,
+                    );
+                    true
+                })
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t!("terminal.paste_confirm.message")),
+                        )
+                        .child(
+                            div()
+                                .id("paste-preview")
+                                .p_3()
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .rounded(cx.theme().radius)
+                                .bg(cx.theme().muted)
+                                .font_family(ui::mono_family(cx))
+                                .text_xs()
+                                .whitespace_normal()
+                                .child(preview.clone()),
+                        )
+                        .child(
+                            Checkbox::new("paste-dont-ask")
+                                .label(t!("terminal.paste_confirm.dont_ask"))
+                                .checked(checked)
+                                .on_click(move |v: &bool, window, _| {
+                                    ask_box.set(*v);
+                                    window.refresh();
+                                }),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("paste-cancel")
+                                .label(t!("common.cancel"))
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("paste-ok")
+                                .primary()
+                                .icon(ui::icon(IconName::ClipboardPaste))
+                                .label(t!("terminal.paste_confirm.ok"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    accept(&weak_ok, &app_ok, &text_ok, ask_ok.get(), window, cx);
+                                }),
+                        ),
+                )
+        });
+    }
+
+    /// Pastes without asking (and repeats it in the other panes while
+    /// broadcasting).
+    fn paste_now(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.emit_broadcast(BroadcastInput::Paste(text.to_string()), cx);
+        let bytes = input::paste_bytes(text, self.model.mode());
+        self.write_input(bytes, cx);
+    }
+
+    // ----- Find -----
+
+    fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &self.find {
+            let input = find.input.clone();
+            input.update(cx, |i, cx| i.focus(window, cx));
+            return;
+        }
+        let initial = self
+            .model
+            .selection_text()
+            .filter(|t| !t.contains('\n') && t.chars().count() <= 200)
+            .unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("terminal.find.placeholder"))
+                .default_value(initial)
+        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, ev: &gpui_component::input::InputEvent, _, cx| {
+                use gpui_component::input::InputEvent;
+                match ev {
+                    InputEvent::Change => this.find_step(None, cx),
+                    InputEvent::PressEnter { shift, .. } => this.find_step(Some(!*shift), cx),
+                    _ => {}
+                }
+            },
+        );
+        input.update(cx, |i, cx| i.focus(window, cx));
+        self.find = Some(FindBar {
+            input,
+            last: None,
+            not_found: false,
+            _sub: sub,
+        });
+        self.find_step(None, cx);
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Searches again: `None` starts over from the bottom (the text
+    /// changed), `Some(true)` goes to the previous (older) match and
+    /// `Some(false)` to the next (newer) one.
+    fn find_step(&mut self, older: Option<bool>, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        let query = find.input.read(cx).value().to_string();
+        let from = match older {
+            Some(_) => find
+                .last
+                .as_ref()
+                .filter(|(q, _)| *q == query)
+                .map(|(_, m)| m.clone()),
+            None => None,
+        };
+        let found = self
+            .model
+            .find(&query, from.as_ref(), older.unwrap_or(true));
+        let find = self.find.as_mut().expect("checked above");
+        find.not_found = !query.is_empty() && found.is_none();
+        find.last = found.map(|m| (query, m));
+        if find.last.is_none() {
+            self.model.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn render_find(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let find = self.find.as_ref()?;
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .id("terminal-find")
+                .key_context(FIND_CONTEXT)
+                .on_action(cx.listener(Self::on_dismiss))
+                .on_action(cx.listener(Self::on_find))
+                .absolute()
+                .top_2()
+                .right_4()
+                .w(px(340.))
+                .p_1()
+                .gap_1()
+                .items_center()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(if find.not_found {
+                    theme.danger
+                } else {
+                    theme.border
+                })
+                .bg(theme.popover)
+                .shadow_md()
+                // Clicks here are not terminal clicks.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Input::new(&find.input)
+                            .small()
+                            .prefix(ui::icon(IconName::Search).size(px(14.))),
+                    ),
+                )
+                .when(find.not_found, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.danger)
+                            .whitespace_nowrap()
+                            .child(t!("terminal.find.none")),
+                    )
+                })
+                .child(
+                    Button::new("find-older")
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::ChevronUp))
+                        .tooltip(t!("terminal.find.previous"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.find_step(Some(true), cx)
+                        })),
+                )
+                .child(
+                    Button::new("find-newer")
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::ChevronDown))
+                        .tooltip(t!("terminal.find.next"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.find_step(Some(false), cx)
+                        })),
+                )
+                .child(
+                    Button::new("find-close")
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::X))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.close_find(window, cx)
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    // ----- Context menu -----
+
+    /// Right-click menu at `position`.
+    fn open_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_selection = self.model.has_selection();
+        let writable = self.writable();
+        let split = self.pane.is_some();
+        let broadcasting = self.pane.is_some_and(|p| p.broadcasting);
+        let focus = self.focus.clone();
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            menu.action_context(focus.clone())
+                .min_w(px(220.))
+                .menu_with_icon_and_disabled(
+                    t!("terminal.menu.copy"),
+                    IconName::Copy,
+                    Box::new(Copy),
+                    !has_selection,
+                )
+                .menu_with_icon_and_disabled(
+                    t!("terminal.menu.paste"),
+                    IconName::ClipboardPaste,
+                    Box::new(Paste),
+                    !writable,
+                )
+                .menu_with_disabled(
+                    t!("terminal.menu.paste_selection"),
+                    Box::new(PasteSelection),
+                    !has_selection || !writable,
+                )
+                .separator()
+                .menu(t!("terminal.menu.select_all"), Box::new(SelectAll))
+                .menu_with_icon(t!("terminal.menu.find"), IconName::Search, Box::new(Find))
+                .menu_with_icon(
+                    t!("terminal.menu.clear"),
+                    IconName::Eraser,
+                    Box::new(ClearTerminal),
+                )
+                .separator()
+                .menu_with_icon(
+                    t!("terminal.menu.send_snippet"),
+                    IconName::SquareTerminal,
+                    Box::new(crate::app::SendSnippet),
+                )
+                .menu_with_icon(
+                    t!("terminal.menu.add_pane"),
+                    IconName::LayoutGrid,
+                    Box::new(crate::app::AddPane),
+                )
+                .when(split, |menu| {
+                    menu.menu_with_check(
+                        t!("terminal.menu.broadcast"),
+                        broadcasting,
+                        Box::new(crate::app::ToggleBroadcast),
+                    )
+                    .menu(
+                        t!("terminal.menu.focus_mode"),
+                        Box::new(crate::app::ToggleFocusMode),
+                    )
+                    .menu(
+                        t!("terminal.menu.close_pane"),
+                        Box::new(crate::app::ClosePane),
+                    )
+                })
+        });
+        let sub = cx.subscribe_in(&menu, window, |this, _, _: &gpui::DismissEvent, _, cx| {
+            this.context_menu = None;
+            cx.notify();
+        });
+        let handle = menu.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.context_menu = Some((menu, position, sub));
+        cx.notify();
+    }
+
+    /// Right click (when the program does not use the mouse): the menu,
+    /// paste or copy, as chosen in Settings.
+    fn right_click(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let setting = self.app.read(cx).settings.right_click;
+        match paste::right_click_action(setting, self.model.has_selection()) {
+            paste::RightClickAction::ShowMenu => self.open_context_menu(position, window, cx),
+            paste::RightClickAction::Paste => self.paste(window, cx),
+            paste::RightClickAction::Copy => {
+                if let Some(text) = self.model.selection_text() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                self.model.clear_selection();
+                cx.notify();
+            }
         }
     }
 
     /// Writes text in the terminal without pressing Enter (AI suggestions).
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        // (Not repeated in the other panes: it comes from the AI.)
         let bytes = input::paste_bytes(text, self.model.mode());
         self.write_input(bytes, cx);
     }
@@ -1188,7 +1792,8 @@ impl TerminalView {
                 self.press_cell = (ev.click_count == 1).then_some((row, col));
                 cx.notify();
             }
-            MouseButton::Middle => self.paste(cx),
+            MouseButton::Middle => self.paste(window, cx),
+            MouseButton::Right => self.right_click(ev.position, window, cx),
             _ => {}
         }
     }
@@ -1283,6 +1888,10 @@ impl TerminalView {
             }
             if !self.model.has_selection() {
                 self.model.clear_selection();
+            } else if self.app.read(cx).settings.copy_on_select
+                && let Some(text) = self.model.selection_text()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             cx.notify();
         }
@@ -1773,6 +2382,20 @@ impl TerminalView {
 
     // ----- Painting -----
 
+    /// Dark or light terminal colors: the host's choice (host editor →
+    /// terminal theme) or the app theme.
+    fn dark_palette(&self, cx: &App) -> bool {
+        let host_theme = self
+            .host_id()
+            .and_then(|id| self.app.read(cx).host(id))
+            .and_then(|h| h.settings.theme.clone());
+        match host_theme.as_deref() {
+            Some("dark") => true,
+            Some("light") => false,
+            _ => cx.theme().is_dark(),
+        }
+    }
+
     fn terminal_font(&self, cx: &App) -> (Font, Pixels) {
         let settings = &self.app.read(cx).settings;
         let family: SharedString = if settings.font_family.trim().is_empty() {
@@ -1816,6 +2439,10 @@ impl TerminalView {
             _ => None,
         };
         let weak: WeakEntity<Self> = cx.entity().downgrade();
+        // In a split view the panes are narrow: icons only, and copy/paste
+        // stay in the right-click menu.
+        let pane = self.pane;
+        let compact = pane.is_some();
         let (kind_label, kind_color) = match self.kind {
             TermKind::Local { .. } => (t!("terminal.kind.local"), theme.primary),
             TermKind::Server { .. } => (t!("terminal.kind.server"), theme.info),
@@ -1832,8 +2459,19 @@ impl TerminalView {
             .border_color(theme.border)
             .bg(theme.tab_bar)
             .child(div().size(px(8.)).rounded_full().bg(dot))
-            .child(div().text_sm().font_medium().child(self.label(cx)))
-            .child(ui::pill(kind_label, kind_color))
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(self.label(cx)),
+            )
+            .when(!compact, |this| {
+                this.child(ui::pill(kind_label, kind_color))
+            })
             .when(
                 self.share_session.is_some() && self.relay.is_some(),
                 |this| this.child(ui::pill(t!("terminal.shared"), theme.success)),
@@ -1860,7 +2498,14 @@ impl TerminalView {
                         .small()
                         .primary()
                         .icon(ui::icon(IconName::RefreshCw))
-                        .label(if is_shell {
+                        .when(!compact, |b| {
+                            b.label(if is_shell {
+                                t!("terminal.reopen")
+                            } else {
+                                t!("terminal.reconnect")
+                            })
+                        })
+                        .tooltip(if is_shell {
                             t!("terminal.reopen")
                         } else {
                             t!("terminal.reconnect")
@@ -1877,7 +2522,7 @@ impl TerminalView {
                         .small()
                         .ghost()
                         .icon(ui::icon(IconName::FolderOpen))
-                        .label("SFTP")
+                        .when(!compact, |b| b.label("SFTP"))
                         .tooltip(t!("terminal.open_sftp"))
                         .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                             cx.emit(TerminalEvent::OpenSftp {
@@ -1887,28 +2532,30 @@ impl TerminalView {
                         })),
                 )
             })
-            .child(
-                Button::new("copy")
-                    .small()
-                    .ghost()
-                    .icon(ui::icon(IconName::Copy))
-                    .tooltip(t!("terminal.copy_selection"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.copy_selection(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("paste")
-                    .small()
-                    .ghost()
-                    .icon(ui::icon(IconName::ClipboardPaste))
-                    .tooltip(t!("terminal.paste"))
-                    .disabled(!running)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.paste(cx);
-                        this.focus.focus(window, cx);
-                    })),
-            )
+            .when(!compact, |this| {
+                this.child(
+                    Button::new("copy")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::Copy))
+                        .tooltip(t!("terminal.copy_selection"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.copy_selection(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("paste")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::ClipboardPaste))
+                        .tooltip(t!("terminal.paste"))
+                        .disabled(!running)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.paste(window, cx);
+                            this.focus.focus(window, cx);
+                        })),
+                )
+            })
             .child({
                 let w1 = weak.clone();
                 let w2 = weak.clone();
@@ -1916,7 +2563,7 @@ impl TerminalView {
                     .small()
                     .ghost()
                     .icon(ui::icon(IconName::Sparkles))
-                    .label(t!("terminal.ai.button"))
+                    .when(!compact, |b| b.label(t!("terminal.ai.button")))
                     .loading(self.ai_busy)
                     .disabled(!ai_ready)
                     .tooltip(if ai_ready {
@@ -1955,7 +2602,7 @@ impl TerminalView {
                         .small()
                         .ghost()
                         .icon(ui::icon(IconName::Share2))
-                        .label(t!("terminal.share.button"))
+                        .when(!compact, |b| b.label(t!("terminal.share.button")))
                         .disabled(!running || !logged_in)
                         .tooltip(if logged_in {
                             t!("terminal.share.tooltip")
@@ -1996,6 +2643,59 @@ impl TerminalView {
                             let _ = this;
                         })),
                 )
+            })
+            .when_some(pane, |this, pane| {
+                this.child(div().w(px(1.)).h(px(16.)).bg(theme.border))
+                    .when(pane.broadcasting, |this| {
+                        this.child(
+                            Button::new("pane-include")
+                                .small()
+                                .map(|b| {
+                                    if pane.included {
+                                        b.warning()
+                                    } else {
+                                        b.ghost()
+                                    }
+                                })
+                                .icon(ui::icon(IconName::RadioTower))
+                                .tooltip(if pane.included {
+                                    t!("terminal.pane.exclude")
+                                } else {
+                                    t!("terminal.pane.include")
+                                })
+                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                    cx.emit(TerminalEvent::Pane(PaneAction::ToggleInclude))
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("pane-maximize")
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(if pane.maximized {
+                                IconName::Minimize2
+                            } else {
+                                IconName::Maximize2
+                            }))
+                            .tooltip(if pane.maximized {
+                                t!("terminal.pane.restore")
+                            } else {
+                                t!("terminal.pane.maximize")
+                            })
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(TerminalEvent::Pane(PaneAction::ToggleMaximize))
+                            })),
+                    )
+                    .child(
+                        Button::new("pane-close")
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::X))
+                            .tooltip(t!("terminal.pane.close"))
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(TerminalEvent::Pane(PaneAction::Close))
+                            })),
+                    )
             })
     }
 
@@ -2069,12 +2769,22 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = TermPalette::for_mode(cx.theme().is_dark());
+        let palette = TermPalette::for_mode(self.dark_palette(cx));
         let (font, font_size) = self.terminal_font(cx);
         let _ = window;
         let toolbar = self.render_toolbar(cx);
         let overlay = self.render_overlay(cx);
         let suggestions = self.render_suggestions(cx);
+        let find = self.render_find(cx);
+        let context_menu = self.context_menu.as_ref().map(|(menu, position, _)| {
+            gpui::deferred(
+                gpui::anchored()
+                    .position(*position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(menu.clone()),
+            )
+            .with_priority(1)
+        });
         let entity = cx.entity();
         v_flex()
             .size_full()
@@ -2103,6 +2813,9 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::on_page_up))
                     .on_action(cx.listener(Self::on_page_down))
                     .on_action(cx.listener(Self::on_bottom))
+                    .on_action(cx.listener(Self::on_paste_selection))
+                    .on_action(cx.listener(Self::on_find))
+                    .on_action(cx.listener(Self::on_clear))
                     // Motion and release are registered by the element for the whole window.
                     .on_any_mouse_down(cx.listener(Self::mouse_down))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
@@ -2114,7 +2827,9 @@ impl Render for TerminalView {
                         palette,
                     ))
                     .children(suggestions)
-                    .children(overlay),
+                    .children(overlay)
+                    .children(find)
+                    .children(context_menu),
             )
     }
 }

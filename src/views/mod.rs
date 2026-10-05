@@ -6,6 +6,7 @@ pub mod ai_chat;
 pub mod ai_settings;
 pub mod forwards;
 pub mod host_editor;
+pub mod host_picker;
 pub mod hosts;
 pub mod import;
 pub mod keychain;
@@ -38,6 +39,9 @@ pub enum OpenRequest {
         host_id: Id,
         conn: Option<Arc<Connection>>,
     },
+    /// Several hosts in a split view (one tab, a grid of terminals): added
+    /// to the current workspace (`current`) or in a new tab.
+    Split { hosts: Vec<Id>, current: bool },
     /// Local terminal: a shell on this computer.
     Shell,
     /// Serial terminal: a port on this computer.

@@ -1,17 +1,23 @@
 //! Hosts: cards arranged by group, search, favorites, tags and detected
 //! system (with its version). A click opens the editor; a double click
 //! connects. `~/.ssh/config` is also imported from here.
+//!
+//! Right click (or Shift+F10 / the menu key on the focused card) opens the
+//! host menu; on a group header, "Connect to all" and "Open all in split
+//! view". Cmd/Ctrl+click and Shift+click select several hosts, with a bar to
+//! connect them in tabs or in a split view, move or delete them.
 
 use std::time::Duration;
 
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
-    Window, div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, anchored,
+    deferred, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
@@ -26,6 +32,143 @@ use crate::ui::{self, IconName};
 
 /// Margin to tell a click from a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(280);
+
+const CONTEXT: &str = "HostList";
+
+actions!(
+    hosts,
+    [
+        /// Opens the menu of the focused host (Shift+F10, the menu key).
+        OpenHostMenu,
+        SelectAllHosts,
+        ClearSelection,
+        ConnectFocused,
+        DeleteSelected,
+        FocusPrevHost,
+        FocusNextHost
+    ]
+);
+
+/// Keys of the host list (when it has the focus, not the search box).
+pub fn init(cx: &mut gpui::App) {
+    cx.bind_keys([
+        KeyBinding::new("shift-f10", OpenHostMenu, Some(CONTEXT)),
+        KeyBinding::new("menu", OpenHostMenu, Some(CONTEXT)),
+        KeyBinding::new("escape", ClearSelection, Some(CONTEXT)),
+        KeyBinding::new("enter", ConnectFocused, Some(CONTEXT)),
+        KeyBinding::new("delete", DeleteSelected, Some(CONTEXT)),
+        KeyBinding::new("left", FocusPrevHost, Some(CONTEXT)),
+        KeyBinding::new("up", FocusPrevHost, Some(CONTEXT)),
+        KeyBinding::new("right", FocusNextHost, Some(CONTEXT)),
+        KeyBinding::new("down", FocusNextHost, Some(CONTEXT)),
+    ]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("cmd-a", SelectAllHosts, Some(CONTEXT)),
+        KeyBinding::new("cmd-backspace", DeleteSelected, Some(CONTEXT)),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new("ctrl-a", SelectAllHosts, Some(CONTEXT))]);
+}
+
+/// Several hosts chosen with Cmd/Ctrl+click and Shift+click, in the order
+/// they were chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection<T> {
+    ids: Vec<T>,
+    /// Where a Shift+click range starts (the last plain or Cmd/Ctrl click).
+    anchor: Option<T>,
+}
+
+impl<T> Default for Selection<T> {
+    fn default() -> Self {
+        Self {
+            ids: Vec::new(),
+            anchor: None,
+        }
+    }
+}
+
+impl<T: Copy + PartialEq> Selection<T> {
+    pub fn ids(&self) -> &[T] {
+        &self.ids
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn contains(&self, id: T) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// Plain click: nothing selected, the range starts here.
+    pub fn click(&mut self, id: T) {
+        self.ids.clear();
+        self.anchor = Some(id);
+    }
+
+    /// Cmd/Ctrl+click: adds or removes one host.
+    pub fn toggle(&mut self, id: T) {
+        if let Some(pos) = self.ids.iter().position(|x| *x == id) {
+            self.ids.remove(pos);
+        } else {
+            self.ids.push(id);
+        }
+        self.anchor = Some(id);
+    }
+
+    /// Shift+click: the hosts between the anchor and `id` in the order they
+    /// are shown (`order`), replacing the previous range.
+    pub fn extend_to(&mut self, order: &[T], id: T) {
+        let to = order.iter().position(|x| *x == id);
+        let from = self
+            .anchor
+            .and_then(|a| order.iter().position(|x| *x == a))
+            .or(to);
+        let (Some(from), Some(to)) = (from, to) else {
+            return;
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        self.ids = order[lo..=hi].to_vec();
+        if self.anchor.is_none() {
+            self.anchor = Some(id);
+        }
+    }
+
+    pub fn select_all(&mut self, order: &[T]) {
+        self.ids = order.to_vec();
+    }
+
+    pub fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    /// Drops what no longer exists (deleted, or hidden by the search).
+    pub fn retain(&mut self, existing: &[T]) {
+        self.ids.retain(|id| existing.contains(id));
+        if self.anchor.is_some_and(|a| !existing.contains(&a)) {
+            self.anchor = None;
+        }
+    }
+}
+
+/// Address to copy: `user@host:port` (IPv6 in brackets).
+pub fn ssh_address(user: Option<&str>, host: &str, port: u16) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match user.filter(|u| !u.is_empty()) {
+        Some(u) => format!("{u}@{host}:{port}"),
+        None => format!("{host}:{port}"),
+    }
+}
 
 /// System version without the name the label already shows
 /// ("Ubuntu 24.04.1 LTS" next to "Ubuntu" → "24.04.1 LTS").
@@ -63,6 +206,15 @@ pub struct HostsView {
     /// Pending single click: the editor opens if no double click arrives
     /// (opening it at once moves the cards and the second click is lost).
     pending_click: Option<(Id, Task<()>)>,
+    /// Hosts chosen with Cmd/Ctrl+click or Shift+click.
+    selection: Selection<Id>,
+    /// Host with the keyboard focus (arrows, Enter, Shift+F10).
+    cursor: Option<Id>,
+    /// Hosts in the order they are shown (for Shift ranges and the keyboard).
+    order: Vec<Id>,
+    focus: FocusHandle,
+    /// Menu opened from the keyboard on the focused card.
+    kbd_menu: Option<(Id, Entity<PopupMenu>, Subscription)>,
 }
 
 impl EventEmitter<OpenRequest> for HostsView {}
@@ -87,6 +239,11 @@ impl HostsView {
             _subs: subs,
             _editor_sub: None,
             pending_click: None,
+            selection: Selection::default(),
+            cursor: None,
+            order: Vec::new(),
+            focus: cx.focus_handle(),
+            kbd_menu: None,
         }
     }
 
@@ -300,6 +457,607 @@ impl HostsView {
         }
     }
 
+    // ----- Several hosts -----
+
+    /// Connects to each host in its own tab.
+    fn connect_many(&mut self, ids: &[Id], cx: &mut Context<Self>) {
+        for host_id in ids {
+            cx.emit(OpenRequest::Local { host_id: *host_id });
+        }
+    }
+
+    /// Opens the hosts together in a split view: a new tab or, with
+    /// `current`, added to the current one.
+    fn open_split(&mut self, ids: Vec<Id>, current: bool, cx: &mut Context<Self>) {
+        if !ids.is_empty() {
+            cx.emit(OpenRequest::Split {
+                hosts: ids,
+                current,
+            });
+        }
+    }
+
+    fn duplicate_host(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.model.update(cx, |m, cx| m.duplicate_host(id, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| match res {
+                Ok(rec) => {
+                    ui::success(window, cx, t!("hosts.duplicated", name = rec.data.label));
+                    this.cursor = Some(rec.data.id);
+                    this.edit(Some(rec), window, cx);
+                }
+                Err(e) => ui::error(window, cx, e),
+            });
+        })
+        .detach();
+    }
+
+    fn copy_address(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let m = self.model.read(cx);
+        let Some(host) = m.host(id) else {
+            return;
+        };
+        let text = ssh_address(
+            m.effective_user(host).as_deref(),
+            &host.address,
+            m.effective_port(host),
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        ui::notify(
+            window,
+            cx,
+            crate::state::ToastKind::Info,
+            t!("hosts.address_copied", address = text),
+        );
+    }
+
+    fn move_to_group(
+        &mut self,
+        ids: Vec<Id>,
+        group: Option<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task = self.model.update(cx, |m, cx| m.move_hosts(ids, group, cx));
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(e) = task.await {
+                let _ = cx.update(|window, cx| ui::error(window, cx, e));
+            }
+        })
+        .detach();
+    }
+
+    /// Deletes the selected hosts, after asking.
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self.selection.ids().to_vec();
+        match ids.len() {
+            0 => {
+                if let Some(rec) = self
+                    .cursor
+                    .and_then(|id| self.model.read(cx).host_record(id).cloned())
+                {
+                    self.delete_host(&rec, window, cx);
+                }
+            }
+            1 => {
+                if let Some(rec) = self.model.read(cx).host_record(ids[0]).cloned() {
+                    self.delete_host(&rec, window, cx);
+                }
+            }
+            n => {
+                let model = self.model.clone();
+                let weak = cx.entity().downgrade();
+                ui::confirm(
+                    window,
+                    cx,
+                    tn!("hosts.bulk.delete_title", n),
+                    tn!("hosts.bulk.delete_message", n),
+                    t!("hosts.delete.ok"),
+                    true,
+                    move |window, cx| {
+                        let task = model.update(cx, |m, cx| m.delete_hosts(ids.clone(), cx));
+                        let weak = weak.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let res = task.await;
+                                let _ = cx.update(|window, cx| match res {
+                                    Ok(()) => {
+                                        if let Some(v) = weak.upgrade() {
+                                            v.update(cx, |v, cx| {
+                                                v.selection.clear();
+                                                cx.notify();
+                                            });
+                                        }
+                                        ui::success(window, cx, tn!("hosts.bulk.deleted", n));
+                                    }
+                                    Err(e) => ui::error(window, cx, e),
+                                });
+                            })
+                            .detach();
+                    },
+                );
+            }
+        }
+    }
+
+    /// Hosts the menu of `id` acts on: the selection if `id` is part of it,
+    /// otherwise just `id`.
+    fn targets(&self, id: Id) -> Vec<Id> {
+        if self.selection.len() > 1 && self.selection.contains(id) {
+            self.selection.ids().to_vec()
+        } else {
+            vec![id]
+        }
+    }
+
+    /// Menu of a host (right click, "…" button and Shift+F10). With several
+    /// hosts selected, including this one, it acts on all of them.
+    fn host_menu(
+        menu: PopupMenu,
+        view: WeakEntity<Self>,
+        id: Id,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let Some(this) = view.upgrade() else {
+            return menu;
+        };
+        let (targets, rec, groups, logged_in) = {
+            let v = this.read(cx);
+            let m = v.model.read(cx);
+            (
+                v.targets(id),
+                m.host_record(id).cloned(),
+                m.groups
+                    .iter()
+                    .map(|g| (g.data.id, g.data.name.clone()))
+                    .collect::<Vec<_>>(),
+                m.logged_in(),
+            )
+        };
+        let Some(rec) = rec else {
+            return menu;
+        };
+        let move_ids = targets.clone();
+        let n = targets.len();
+        let w = view.clone();
+        let act = move |f: fn(&mut HostsView, Vec<Id>, &mut Window, &mut Context<HostsView>)| {
+            let w = w.clone();
+            let targets = targets.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut gpui::App| {
+                if let Some(v) = w.upgrade() {
+                    let targets = targets.clone();
+                    v.update(cx, |v, cx| f(v, targets, window, cx));
+                }
+            }
+        };
+        let current_group = rec.data.group_id;
+        let move_menu = |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            if groups.is_empty() {
+                return menu;
+            }
+            let w = view.clone();
+            let ids = move_ids.clone();
+            let groups = groups.clone();
+            menu.submenu_with_icon(
+                Some(ui::icon(IconName::FolderInput)),
+                if n > 1 {
+                    tn!("hosts.bulk.move", n)
+                } else {
+                    t!("hosts.menu.move_to_group")
+                },
+                window,
+                cx,
+                move |mut sub, _, _| {
+                    let mut entries: Vec<(Option<Id>, SharedString)> =
+                        vec![(None, t!("hosts.menu.no_group"))];
+                    entries.extend(
+                        groups
+                            .iter()
+                            .map(|(g, name)| (Some(*g), name.clone().into())),
+                    );
+                    for (group, name) in entries {
+                        let w = w.clone();
+                        let ids = ids.clone();
+                        sub = sub.item(
+                            PopupMenuItem::new(name)
+                                .checked(n == 1 && group == current_group)
+                                .on_click(move |_, window, cx| {
+                                    if let Some(v) = w.upgrade() {
+                                        let ids = ids.clone();
+                                        v.update(cx, |v, cx| {
+                                            v.move_to_group(ids, group, window, cx)
+                                        });
+                                    }
+                                }),
+                        );
+                    }
+                    sub
+                },
+            )
+        };
+
+        if n > 1 {
+            let menu = menu
+                .label(tn!("hosts.bulk.selected", n))
+                .item(
+                    PopupMenuItem::new(tn!("hosts.bulk.connect", n))
+                        .icon(ui::icon(IconName::SquareTerminal))
+                        .on_click(act(|v, ids, _, cx| v.connect_many(&ids, cx))),
+                )
+                .item(
+                    PopupMenuItem::new(t!("hosts.bulk.split"))
+                        .icon(ui::icon(IconName::LayoutGrid))
+                        .on_click(act(|v, ids, _, cx| v.open_split(ids, false, cx))),
+                );
+            let menu = move_menu(menu.separator(), window, cx);
+            return menu.separator().item(
+                PopupMenuItem::new(tn!("hosts.bulk.delete", n))
+                    .icon(ui::icon(IconName::Trash))
+                    .on_click(act(|v, _, window, cx| v.delete_selected(window, cx))),
+            );
+        }
+
+        let favorite = rec.data.favorite;
+        let menu = menu
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.connect"))
+                    .icon(ui::icon(IconName::SquareTerminal))
+                    .on_click(act(|v, ids, _, cx| v.connect_many(&ids, cx))),
+            )
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.connect_split"))
+                    .icon(ui::icon(IconName::LayoutGrid))
+                    .on_click(act(|v, ids, _, cx| v.open_split(ids, true, cx))),
+            )
+            .when(logged_in, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.connect_server"))
+                        .icon(ui::icon(IconName::Cloud))
+                        .on_click(act(|v, ids, _, cx| {
+                            for host_id in ids {
+                                v.connect(host_id, true, cx);
+                            }
+                        })),
+                )
+            })
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.open_sftp"))
+                    .icon(ui::icon(IconName::FolderOpen))
+                    .on_click(act(|_, ids, _, cx| {
+                        for host_id in ids {
+                            cx.emit(OpenRequest::Sftp {
+                                host_id,
+                                conn: None,
+                            });
+                        }
+                    })),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.edit"))
+                    .icon(ui::icon(IconName::Pencil))
+                    .on_click(act(|v, ids, window, cx| {
+                        let rec = ids
+                            .first()
+                            .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                        if rec.is_some() {
+                            v.edit(rec, window, cx);
+                        }
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.duplicate"))
+                    .icon(ui::icon(IconName::CopyPlus))
+                    .on_click(act(|v, ids, window, cx| {
+                        if let Some(id) = ids.first() {
+                            v.duplicate_host(*id, window, cx);
+                        }
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(t!("hosts.menu.copy_address"))
+                    .icon(ui::icon(IconName::Copy))
+                    .on_click(act(|v, ids, window, cx| {
+                        if let Some(id) = ids.first() {
+                            v.copy_address(*id, window, cx);
+                        }
+                    })),
+            )
+            .item(
+                PopupMenuItem::new(if favorite {
+                    t!("hosts.menu.unfavorite")
+                } else {
+                    t!("hosts.menu.favorite")
+                })
+                .icon(ui::icon(IconName::Star))
+                .on_click(act(|v, ids, window, cx| {
+                    let rec = ids
+                        .first()
+                        .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                    if let Some(rec) = rec {
+                        v.toggle_favorite(&rec, window, cx);
+                    }
+                })),
+            );
+        let menu = move_menu(menu, window, cx);
+        menu.separator().item(
+            PopupMenuItem::new(t!("hosts.menu.delete"))
+                .icon(ui::icon(IconName::Trash))
+                .on_click(act(|v, ids, window, cx| {
+                    let rec = ids
+                        .first()
+                        .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                    if let Some(rec) = rec {
+                        v.delete_host(&rec, window, cx);
+                    }
+                })),
+        )
+    }
+
+    /// Menu of a group header: connect to all its hosts, in tabs or in a
+    /// split view, and edit or delete the group.
+    fn group_menu(
+        menu: PopupMenu,
+        view: WeakEntity<Self>,
+        group: Option<Group>,
+        hosts: Vec<Id>,
+    ) -> PopupMenu {
+        let (w1, w2, w3, w4) = (view.clone(), view.clone(), view.clone(), view);
+        let (h1, h2) = (hosts.clone(), hosts.clone());
+        let empty = hosts.is_empty();
+        let menu = menu
+            .item(
+                PopupMenuItem::new(tn!("hosts.group.menu.connect_all", hosts.len()))
+                    .icon(ui::icon(IconName::SquareTerminal))
+                    .disabled(empty)
+                    .on_click(move |_, _, cx| {
+                        if let Some(v) = w1.upgrade() {
+                            v.update(cx, |v, cx| v.connect_many(&h1, cx));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t!("hosts.group.menu.split_all"))
+                    .icon(ui::icon(IconName::LayoutGrid))
+                    .disabled(empty)
+                    .on_click(move |_, _, cx| {
+                        if let Some(v) = w2.upgrade() {
+                            let ids = h2.clone();
+                            v.update(cx, |v, cx| v.open_split(ids, false, cx));
+                        }
+                    }),
+            );
+        let Some(g) = group else {
+            return menu;
+        };
+        let g2 = g.clone();
+        menu.separator()
+            .item(
+                PopupMenuItem::new(t!("hosts.group.menu.edit"))
+                    .icon(ui::icon(IconName::Pencil))
+                    .on_click(move |_, window, cx| {
+                        if let Some(v) = w3.upgrade() {
+                            let g = g.clone();
+                            v.update(cx, |v, cx| v.edit_group(Some(g), window, cx));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t!("hosts.group.menu.delete"))
+                    .icon(ui::icon(IconName::Trash))
+                    .on_click(move |_, window, cx| {
+                        if let Some(v) = w4.upgrade() {
+                            let g = g2.clone();
+                            v.update(cx, |v, cx| v.delete_group(g, window, cx));
+                        }
+                    }),
+            )
+    }
+
+    // ----- Keyboard -----
+
+    fn on_open_menu(&mut self, _: &OpenHostMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.cursor.or_else(|| self.order.first().copied()) else {
+            return;
+        };
+        self.cursor = Some(id);
+        let view = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+            Self::host_menu(menu, view.clone(), id, window, cx)
+        });
+        let sub = cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.kbd_menu = None;
+                this.focus.focus(window, cx);
+                cx.notify();
+            },
+        );
+        let handle = menu.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.kbd_menu = Some((id, menu, sub));
+        cx.notify();
+    }
+
+    fn on_select_all(&mut self, _: &SelectAllHosts, _: &mut Window, cx: &mut Context<Self>) {
+        let order = self.order.clone();
+        self.selection.select_all(&order);
+        cx.notify();
+    }
+
+    fn on_clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.selection.clear();
+        cx.notify();
+    }
+
+    fn on_connect_focused(&mut self, _: &ConnectFocused, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.len() > 1 {
+            let ids = self.selection.ids().to_vec();
+            self.connect_many(&ids, cx);
+        } else if let Some(id) = self.cursor {
+            self.connect(id, false, cx);
+        }
+    }
+
+    fn on_delete_selected(
+        &mut self,
+        _: &DeleteSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_selected(window, cx);
+    }
+
+    fn step_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.order.is_empty() {
+            return;
+        }
+        let n = self.order.len() as isize;
+        let next = match self
+            .cursor
+            .and_then(|c| self.order.iter().position(|x| *x == c))
+        {
+            Some(ix) => (ix as isize + delta).rem_euclid(n),
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        self.cursor = Some(self.order[next as usize]);
+        cx.notify();
+    }
+
+    fn on_prev(&mut self, _: &FocusPrevHost, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_cursor(-1, cx);
+    }
+
+    fn on_next(&mut self, _: &FocusNextHost, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_cursor(1, cx);
+    }
+
+    /// Bar shown while several hosts are selected.
+    fn render_selection_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let n = self.selection.len();
+        let theme = cx.theme();
+        let has_groups = !self.model.read(cx).groups.is_empty();
+        let view = cx.entity().downgrade();
+        h_flex()
+            .mx_6()
+            .mt_3()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.primary)
+            .bg(theme.secondary)
+            .child(
+                ui::icon(IconName::SquareCheck)
+                    .size(px(16.))
+                    .text_color(theme.primary),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child(tn!("hosts.bulk.selected", n)),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("bulk-connect")
+                    .small()
+                    .primary()
+                    .icon(ui::icon(IconName::SquareTerminal))
+                    .label(tn!("hosts.bulk.connect", n))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let ids = this.selection.ids().to_vec();
+                        this.connect_many(&ids, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-split")
+                    .small()
+                    .icon(ui::icon(IconName::LayoutGrid))
+                    .label(t!("hosts.bulk.split"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let ids = this.selection.ids().to_vec();
+                        this.open_split(ids, false, cx);
+                    })),
+            )
+            .when(has_groups, |this| {
+                this.child(
+                    Button::new("bulk-move")
+                        .small()
+                        .icon(ui::icon(IconName::FolderInput))
+                        .label(t!("hosts.bulk.move_short"))
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            let Some(v) = view.upgrade() else {
+                                return menu;
+                            };
+                            let groups: Vec<(Option<Id>, SharedString)> =
+                                std::iter::once((None, t!("hosts.menu.no_group")))
+                                    .chain(v.read(cx).model.read(cx).groups.iter().map(|g| {
+                                        (Some(g.data.id), SharedString::from(g.data.name.clone()))
+                                    }))
+                                    .collect();
+                            for (group, name) in groups {
+                                let w = view.clone();
+                                menu = menu.item(PopupMenuItem::new(name).on_click(
+                                    move |_, window, cx| {
+                                        if let Some(v) = w.upgrade() {
+                                            v.update(cx, |v, cx| {
+                                                let ids = v.selection.ids().to_vec();
+                                                v.move_to_group(ids, group, window, cx)
+                                            });
+                                        }
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                )
+            })
+            .child(
+                Button::new("bulk-delete")
+                    .small()
+                    .danger()
+                    .icon(ui::icon(IconName::Trash))
+                    .label(t!("hosts.menu.delete"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.delete_selected(window, cx)
+                    })),
+            )
+            .child(
+                Button::new("bulk-all")
+                    .small()
+                    .ghost()
+                    .label(t!("hosts.bulk.select_all"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let order = this.order.clone();
+                        this.selection.select_all(&order);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("bulk-clear")
+                    .small()
+                    .ghost()
+                    .icon(ui::icon(IconName::X))
+                    .tooltip(t!("hosts.bulk.clear"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.selection.clear();
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn matches(query: &str, rec: &Record<Host>, group_name: Option<&str>) -> bool {
         if query.is_empty() {
             return true;
@@ -345,6 +1103,7 @@ impl HostsView {
         &self,
         rec: &Record<Host>,
         ix: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let host = &rec.data;
@@ -393,12 +1152,16 @@ impl HostsView {
                 .map(|p| format!(":{p}"))
                 .unwrap_or_default()
         );
-        let logged_in = self.model.read(cx).logged_in();
         let id = host.id;
-        let rec_fav = rec.clone();
-        let rec_edit = rec.clone();
-        let rec_del = rec.clone();
         let weak = cx.entity().downgrade();
+        let weak_menu = weak.clone();
+        let multi = self.selection.contains(id);
+        let cursor = self.cursor == Some(id) && self.focus.contains_focused(window, cx);
+        let kbd_menu = self
+            .kbd_menu
+            .as_ref()
+            .filter(|(m, _, _)| *m == id)
+            .map(|(_, menu, _)| menu.clone());
         let initials: String = host
             .label
             .split_whitespace()
@@ -409,20 +1172,43 @@ impl HostsView {
 
         v_flex()
             .id(("host-card", ix))
+            .relative()
             .w(px(290.))
             .p_3()
             .gap_2()
             .rounded(theme.radius_lg)
             .border_1()
-            .border_color(if selected {
+            .border_color(if selected || multi || cursor {
                 theme.primary
             } else {
                 theme.border
             })
-            .bg(theme.secondary)
-            .hover(|s| s.bg(theme.secondary_hover))
+            .when(multi, |this| this.bg(theme.list_active))
+            .when(!multi, |this| {
+                this.bg(theme.secondary)
+                    .hover(|s| s.bg(theme.secondary_hover))
+            })
             .cursor_pointer()
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                this.focus.focus(window, cx);
+                this.cursor = Some(id);
+                let mods = ev.modifiers();
+                if mods.secondary() {
+                    // Cmd/Ctrl+click: add or remove it from the selection.
+                    this.pending_click = None;
+                    this.selection.toggle(id);
+                    cx.notify();
+                    return;
+                }
+                if mods.shift {
+                    let order = this.order.clone();
+                    this.pending_click = None;
+                    this.selection.extend_to(&order, id);
+                    cx.notify();
+                    return;
+                }
+                this.selection.click(id);
+                cx.notify();
                 if ev.click_count() >= 2 {
                     this.pending_click = None;
                     this.connect(id, false, cx);
@@ -508,105 +1294,20 @@ impl HostsView {
                                     .child(subtitle),
                             ),
                     )
+                    .when(multi, |this| {
+                        this.child(
+                            ui::icon(IconName::SquareCheck)
+                                .size(px(16.))
+                                .text_color(theme.primary),
+                        )
+                    })
                     .child(
                         Button::new(("card-menu", ix))
                             .xsmall()
                             .ghost()
                             .icon(ui::icon(IconName::EllipsisVertical))
-                            .dropdown_menu(move |menu, _, _| {
-                                let w = weak.clone();
-                                let (w1, w2, w3, w4, w5, w6) = (
-                                    w.clone(),
-                                    w.clone(),
-                                    w.clone(),
-                                    w.clone(),
-                                    w.clone(),
-                                    w.clone(),
-                                );
-                                let (rf, re, rd) =
-                                    (rec_fav.clone(), rec_edit.clone(), rec_del.clone());
-                                let menu = menu
-                                    .item(
-                                        PopupMenuItem::new(t!("hosts.menu.connect"))
-                                            .icon(ui::icon(IconName::SquareTerminal))
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(v) = w1.upgrade() {
-                                                    v.update(cx, |v, cx| v.connect(id, false, cx));
-                                                }
-                                            }),
-                                    )
-                                    .when(logged_in, |menu| {
-                                        menu.item(
-                                            PopupMenuItem::new(t!("hosts.menu.connect_server"))
-                                                .icon(ui::icon(IconName::Cloud))
-                                                .on_click(move |_, _, cx| {
-                                                    if let Some(v) = w2.upgrade() {
-                                                        v.update(cx, |v, cx| {
-                                                            v.connect(id, true, cx)
-                                                        });
-                                                    }
-                                                }),
-                                        )
-                                    })
-                                    .item(
-                                        PopupMenuItem::new(t!("hosts.menu.open_sftp"))
-                                            .icon(ui::icon(IconName::FolderOpen))
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(v) = w3.upgrade() {
-                                                    v.update(cx, |_, cx| {
-                                                        cx.emit(OpenRequest::Sftp {
-                                                            host_id: id,
-                                                            conn: None,
-                                                        })
-                                                    });
-                                                }
-                                            }),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t!("hosts.menu.edit"))
-                                            .icon(ui::icon(IconName::Pencil))
-                                            .on_click(move |_, window, cx| {
-                                                if let Some(v) = w4.upgrade() {
-                                                    let re = re.clone();
-                                                    v.update(cx, |v, cx| {
-                                                        v.edit(Some(re), window, cx)
-                                                    });
-                                                }
-                                            }),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(if rf.data.favorite {
-                                            t!("hosts.menu.unfavorite")
-                                        } else {
-                                            t!("hosts.menu.favorite")
-                                        })
-                                        .icon(ui::icon(IconName::Star))
-                                        .on_click(
-                                            move |_, window, cx| {
-                                                if let Some(v) = w5.upgrade() {
-                                                    let rf = rf.clone();
-                                                    v.update(cx, |v, cx| {
-                                                        v.toggle_favorite(&rf, window, cx)
-                                                    });
-                                                }
-                                            },
-                                        ),
-                                    )
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t!("hosts.menu.delete"))
-                                            .icon(ui::icon(IconName::Trash))
-                                            .on_click(move |_, window, cx| {
-                                                if let Some(v) = w6.upgrade() {
-                                                    let rd = rd.clone();
-                                                    v.update(cx, |v, cx| {
-                                                        v.delete_host(&rd, window, cx)
-                                                    });
-                                                }
-                                            }),
-                                    );
-                                menu
+                            .dropdown_menu(move |menu, window, cx| {
+                                Self::host_menu(menu, weak.clone(), id, window, cx)
                             }),
                     ),
             )
@@ -650,15 +1351,28 @@ impl HostsView {
                             .map(|t| ui::pill(t.clone(), theme.muted_foreground)),
                     ),
             )
+            // Menu opened from the keyboard (Shift+F10, the menu key).
+            .when_some(kbd_menu, |this, menu| {
+                this.child(
+                    div().absolute().top(px(40.)).left(px(24.)).child(
+                        deferred(anchored().snap_to_window_with_margin(px(8.)).child(menu))
+                            .with_priority(1),
+                    ),
+                )
+            })
+            .context_menu(move |menu, window, cx| {
+                Self::host_menu(menu, weak_menu.clone(), id, window, cx)
+            })
     }
 
     fn render_group_header(
         &self,
         group: Option<&Group>,
-        count: usize,
+        hosts: Vec<Id>,
         ix: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let count = hosts.len();
         let theme = cx.theme();
         let name = group
             .map(|g| g.name.clone())
@@ -668,7 +1382,10 @@ impl HostsView {
             .unwrap_or_else(|| theme::color_for(&name));
         let weak = cx.entity().downgrade();
         let group_owned = group.cloned();
+        let (menu_view, menu_group, menu_hosts) =
+            (weak.clone(), group_owned.clone(), hosts.clone());
         h_flex()
+            .id(("group-header", ix))
             .gap_2()
             .items_center()
             .child(ui::icon(IconName::Folder).size(px(16.)).text_color(color))
@@ -679,43 +1396,34 @@ impl HostsView {
                     .text_color(theme.muted_foreground)
                     .child(tn!("hosts.count", count)),
             )
-            .when_some(group_owned, |this, g| {
-                this.child(
-                    Button::new(("group-menu", ix))
-                        .xsmall()
-                        .ghost()
-                        .icon(ui::icon(IconName::Ellipsis))
-                        .dropdown_menu(move |menu, _, _| {
-                            let (w1, w2) = (weak.clone(), weak.clone());
-                            let (g1, g2) = (g.clone(), g.clone());
-                            menu.item(
-                                PopupMenuItem::new(t!("hosts.group.menu.edit"))
-                                    .icon(ui::icon(IconName::Pencil))
-                                    .on_click(move |_, window, cx| {
-                                        if let Some(v) = w1.upgrade() {
-                                            let g = g1.clone();
-                                            v.update(cx, |v, cx| v.edit_group(Some(g), window, cx));
-                                        }
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new(t!("hosts.group.menu.delete"))
-                                    .icon(ui::icon(IconName::Trash))
-                                    .on_click(move |_, window, cx| {
-                                        if let Some(v) = w2.upgrade() {
-                                            let g = g2.clone();
-                                            v.update(cx, |v, cx| v.delete_group(g, window, cx));
-                                        }
-                                    }),
-                            )
-                        }),
+            .child(
+                Button::new(("group-menu", ix))
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(IconName::Ellipsis))
+                    .dropdown_menu(move |menu, _, _| {
+                        Self::group_menu(menu, weak.clone(), group_owned.clone(), hosts.clone())
+                    }),
+            )
+            .context_menu(move |menu, _, _| {
+                Self::group_menu(
+                    menu,
+                    menu_view.clone(),
+                    menu_group.clone(),
+                    menu_hosts.clone(),
                 )
             })
     }
 }
 
+impl Focusable for HostsView {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for HostsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let query = self.search.read(cx).value().trim().to_string();
         let groups: Vec<Group> = model.groups.iter().map(|g| g.data.clone()).collect();
@@ -849,6 +1557,18 @@ impl Render for HostsView {
             }
         }
 
+        // Order on screen, for Shift ranges and the keyboard; what is no
+        // longer shown leaves the selection.
+        self.order = sections
+            .iter()
+            .flat_map(|(_, list)| list.iter().map(|h| h.data.id))
+            .collect();
+        let order = self.order.clone();
+        self.selection.retain(&order);
+        if self.cursor.is_some_and(|c| !order.contains(&c)) {
+            self.cursor = None;
+        }
+
         let warning = cx.theme().warning;
         let total = hosts.len();
         let mut card_ix = 0usize;
@@ -885,12 +1605,17 @@ impl Render for HostsView {
                     .child(div().font_semibold().child(t!("hosts.filter.favorites")))
                     .into_any_element()
             } else {
-                self.render_group_header(title_group, list.len(), si, cx)
-                    .into_any_element()
+                self.render_group_header(
+                    title_group,
+                    list.iter().map(|h| h.data.id).collect(),
+                    si,
+                    cx,
+                )
+                .into_any_element()
             };
             let mut grid = h_flex().flex_wrap().gap_3();
             for rec in list {
-                grid = grid.child(self.render_card(rec, card_ix, cx));
+                grid = grid.child(self.render_card(rec, card_ix, window, cx));
                 card_ix += 1;
             }
             if list.is_empty() {
@@ -980,8 +1705,21 @@ impl Render for HostsView {
                     .border_color(theme.border)
                     .children(chips),
             )
+            .when(!self.selection.is_empty(), |this| {
+                this.child(self.render_selection_bar(cx))
+            })
             .child(
                 div()
+                    .id("host-list")
+                    .key_context(CONTEXT)
+                    .track_focus(&self.focus)
+                    .on_action(cx.listener(Self::on_open_menu))
+                    .on_action(cx.listener(Self::on_select_all))
+                    .on_action(cx.listener(Self::on_clear_selection))
+                    .on_action(cx.listener(Self::on_connect_focused))
+                    .on_action(cx.listener(Self::on_delete_selected))
+                    .on_action(cx.listener(Self::on_prev))
+                    .on_action(cx.listener(Self::on_next))
                     .flex_1()
                     .min_h_0()
                     .child(v_flex().size_full().overflow_y_scrollbar().child(body)),

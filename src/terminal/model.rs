@@ -6,16 +6,32 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use gpui::Hsla;
 use parking_lot::Mutex;
 
 use crate::theme::{TermPalette, rgb8};
+
+/// A match of the find bar: first and last cell (inclusive).
+pub type FindMatch = std::ops::RangeInclusive<Point>;
+
+/// Regular expression that matches `text` literally.
+fn literal_pattern(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Terminal size for `alacritty_terminal`.
 #[derive(Clone, Copy, Debug)]
@@ -306,6 +322,52 @@ impl TermModel {
         self.events.0.lock().clear();
         self.term = Term::new(config, &Size { cols, lines }, self.events.clone());
         self.processor = Processor::new();
+    }
+
+    /// Forgets the history (scrollback) and the selection; the visible
+    /// screen stays (the shell clears it when asked with Ctrl+L).
+    pub fn clear_history(&mut self) {
+        self.term.selection = None;
+        self.scroll_to_bottom();
+        self.term.grid_mut().clear_history();
+    }
+
+    // ----- Find -----
+
+    /// Finds `query` literally (ignoring case unless it has capitals) in the
+    /// screen and the history, starting next to `from` (or at the bottom
+    /// for `older`, at the top otherwise) and wrapping around. `older`
+    /// searches upwards. The match is selected and scrolled into view.
+    pub fn find(
+        &mut self,
+        query: &str,
+        from: Option<&FindMatch>,
+        older: bool,
+    ) -> Option<FindMatch> {
+        if query.is_empty() {
+            return None;
+        }
+        let mut regex = RegexSearch::new(&literal_pattern(query)).ok()?;
+        let direction = if older {
+            Direction::Left
+        } else {
+            Direction::Right
+        };
+        let last_col = Column(self.size.cols.saturating_sub(1));
+        let origin = match from {
+            Some(m) if older => m.start().sub(&self.term, Boundary::None, 1),
+            Some(m) => m.end().add(&self.term, Boundary::None, 1),
+            None if older => Point::new(self.term.bottommost_line(), last_col),
+            None => Point::new(self.term.topmost_line(), Column(0)),
+        };
+        let found = self
+            .term
+            .search_next(&mut regex, origin, direction, Side::Left, None)?;
+        let mut sel = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
+        sel.update(*found.end(), Side::Right);
+        self.term.selection = Some(sel);
+        self.term.scroll_to_point(*found.start());
+        Some(found)
     }
 
     // ----- Links -----
@@ -672,6 +734,31 @@ mod tests {
             .chars()
             .collect();
         assert_eq!(find_url(&wiki, 5).map(|u| u.ends_with(')')), Some(true));
+    }
+
+    #[test]
+    fn find_walks_the_history() {
+        let mut m = TermModel::new(40, 3, 100);
+        for i in 0..10 {
+            m.feed(format!("line {i} needle.{i}\r\n").as_bytes());
+        }
+        // The most recent first (upwards), then older ones.
+        let first = m.find("NEEDLE.9", None, true);
+        assert!(first.is_none(), "capitals make the search case sensitive");
+        let first = m.find("needle.", None, true).unwrap();
+        assert_eq!(m.selection_text().as_deref(), Some("needle."));
+        let second = m.find("needle.", Some(&first), true).unwrap();
+        assert!(second.start().line < first.start().line);
+        // And back down.
+        let again = m.find("needle.", Some(&second), false).unwrap();
+        assert_eq!(again.start(), first.start());
+        // Literal text: the dot is not "any character".
+        m.feed(b"needleX");
+        assert!(m.find("e.X", None, true).is_none());
+        assert!(m.find("missing", None, true).is_none());
+        m.clear_history();
+        assert_eq!(m.display_offset(), 0);
+        assert!(!m.has_selection());
     }
 
     #[test]

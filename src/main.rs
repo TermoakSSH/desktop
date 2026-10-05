@@ -24,6 +24,8 @@ mod i18n;
 
 mod app;
 mod local_ai;
+mod menus;
+mod panes;
 mod prompts;
 mod qr;
 mod runtime;
@@ -93,8 +95,10 @@ fn main() {
             gpui_component::init(cx);
             runtime::init(cx, rt);
             theme::init(cx, settings.dark);
-            app::init(cx);
+            // The terminal keys first: the menu bar shows the shortcuts
+            // bound when it is built (in `app::init`).
             terminal::init(cx);
+            app::init(cx);
 
             let options = window_options(cx);
             let opened = match workspace {

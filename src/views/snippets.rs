@@ -684,3 +684,327 @@ impl Render for RunDialog {
             )
     }
 }
+
+/// Text a snippet types into a terminal: with "Run" it ends with Enter (one
+/// line break), with "Paste" it never does.
+pub fn snippet_input(script: &str, run: bool) -> String {
+    let body = script.trim_end_matches(['\r', '\n']);
+    if run {
+        format!("{body}\n")
+    } else {
+        body.to_string()
+    }
+}
+
+/// Terminal → Send snippet: picks a snippet, fills its variables and types
+/// it into the focused terminal or, in a split view, into every pane ("Run
+/// in all panes", checked while broadcasting). `on_send` gets the text and
+/// whether it goes to all the panes.
+pub fn open_send_dialog(
+    model: Entity<AppModel>,
+    split: bool,
+    broadcast: bool,
+    window: &mut Window,
+    cx: &mut gpui::App,
+    on_send: impl Fn(String, bool, &mut Window, &mut gpui::App) + 'static,
+) {
+    if model.read(cx).snippets.is_empty() {
+        ui::notify(
+            window,
+            cx,
+            crate::state::ToastKind::Info,
+            t!("snippets.send.none"),
+        );
+        return;
+    }
+    let dialog = cx.new(|cx| SendDialog::new(model, split, broadcast, window, cx));
+    let on_send = std::rc::Rc::new(on_send);
+    window.open_dialog(cx, move |d, _, _| {
+        let (paste, run, enter) = (dialog.clone(), dialog.clone(), dialog.clone());
+        let (send_paste, send_run, send_enter) =
+            (on_send.clone(), on_send.clone(), on_send.clone());
+        d.title(t!("snippets.send.title"))
+            .w(px(560.))
+            .on_ok(move |_, window, cx| {
+                match enter.update(cx, |d, cx| d.finish(true, window, cx)) {
+                    Some((text, all)) => {
+                        send_enter(text, all, window, cx);
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .child(dialog.clone())
+            .footer(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("send-cancel")
+                            .label(t!("common.cancel"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("send-paste")
+                            .icon(ui::icon(IconName::ClipboardPaste))
+                            .label(t!("snippets.send.paste"))
+                            .tooltip(t!("snippets.send.paste_tooltip"))
+                            .on_click(move |_, window, cx| {
+                                if let Some((text, all)) =
+                                    paste.update(cx, |d, cx| d.finish(false, window, cx))
+                                {
+                                    window.close_dialog(cx);
+                                    send_paste(text, all, window, cx);
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("send-run")
+                            .primary()
+                            .icon(ui::icon(IconName::Play))
+                            .label(t!("snippets.send.run"))
+                            .on_click(move |_, window, cx| {
+                                if let Some((text, all)) =
+                                    run.update(cx, |d, cx| d.finish(true, window, cx))
+                                {
+                                    window.close_dialog(cx);
+                                    send_run(text, all, window, cx);
+                                }
+                            }),
+                    ),
+            )
+    });
+}
+
+/// Content of the "Send snippet" dialog.
+struct SendDialog {
+    model: Entity<AppModel>,
+    search: Entity<InputState>,
+    selected: Option<Id>,
+    vars: Vec<(String, Entity<InputState>)>,
+    split: bool,
+    all_panes: bool,
+    _sub: Subscription,
+}
+
+impl SendDialog {
+    fn new(
+        model: Entity<AppModel>,
+        split: bool,
+        broadcast: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("snippets.send.search_placeholder"))
+        });
+        ui::focus_later(&search, window, cx);
+        let sub = cx.subscribe_in(
+            &search,
+            window,
+            |this, _, ev: &gpui_component::input::InputEvent, window, cx| {
+                if matches!(ev, gpui_component::input::InputEvent::Change) {
+                    // While typing, the first match is chosen if the chosen
+                    // one is filtered out.
+                    let matches = this.matches(cx);
+                    if !matches.iter().any(|s| Some(s.data.id) == this.selected) {
+                        let first = matches.first().map(|s| s.data.id);
+                        this.select(first, window, cx);
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        let selected = model.read(cx).snippets.first().map(|s| s.data.id);
+        let mut dialog = Self {
+            model,
+            search,
+            selected: None,
+            vars: Vec::new(),
+            split,
+            all_panes: split && broadcast,
+            _sub: sub,
+        };
+        dialog.select(selected, window, cx);
+        dialog
+    }
+
+    fn matches(&self, cx: &gpui::App) -> Vec<Record<Snippet>> {
+        let q = self.search.read(cx).value().trim().to_lowercase();
+        self.model
+            .read(cx)
+            .snippets
+            .iter()
+            .filter(|s| {
+                q.is_empty()
+                    || s.data.name.to_lowercase().contains(&q)
+                    || s.data.script.to_lowercase().contains(&q)
+                    || s.data.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn snippet(&self, cx: &gpui::App) -> Option<Snippet> {
+        let id = self.selected?;
+        self.model
+            .read(cx)
+            .snippets
+            .iter()
+            .find(|s| s.data.id == id)
+            .map(|s| s.data.clone())
+    }
+
+    fn select(&mut self, id: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = id;
+        self.vars = self
+            .snippet(cx)
+            .map(|s| s.variables())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| {
+                let state = cx.new(|cx| InputState::new(window, cx).placeholder(name.clone()));
+                (name, state)
+            })
+            .collect();
+        cx.notify();
+    }
+
+    /// The text to type and whether it goes to every pane, or `None` (with
+    /// an error shown) if something is missing.
+    fn finish(
+        &mut self,
+        run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, bool)> {
+        let Some(snippet) = self.snippet(cx) else {
+            ui::error(window, cx, t!("snippets.send.choose"));
+            return None;
+        };
+        let values: BTreeMap<String, String> = self
+            .vars
+            .iter()
+            .map(|(n, s)| (n.clone(), s.read(cx).value().to_string()))
+            .collect();
+        if let Some((missing, _)) = values.iter().find(|(_, v)| v.trim().is_empty()) {
+            ui::error(window, cx, t!("snippets.run.missing_value", name = missing));
+            return None;
+        }
+        match snippet.render(&values) {
+            Ok(script) => Some((snippet_input(&script, run), self.split && self.all_panes)),
+            Err(e) => {
+                ui::error(window, cx, e.to_string());
+                None
+            }
+        }
+    }
+}
+
+impl Render for SendDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = self.matches(cx);
+        let selected = self.selected;
+        let theme = cx.theme();
+        v_flex()
+            .gap_3()
+            .child(Input::new(&self.search).prefix(ui::icon(IconName::Search).size(px(14.))))
+            .child(
+                v_flex()
+                    .id("send-snippets")
+                    .max_h(px(220.))
+                    .gap_1()
+                    .overflow_y_scrollbar()
+                    .when(items.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .p_3()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("snippets.send.no_matches")),
+                        )
+                    })
+                    .children(items.into_iter().enumerate().map(|(i, rec)| {
+                        let id = rec.data.id;
+                        let active = selected == Some(id);
+                        let first_line = rec.data.script.lines().next().unwrap_or("").to_string();
+                        h_flex()
+                            .id(("send-snippet", i))
+                            .px_3()
+                            .py_2()
+                            .gap_3()
+                            .items_center()
+                            .rounded(theme.radius)
+                            .cursor_pointer()
+                            .when(active, |this| this.bg(theme.list_active))
+                            .when(!active, |this| this.hover(|s| s.bg(theme.secondary_hover)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.select(Some(id), window, cx)
+                            }))
+                            .child(
+                                ui::icon(IconName::SquareTerminal)
+                                    .size(px(16.))
+                                    .text_color(theme.primary),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div().text_sm().font_medium().child(rec.data.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family(ui::mono_family(cx))
+                                            .text_color(theme.muted_foreground)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .child(first_line),
+                                    ),
+                            )
+                    })),
+            )
+            .children(
+                self.vars.iter().map(|(name, state)| {
+                    ui::field(format!("{{{{{name}}}}}"), Input::new(state), cx)
+                }),
+            )
+            .when(self.split, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Checkbox::new("send-all-panes")
+                                .label(t!("snippets.send.all_panes"))
+                                .checked(self.all_panes)
+                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                    this.all_panes = *v;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("snippets.send.all_panes_hint")),
+                        ),
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet_input;
+
+    #[test]
+    fn run_ends_with_one_enter_and_paste_with_none() {
+        assert_eq!(snippet_input("uptime", true), "uptime\n");
+        assert_eq!(snippet_input("uptime\n\n", true), "uptime\n");
+        assert_eq!(snippet_input("a\nb\n", false), "a\nb");
+        assert_eq!(snippet_input("a\r\n", false), "a");
+    }
+}
