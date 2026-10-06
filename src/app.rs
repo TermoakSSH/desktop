@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, EntityId, FocusHandle, Focusable,
@@ -27,19 +28,25 @@ use gpui_component::{ActiveTheme, Root, Sizable, StyledExt, TitleBar, WindowExt,
 use termoak_core::Id;
 use termoak_ssh::Connection;
 
+use crate::accounts::{self, SwitcherEntry, VaultFilter, ViewMode};
 use crate::local_ai::copilot::{LocalAi, LocalAiGlobal};
-use crate::local_ai::terminals::{LocalTerminals, TermRequest, screen_tail};
+use crate::local_ai::terminals::LocalTerminals;
 use crate::menus::{self, MenuState};
+use crate::notifications::{self, AiNotice, Category, Notice, Target};
 use crate::panes::{self, Dir, MAX_PANES};
-use crate::prompts::{self, PromptRequest};
+use crate::prompts::PromptRequest;
 use crate::runtime;
+use crate::sharing::{self, SessionNotice};
 use crate::state::{AppModel, ModelEvent, ToastKind};
 use crate::terminal::{
-    PaneAction, PaneChrome, TermKind, TermState, TerminalEvent, TerminalView, serial::SerialParams,
+    PaneAction, PaneChrome, RequestKind, ShareRequest, TermKind, TermState, TerminalEvent,
+    TerminalView, serial::SerialParams,
 };
 use crate::ui::{self, IconName};
 use crate::update::{self, UpdateEvent, UpdateModel, UpdateStatus};
 use crate::views::OpenRequest;
+use crate::views::accounts::avatar;
+use crate::views::add_account;
 use crate::views::admin::AdminView;
 use crate::views::ai::AiView;
 use crate::views::ai_chat::{AiChat, AiChatEvent};
@@ -53,11 +60,15 @@ use crate::views::settings::{SettingsPage, SettingsView};
 use crate::views::sftp::SftpView;
 use crate::views::snippets::SnippetsView;
 use crate::views::teams::TeamsView;
+use crate::views::vaults;
+use crate::windows;
 
 actions!(
     termoak,
     [
         NewTab,
+        /// Another window on the same data, with its own tabs.
+        NewWindow,
         NewLocalTerminal,
         CloseTab,
         NextTab,
@@ -103,6 +114,17 @@ actions!(
 
 const CONTEXT: &str = "Workspace";
 
+/// Toasts of requests from a shared terminal tab (one per request).
+struct ShareRequestToast;
+
+/// Toasts of notices about server sessions you are not watching.
+struct SessionNoticeToast;
+
+/// Key of the toast of a request.
+fn request_key(kind: RequestKind, participant: Id) -> SharedString {
+    format!("{kind:?}-{participant}").into()
+}
+
 /// Default terminal font size (View → Actual size).
 const DEFAULT_FONT_SIZE: f32 = 14.;
 
@@ -119,7 +141,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-1", GoHome, Some(CONTEXT)),
         KeyBinding::new("cmd-i", ToggleCopilot, Some(CONTEXT)),
         KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
-        KeyBinding::new("cmd-n", NewHost, Some(CONTEXT)),
+        KeyBinding::new("cmd-n", NewWindow, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", NewHost, Some(CONTEXT)),
         KeyBinding::new("cmd-d", AddPane, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-m", ToggleFocusMode, Some(CONTEXT)),
         KeyBinding::new("cmd-b", ToggleBroadcast, Some(CONTEXT)),
@@ -172,6 +195,9 @@ pub fn init(cx: &mut App) {
     ]);
     crate::views::hosts::init(cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    // Deferred: the action arrives while the window in front is being
+    // updated, and the new one is placed from its bounds.
+    cx.on_action(|_: &NewWindow, cx: &mut App| cx.defer(windows::open_new));
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
@@ -291,6 +317,8 @@ enum TabContent {
     Dormant {
         session_id: Id,
         title: String,
+        /// Account whose server has it.
+        account: Id,
     },
 }
 
@@ -401,34 +429,14 @@ impl AppView {
     pub fn new(
         model: Entity<AppModel>,
         updates: Entity<UpdateModel>,
-        prompts_rx: tokio::sync::mpsc::UnboundedReceiver<PromptRequest>,
+        prompts_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PromptRequest>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        prompts::listen(prompts_rx, window, cx);
-
-        // The AI that runs on this computer: its tools reach the terminals
-        // of this window through these requests.
-        let (terminals, mut term_rx) = LocalTerminals::new();
-        let store = model.read(cx).ws.store.clone();
-        let rt = runtime::handle(cx);
-        let local_ai = {
-            let _rt = rt.enter();
-            Arc::new(LocalAi::new(store, Arc::new(terminals)))
-        };
-        cx.set_global(LocalAiGlobal(local_ai.clone()));
-        Self::start_local_engine(local_ai, model.clone(), window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            while let Some(req) = term_rx.recv().await {
-                if this
-                    .update(cx, |app, cx| app.answer_terminal(req, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
+        let first = windows::register(&model, &updates, cx.weak_entity(), window, cx);
+        if first {
+            Self::start_app_services(prompts_rx, model.clone(), cx);
+        }
 
         let hosts = cx.new(|cx| HostsView::new(model.clone(), window, cx));
         let keychain = cx.new(|cx| KeychainView::new(model.clone(), window, cx));
@@ -451,19 +459,49 @@ impl AppView {
                 cx.notify();
             }),
             cx.subscribe_in(&model, window, |this, _, ev: &ModelEvent, window, cx| {
+                // Notices show up in one window only (the one used last).
+                let notices = windows::is_notice_window(window, cx);
                 match ev {
-                    ModelEvent::Toast(kind, msg) => ui::notify(window, cx, *kind, msg.clone()),
+                    ModelEvent::Toast(kind, msg) if notices => {
+                        ui::notify(window, cx, *kind, msg.clone())
+                    }
+                    ModelEvent::LayoutMigrated if notices => this.layout_notice(window, cx),
+                    ModelEvent::Server(v) if v["type"] == "ai" && notices => {
+                        this.on_ai_event(v, window, cx)
+                    }
                     // When starting signed in or when signing in: the running
-                    // sessions, as dormant tabs.
-                    ModelEvent::SessionChanged => this.restore_cloud_tabs(true, window, cx),
+                    // sessions, as dormant tabs (in the first window).
+                    ModelEvent::SessionChanged => {
+                        let add_tabs = windows::is_first_window(window, cx);
+                        this.restore_cloud_tabs(add_tabs, window, cx)
+                    }
                     ModelEvent::Server(v) if v["type"] == "session" => {
-                        this.restore_cloud_tabs(false, window, cx)
+                        this.restore_cloud_tabs(false, window, cx);
+                        if !notices {
+                            return;
+                        }
+                        if v["notice"]["type"] == "session_closed"
+                            && let Some(id) = v["notice"]["session_id"]
+                                .as_str()
+                                .and_then(|s| s.parse::<Id>().ok())
+                        {
+                            this.model.update(cx, |m, cx| m.clear_session_alert(id, cx));
+                        }
+                        if let Some(notice) = SessionNotice::from_event(v) {
+                            let account = v["account_id"].as_str().and_then(|a| a.parse().ok());
+                            this.on_session_notice(notice, account, window, cx);
+                        }
                     }
                     _ => {}
                 }
             }),
             cx.subscribe_in(&updates, window, |this, _, ev: &UpdateEvent, window, cx| {
-                this.on_update_event(ev, window, cx);
+                if windows::is_notice_window(window, cx) {
+                    this.on_update_event(ev, window, cx);
+                }
+            }),
+            cx.observe_window_activation(window, |_, window, cx| {
+                windows::set_active(window, window.is_window_active(), cx);
             }),
         ];
         subs.push(cx.subscribe_in(&hosts, window, Self::on_open_request));
@@ -501,24 +539,383 @@ impl AppView {
             focus: cx.focus_handle(),
             _subs: subs,
         };
-        // If the server session was already restored, the event will not come.
+        // macOS asks for permission once; before the first notice, so that
+        // one is not lost.
+        if first && view.model.read(cx).settings.notifications.enabled {
+            notifications::request_authorization();
+        }
+        // If the server session was already restored, the event will not
+        // come. Only the first window gets the dormant tabs; a new one starts
+        // empty.
         if logged_in {
-            view.restore_cloud_tabs(true, window, cx);
+            view.restore_cloud_tabs(first, window, cx);
+        }
+        // The layout notice may have come before this window existed.
+        if first {
+            let app = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                if let Some(app) = app.upgrade() {
+                    app.update(cx, |app, cx| app.layout_notice(window, cx));
+                }
+            });
         }
         view
     }
 
-    /// Starts the engine of the AI tasks on this computer and passes its
-    /// events on like the server's (with a notification when a task needs
-    /// approval or ends).
-    fn start_local_engine(
-        local_ai: Arc<LocalAi>,
+    /// What exists once for the whole app, set up by the first window and
+    /// shared by every window (see `windows.rs`): the authentication
+    /// questions, the links opened from outside, the clicks on
+    /// notifications of the system and the AI that runs on this computer.
+    fn start_app_services(
+        prompts_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PromptRequest>>,
         model: Entity<AppModel>,
+        cx: &mut Context<Self>,
+    ) {
+        // Questions of the SSH engine: in the window in use.
+        if let Some(mut rx) = prompts_rx {
+            cx.spawn(async move |_, cx| {
+                while let Some(req) = rx.recv().await {
+                    cx.update(|cx| windows::show_prompt(req, cx));
+                }
+            })
+            .detach();
+        }
+        // `termoak://` links opened from outside (at startup or later).
+        if let Some(mut links) = crate::links::take_receiver() {
+            cx.spawn(async move |_, cx| {
+                while let Some(link) = links.recv().await {
+                    cx.update(|cx| {
+                        windows::with_notice_window(cx, |app, window, cx| {
+                            app.open_link(&link, window, cx)
+                        })
+                    });
+                }
+            })
+            .detach();
+        }
+        // A click on a notification of the system: the window comes to the
+        // front with what it was about.
+        cx.on_system_notification_response(|response, cx| {
+            windows::notification_clicked(&response.tag, cx)
+        });
+
+        // The AI that runs on this computer: its tools reach the terminals
+        // of every window through these requests.
+        let (terminals, mut term_rx) = LocalTerminals::new();
+        let store = model.read(cx).ws.store.clone();
+        let rt = runtime::handle(cx);
+        let local_ai = {
+            let _rt = rt.enter();
+            Arc::new(LocalAi::new(store, Arc::new(terminals)))
+        };
+        cx.set_global(LocalAiGlobal(local_ai.clone()));
+        Self::start_local_engine(local_ai, model, cx);
+        cx.spawn(async move |_, cx| {
+            while let Some(req) = term_rx.recv().await {
+                cx.update(|cx| windows::answer_terminal(req, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// A `termoak://` (or web join) link: join a shared session or sign up
+    /// with an invitation.
+    pub fn open_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        if sharing::parse_join_link(link).is_some() {
+            self.open_join_dialog(Some(link.to_string()), window, cx);
+        } else if add_account::parse_invite_link(link).is_some() {
+            self.select_section(Section::Settings, window, cx);
+            self.settings
+                .update(cx, |s, cx| s.open_invite_link(link, window, cx));
+        } else {
+            ui::notify(window, cx, ToastKind::Warning, t!("join.unknown_link"));
+        }
+    }
+
+    /// "Join with link".
+    pub fn open_join_dialog(
+        &mut self,
+        link: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let weak = cx.entity().downgrade();
+        crate::views::join::open(
+            self.model.clone(),
+            link,
+            std::rc::Rc::new(move |req, window, cx| {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |app, cx| app.open(req, window, cx));
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Shows the tab (and pane) of a terminal.
+    fn show_terminal(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((tab, pane)) = self.find_pane(id) {
+            self.activate(Some(tab), window, cx);
+            self.focus_pane(tab, pane, window, cx);
+        }
+    }
+
+    /// A terminal is in view: its tab is the active one and the window has
+    /// the focus.
+    fn terminal_in_view(&self, id: EntityId, window: &Window) -> bool {
+        window.is_window_active()
+            && self
+                .find_pane(id)
+                .is_some_and(|(tab, _)| self.active == Some(tab))
+    }
+
+    /// A request from a shared terminal: if its tab is not in view, a toast
+    /// to answer it from anywhere.
+    fn on_share_request(
+        &mut self,
+        id: EntityId,
+        req: &ShareRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.notify_system(
+            Notice {
+                category: Category::Sharing,
+                key: notifications::request_key(req.kind == RequestKind::Join, req.participant),
+                title: req.title.clone(),
+                body: req.text().to_string(),
+                target: Target::Terminal(id),
+            },
+            window,
+            cx,
+        );
+        if self.terminal_in_view(id, window) {
+            return;
+        }
+        let Some(view) = self
+            .find_pane(id)
+            .and_then(|(tab, _)| self.tabs[tab].panes())
+            .and_then(|p| p.views().find(|v| v.entity_id() == id).cloned())
+        else {
+            return;
+        };
+        let terminal = view.downgrade();
+        let app = cx.entity().downgrade();
+        let (kind, participant) = (req.kind, req.participant);
+        let yes_label = match kind {
+            RequestKind::Join => t!("share.allow"),
+            RequestKind::Control => t!("share.give"),
+        };
+        window.push_notification(
+            Notification::new()
+                .id1::<ShareRequestToast>(request_key(kind, participant))
+                .icon(ui::icon(match kind {
+                    RequestKind::Join => IconName::DoorOpen,
+                    RequestKind::Control => IconName::Keyboard,
+                }))
+                .title(req.title.clone())
+                .message(req.text())
+                .autohide(false)
+                .content(move |_, _, cx| {
+                    let answer = |yes: bool| {
+                        let terminal = terminal.clone();
+                        cx.listener(move |note: &mut Notification, _: &ClickEvent, window, cx| {
+                            if let Some(t) = terminal.upgrade() {
+                                t.update(cx, |t, cx| t.answer_request(kind, participant, yes, cx));
+                            }
+                            note.dismiss(window, cx);
+                        })
+                    };
+                    let app = app.clone();
+                    h_flex()
+                        .pt_2()
+                        .gap_2()
+                        .child(
+                            Button::new("request-yes")
+                                .small()
+                                .primary()
+                                .label(yes_label.clone())
+                                .on_click(answer(true)),
+                        )
+                        .child(
+                            Button::new("request-no")
+                                .small()
+                                .label(t!("share.deny"))
+                                .on_click(answer(false)),
+                        )
+                        .child(
+                            Button::new("request-show")
+                                .small()
+                                .ghost()
+                                .label(t!("share.show"))
+                                .on_click(cx.listener(
+                                    move |note: &mut Notification, _: &ClickEvent, window, cx| {
+                                        if let Some(a) = app.upgrade() {
+                                            a.update(cx, |a, cx| a.show_terminal(id, window, cx));
+                                        }
+                                        note.dismiss(window, cx);
+                                    },
+                                )),
+                        )
+                        .into_any_element()
+                }),
+            cx,
+        );
+    }
+
+    /// A notice of the events WebSocket about a shared session. Sessions
+    /// open in a tab show it themselves.
+    fn on_session_notice(
+        &mut self,
+        notice: SessionNotice,
+        account: Option<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = notice.session_id();
+        if self.has_session(session_id, cx)
+            || windows::session_open_elsewhere(session_id, cx.entity_id(), cx)
+        {
+            return;
+        }
+        if notice.needs_owner() {
+            self.model
+                .update(cx, |m, cx| m.add_session_alert(session_id, cx));
+        }
+        let title = match &notice {
+            SessionNotice::JoinRequest { title, .. }
+            | SessionNotice::ControlRequest { title, .. }
+            | SessionNotice::SessionShared { title, .. }
+                if !title.is_empty() =>
+            {
+                title.clone()
+            }
+            _ => t!("server_sessions.default_title").to_string(),
+        };
+        let shared = matches!(notice, SessionNotice::SessionShared { .. });
+        let heading = if shared {
+            t!("share.notice.shared_title")
+        } else {
+            t!("share.notice.title")
+        };
+        let (category, key) = notifications::session_notice_key(&notice);
+        self.notify_system(
+            Notice {
+                category,
+                key,
+                title: heading.to_string(),
+                body: notice.text(),
+                target: Target::Session {
+                    session_id,
+                    title: title.clone(),
+                    account,
+                },
+            },
+            window,
+            cx,
+        );
+        let mut note = Notification::info(notice.text())
+            .id1::<SessionNoticeToast>(SharedString::from(session_id.to_string()))
+            .title(heading);
+        if notice.needs_owner() || shared {
+            let app = cx.entity().downgrade();
+            note = note.action(move |_, _, _| {
+                let app = app.clone();
+                let title = title.clone();
+                Button::new("notice-open")
+                    .small()
+                    .primary()
+                    .label(t!("server_sessions.open"))
+                    .on_click(move |_, window, cx| {
+                        if let Some(a) = app.upgrade() {
+                            let req = OpenRequest::Attach {
+                                session_id,
+                                title: title.clone(),
+                                account,
+                            };
+                            a.update(cx, |a, cx| a.open(req, window, cx));
+                        }
+                    })
+            });
+        }
+        window.push_notification(note, cx);
+    }
+
+    /// An event of an AI task: a task on this computer needing approval or
+    /// ending shows a toast (the server's ones are in the AI section); both
+    /// become a notification of the system in the background.
+    fn on_ai_event(&mut self, v: &serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = AiNotice::from_event(v) else {
+            return;
+        };
+        let local = v["local"] == true;
+        if local {
+            let (kind, text) = notice.toast(true);
+            ui::notify(window, cx, kind, text);
+        }
+        self.notify_system(notice.notice(local), window, cx);
+    }
+
+    /// Posts a notice as a notification of the system if the window is in
+    /// the background and its kind is on in Settings (see `notifications`).
+    /// (Any window of the app in front counts: the toast is enough.)
+    fn notify_system(&mut self, notice: Notice, window: &Window, cx: &mut Context<Self>) {
+        let prefs = self.model.read(cx).settings.notifications;
+        let active = window.is_window_active() || windows::any_active(cx);
+        let admitted = cx.try_global::<windows::AppWindows>().is_some().then(|| {
+            cx.global_mut::<windows::AppWindows>().notifier.admit(
+                &prefs,
+                notice,
+                active,
+                Instant::now(),
+            )
+        });
+        if let Some(n) = admitted.flatten() {
+            cx.show_system_notification(n);
+        }
+    }
+
+    /// A notification of the system was clicked (`windows.rs` picks the
+    /// window): it comes to the front and opens what it was about.
+    pub fn open_notification_target(
+        &mut self,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.activate(true);
+        window.activate_window();
+        match target {
+            Target::Terminal(id) => self.show_terminal(id, window, cx),
+            Target::Session {
+                session_id,
+                title,
+                account,
+            } => self.open(
+                OpenRequest::Attach {
+                    session_id,
+                    title,
+                    account,
+                },
+                window,
+                cx,
+            ),
+            Target::AiTask(task_id) => {
+                self.select_section(Section::Ai, window, cx);
+                self.ai.update(cx, |v, cx| v.open_task(task_id, window, cx));
+            }
+        }
+    }
+
+    /// Starts the engine of the AI tasks on this computer and passes its
+    /// events on like the server's (marked `"local"`).
+    fn start_local_engine(local_ai: Arc<LocalAi>, model: Entity<AppModel>, cx: &mut Context<Self>) {
         let started = runtime::spawn(cx, async move { local_ai.start_engine().await });
-        cx.spawn_in(window, async move |_, cx| {
+        // Not tied to a window: it keeps going while any window is open.
+        let model = model.downgrade();
+        cx.spawn(async move |_, cx| {
             let engine = match started.await {
                 Ok(e) => e,
                 Err(e) => {
@@ -537,16 +934,13 @@ impl AppView {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let note = local_task_note(&ev.event);
                 let mut v = serde_json::to_value(&ev).unwrap_or_default();
                 v["type"] = "ai".into();
-                let alive = cx
-                    .update(|window, cx| {
-                        model.update(cx, |_, cx| cx.emit(ModelEvent::Server(v)));
-                        if let Some((kind, text)) = note {
-                            ui::notify(window, cx, kind, text);
-                        }
-                    })
+                // The window shows its notices (`on_ai_event`).
+                v["local"] = true.into();
+                // The model goes away with the last window.
+                let alive = model
+                    .update(cx, |_, cx| cx.emit(ModelEvent::Server(v)))
                     .is_ok();
                 if !alive {
                     break;
@@ -556,8 +950,8 @@ impl AppView {
         .detach();
     }
 
-    /// Every open terminal (all the panes of every tab).
-    fn all_terminals(&self) -> Vec<Entity<TerminalView>> {
+    /// Every open terminal of this window (all the panes of every tab).
+    pub fn terminals(&self) -> Vec<Entity<TerminalView>> {
         self.tabs
             .iter()
             .filter_map(Tab::panes)
@@ -565,58 +959,33 @@ impl AppView {
             .collect()
     }
 
-    /// Answers the local AI about the open terminals.
-    fn answer_terminal(&mut self, req: TermRequest, cx: &mut Context<Self>) {
-        let terms = self.all_terminals();
-        let find = |id: Id, cx: &App| terms.iter().find(|t| t.read(cx).ai_id() == id).cloned();
-        let missing = |id: Id| format!("there is no open terminal {id}; use list_sessions");
-        match req {
-            TermRequest::List(reply) => {
-                let list = terms
-                    .iter()
-                    .map(|t| {
-                        let v = t.read(cx);
-                        let host_id = match v.kind() {
-                            TermKind::Local { host_id } => Some(*host_id),
-                            TermKind::Server { host_id, .. } => *host_id,
-                            _ => None,
-                        };
-                        termoak_ai::SessionSummary {
-                            id: v.ai_id(),
-                            title: v.title(cx).to_string(),
-                            host_id,
-                            status: v.ai_status().into(),
-                            viewers: 1,
-                        }
-                    })
-                    .collect();
-                let _ = reply.send(list);
-            }
-            TermRequest::Read {
-                id,
-                max_chars,
-                reply,
-            } => {
-                let res = find(id, cx)
-                    .map(|t| screen_tail(&t.read(cx).screen_text(), max_chars))
-                    .ok_or_else(|| missing(id));
-                let _ = reply.send(res);
-            }
-            TermRequest::Type { id, input, reply } => {
-                let res = match find(id, cx) {
-                    Some(t) => t.update(cx, |t, cx| t.ai_type(&input, cx)),
-                    None => Err(missing(id)),
-                };
-                let _ = reply.send(res);
-            }
-        }
+    /// The terminal `id` is in a tab of this window.
+    pub fn has_terminal(&self, id: EntityId) -> bool {
+        self.find_pane(id).is_some()
+    }
+
+    /// The server session is open in a terminal of this window.
+    pub fn has_session(&self, session_id: Id, cx: &App) -> bool {
+        self.tabs.iter().any(|t| {
+            matches!(t.content, TabContent::Terminal(_))
+                && t.server_sessions(cx).contains(&session_id)
+        })
     }
 
     /// Fetches the server sessions. With `add_tabs`, own running sessions
     /// that are not open are added as dormant tabs (without changing screen);
     /// without it, only the Home notice is updated.
     fn restore_cloud_tabs(&mut self, add_tabs: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(api) = self.model.read(cx).api.clone() else {
+        // Every signed-in account (not only the one in sight): dormant tabs
+        // of the others stay.
+        let sources: Vec<(Id, termoak_client::ApiClient)> = {
+            let m = self.model.read(cx);
+            m.accounts
+                .iter()
+                .filter_map(|a| m.api_of(Some(a.id())).map(|api| (a.id(), api)))
+                .collect()
+        };
+        if sources.is_empty() {
             // Signed out, dormant tabs can no longer attach.
             self.cloud_sessions = 0;
             let dormant: Vec<usize> = self
@@ -630,27 +999,45 @@ impl AppView {
             }
             cx.notify();
             return;
-        };
+        }
         runtime::run_in(
             cx,
             window,
-            async move { api.get::<serde_json::Value>("/api/v1/sessions").await },
+            async move {
+                let mut out = Vec::new();
+                let mut failed = false;
+                for (account, api) in sources {
+                    match api.get::<serde_json::Value>("/api/v1/sessions").await {
+                        Ok(v) => out.push((account, v)),
+                        Err(_) => failed = true,
+                    }
+                }
+                // Without every answer, nothing is dropped as "ended".
+                if failed {
+                    return Err("incomplete".to_string());
+                }
+                Ok::<_, String>(out)
+            },
             move |this, res, _, cx| {
-                let Ok(v) = res else { return };
-                let running: Vec<(Id, String)> = v["active"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|s| s["kind"] == "server" && s["state"]["state"] != "closed")
-                    .filter(|s| s["access"].as_str().unwrap_or("owner") == "owner")
-                    .filter_map(|s| {
-                        Some((
-                            s["id"].as_str()?.parse().ok()?,
-                            s["title"]
-                                .as_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|| t!("app.session_fallback_title").to_string()),
-                        ))
+                let Ok(all) = res else { return };
+                let running: Vec<(Id, String, Id)> = all
+                    .iter()
+                    .flat_map(|(account, v)| {
+                        v["active"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|s| s["kind"] == "server" && s["state"]["state"] != "closed")
+                            .filter(|s| s["access"].as_str().unwrap_or("owner") == "owner")
+                            .filter_map(move |s| {
+                                Some((
+                                    s["id"].as_str()?.parse().ok()?,
+                                    s["title"].as_str().map(str::to_string).unwrap_or_else(|| {
+                                        t!("app.session_fallback_title").to_string()
+                                    }),
+                                    *account,
+                                ))
+                            })
                     })
                     .collect();
                 this.cloud_sessions = running.len();
@@ -660,7 +1047,7 @@ impl AppView {
                     .iter()
                     .filter(|t| match &t.content {
                         TabContent::Dormant { session_id, .. } => {
-                            !running.iter().any(|(id, _)| id == session_id)
+                            !running.iter().any(|(id, _, _)| id == session_id)
                         }
                         _ => false,
                     })
@@ -670,17 +1057,23 @@ impl AppView {
                     this.drop_dormant(id);
                 }
                 if add_tabs {
-                    for (session_id, title) in running {
+                    let me = cx.entity_id();
+                    for (session_id, title, account) in running {
                         let open = this
                             .tabs
                             .iter()
-                            .any(|t| t.server_sessions(cx).contains(&session_id));
+                            .any(|t| t.server_sessions(cx).contains(&session_id))
+                            || windows::session_open_elsewhere(session_id, me, cx);
                         if !open {
                             let id = this.next_id;
                             this.next_id += 1;
                             this.tabs.push(Tab {
                                 id,
-                                content: TabContent::Dormant { session_id, title },
+                                content: TabContent::Dormant {
+                                    session_id,
+                                    title,
+                                    account,
+                                },
                                 custom_title: None,
                             });
                         }
@@ -708,14 +1101,27 @@ impl AppView {
 
     /// Attaches a dormant tab (when clicked).
     fn wake(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(TabContent::Dormant { session_id, title }) = self.tabs.get(ix).map(|t| &t.content)
+        let Some(TabContent::Dormant {
+            session_id,
+            title,
+            account,
+        }) = self.tabs.get(ix).map(|t| &t.content)
         else {
             return;
         };
-        let (session_id, title) = (*session_id, title.clone());
+        let (session_id, title, account) = (*session_id, title.clone(), *account);
         let model = self.model.clone();
-        let view =
-            cx.new(|cx| TerminalView::server(model, None, Some(session_id), title, window, cx));
+        let view = cx.new(|cx| {
+            TerminalView::server(
+                model,
+                None,
+                Some(session_id),
+                Some(account),
+                title,
+                window,
+                cx,
+            )
+        });
         let pane = self.new_pane(view, window, cx);
         self.tabs[ix].content = TabContent::Terminal(Panes::new(vec![pane]));
     }
@@ -832,11 +1238,27 @@ impl AppView {
             OpenRequest::Server { host_id } => {
                 let host_id = *host_id;
                 let title = self.model.read(cx).host_label(host_id);
-                cx.new(|cx| TerminalView::server(model, Some(host_id), None, title, window, cx))
+                cx.new(|cx| {
+                    TerminalView::server(model, Some(host_id), None, None, title, window, cx)
+                })
             }
-            OpenRequest::Attach { session_id, title } => {
-                let (session_id, title) = (*session_id, title.clone());
-                cx.new(|cx| TerminalView::server(model, None, Some(session_id), title, window, cx))
+            OpenRequest::Attach {
+                session_id,
+                title,
+                account,
+            } => {
+                let (session_id, title, account) = (*session_id, title.clone(), *account);
+                cx.new(|cx| {
+                    TerminalView::server(model, None, Some(session_id), account, title, window, cx)
+                })
+            }
+            OpenRequest::JoinLink {
+                session_id,
+                title,
+                link,
+            } => {
+                let (session_id, title, link) = (*session_id, title.clone(), link.clone());
+                cx.new(|cx| TerminalView::join_link(model, session_id, link, title, window, cx))
             }
             OpenRequest::Shell => cx.new(|cx| TerminalView::shell(model, window, cx)),
             OpenRequest::Serial(params) => {
@@ -847,8 +1269,50 @@ impl AppView {
         })
     }
 
+    /// How a host opens from this device: Use-only hosts of Strict vaults
+    /// open a server session instead, and Use-only hosts need their server
+    /// for just-in-time credentials. `None`: it cannot open (already said).
+    fn route_local(
+        &self,
+        host_id: Id,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<OpenRequest> {
+        let m = self.model.read(cx);
+        let caps = m.host_caps(host_id);
+        let signed_in = m.api_for_host(host_id).is_some();
+        match accounts::connect_route(caps.connect, signed_in) {
+            Ok(false) => Some(OpenRequest::Local { host_id }),
+            Ok(true) => {
+                ui::notify(window, cx, ToastKind::Info, t!("vaults.strict_connect"));
+                Some(OpenRequest::Server { host_id })
+            }
+            Err(code) => {
+                ui::error(
+                    window,
+                    cx,
+                    crate::i18n::api_error_text(code).unwrap_or_else(|| code.to_string()),
+                );
+                None
+            }
+        }
+    }
+
     /// Opens a new tab.
     pub fn open(&mut self, req: OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let req = match req {
+            OpenRequest::Local { host_id } => match self.route_local(host_id, window, cx) {
+                Some(r) => r,
+                None => return,
+            },
+            other => other,
+        };
+        if let OpenRequest::Attach { session_id, .. } = &req {
+            let id = *session_id;
+            self.model.update(cx, |m, cx| m.clear_session_alert(id, cx));
+            window
+                .remove_notification1::<SessionNoticeToast>(SharedString::from(id.to_string()), cx);
+        }
         match req {
             OpenRequest::Attach { session_id, .. }
                 if let Some(ix) = self
@@ -868,7 +1332,7 @@ impl AppView {
             OpenRequest::Split { hosts, current } => {
                 let reqs: Vec<OpenRequest> = hosts
                     .into_iter()
-                    .map(|host_id| OpenRequest::Local { host_id })
+                    .filter_map(|host_id| self.route_local(host_id, window, cx))
                     .collect();
                 self.open_split(reqs, current, window, cx);
             }
@@ -934,6 +1398,14 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let req = match req {
+            // Use-only hosts of Strict vaults open through the server.
+            OpenRequest::Local { host_id } => match self.route_local(host_id, window, cx) {
+                Some(r) => r,
+                None => return,
+            },
+            other => other,
+        };
         match req {
             OpenRequest::Local { .. }
             | OpenRequest::Server { .. }
@@ -1011,6 +1483,40 @@ impl AppView {
     ) {
         match ev {
             TerminalEvent::TitleChanged => cx.notify(),
+            TerminalEvent::ShareRequest(req) => self.on_share_request(id, req, window, cx),
+            TerminalEvent::ShareRequestDone { kind, participant } => {
+                window.remove_notification1::<ShareRequestToast>(
+                    request_key(*kind, *participant),
+                    cx,
+                );
+                let key = notifications::request_key(*kind == RequestKind::Join, *participant);
+                let tag = cx
+                    .try_global::<windows::AppWindows>()
+                    .is_some()
+                    .then(|| cx.global_mut::<windows::AppWindows>().notifier.forget(&key));
+                if let Some(tag) = tag.flatten() {
+                    cx.dismiss_system_notification(&tag);
+                }
+            }
+            TerminalEvent::KeyboardChanged { you_drive, text } => {
+                let title = self
+                    .find_pane(id)
+                    .and_then(|(tab, _)| self.tabs[tab].panes())
+                    .and_then(|p| p.views().find(|v| v.entity_id() == id).cloned())
+                    .map(|v| v.read(cx).title(cx).to_string())
+                    .unwrap_or_else(|| t!("share.notice.title").to_string());
+                self.notify_system(
+                    Notice {
+                        category: Category::SharedWithMe,
+                        key: format!("keyboard:{id}:{you_drive}"),
+                        title,
+                        body: text.to_string(),
+                        target: Target::Terminal(id),
+                    },
+                    window,
+                    cx,
+                );
+            }
             TerminalEvent::OpenSftp { host_id, conn } => {
                 self.open_sftp(*host_id, conn.clone(), window, cx);
             }
@@ -1347,7 +1853,8 @@ impl AppView {
         };
         let req = match &self.tabs[ix].content {
             TabContent::Terminal(p) => duplicate_request(p.focused().read(cx).kind()),
-            TabContent::Dormant { .. } | TabContent::Sftp(_) => None,
+            TabContent::Sftp(s) => Some(s.read(cx).duplicate_request()),
+            TabContent::Dormant { .. } => None,
         };
         match req {
             Some(req) => self.open(req, window, cx),
@@ -1394,7 +1901,11 @@ impl AppView {
             selection: term.is_some_and(|t| t.has_selection()),
             ended: term.is_some_and(|t| t.ended()),
             host: term.is_some_and(|t| t.host().is_some()),
-            duplicable: term.is_some_and(|t| duplicate_request(t.kind()).is_some()),
+            duplicable: term.is_some_and(|t| duplicate_request(t.kind()).is_some())
+                || self
+                    .active
+                    .and_then(|i| self.tabs.get(i))
+                    .is_some_and(|t| matches!(t.content, TabContent::Sftp(_))),
             any_tab: !self.tabs.is_empty(),
             updates: self.updates.read(cx).status != UpdateStatus::Disabled,
         }
@@ -1844,6 +2355,7 @@ impl AppView {
         weak: gpui::WeakEntity<Self>,
         tab_id: usize,
         is_terminal: bool,
+        can_duplicate: bool,
         others: Vec<(usize, SharedString)>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
@@ -1862,7 +2374,7 @@ impl AppView {
             .item(
                 PopupMenuItem::new(t!("app.tab.duplicate"))
                     .icon(ui::icon(IconName::CopyPlus))
-                    .disabled(!is_terminal)
+                    .disabled(!can_duplicate)
                     .on_click(move |_, window, cx| {
                         if let Some(app) = w2.upgrade() {
                             app.update(cx, |this, cx| this.duplicate_tab(tab_id, window, cx));
@@ -1992,6 +2504,7 @@ impl AppView {
             };
             let tab_id = tab.id;
             let is_terminal = matches!(tab.content, TabContent::Terminal(_));
+            let can_duplicate = !matches!(tab.content, TabContent::Dormant { .. });
             let others: Vec<(usize, SharedString)> = terminal_tabs
                 .iter()
                 .filter(|(id, _)| *id != tab_id)
@@ -2084,6 +2597,7 @@ impl AppView {
                             weak.clone(),
                             tab_id,
                             is_terminal,
+                            can_duplicate,
                             others.clone(),
                             window,
                             cx,
@@ -2352,12 +2866,15 @@ impl AppView {
         let user = model.server_user.clone();
         let syncing = model.syncing;
         let events_online = model.events_online;
+        // Requests waiting in sessions you are not watching.
+        let alerts = model.session_alert_count();
         let section = self.section;
         let item = |s: Section, cx: &mut Context<Self>| {
+            let badge = (s == Section::ServerSessions && alerts > 0).then_some(alerts);
             // Taller and with bigger text and icons than the stock ones (28 px):
             // the fixed height of the component is applied later, but the
             // minimum wins.
-            SidebarMenuItem::new(s.label())
+            let item = SidebarMenuItem::new(s.label())
                 .icon(ui::icon(s.icon()).size(px(18.)))
                 .min_h(px(38.))
                 .px_3()
@@ -2366,7 +2883,25 @@ impl AppView {
                 .active(section == s)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.select_section(s, window, cx)
-                }))
+                }));
+            match badge {
+                Some(n) => item.suffix(move |_, cx| {
+                    div()
+                        .min_w(px(18.))
+                        .h(px(18.))
+                        .px_1()
+                        .rounded_full()
+                        .bg(cx.theme().warning)
+                        .text_color(cx.theme().warning_foreground)
+                        .text_xs()
+                        .font_semibold()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(n.to_string())
+                }),
+                None => item,
+            }
         };
         let theme = cx.theme();
         let account = h_flex()
@@ -2414,41 +2949,54 @@ impl AppView {
                         )),
                 )
             });
+        let switcher = self.render_switcher(collapsed, cx);
+        let picker = self.render_vault_picker(collapsed, cx);
+        let theme = cx.theme();
         Sidebar::new("sidebar")
             .w(px(232.))
             .collapsed(collapsed)
             .header(
-                SidebarHeader::new().child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .size(px(28.))
-                                .rounded(px(7.))
-                                .bg(theme.primary)
-                                .flex()
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        SidebarHeader::new().child(
+                            h_flex()
+                                .gap_2()
                                 .items_center()
-                                .justify_center()
                                 .child(
-                                    ui::icon(IconName::Terminal)
-                                        .size(px(16.))
-                                        .text_color(theme.primary_foreground),
-                                ),
-                        )
-                        .when(!collapsed, |this| {
-                            this.child(
-                                v_flex()
-                                    .child(div().text_sm().font_semibold().child("Termoak"))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("v{}", update::current_version())),
-                                    ),
-                            )
-                        }),
-                ),
+                                    div()
+                                        .size(px(28.))
+                                        .rounded(px(7.))
+                                        .bg(theme.primary)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            ui::icon(IconName::Terminal)
+                                                .size(px(16.))
+                                                .text_color(theme.primary_foreground),
+                                        ),
+                                )
+                                .when(!collapsed, |this| {
+                                    this.child(
+                                        v_flex()
+                                            .child(div().text_sm().font_semibold().child("Termoak"))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!(
+                                                        "v{}",
+                                                        update::current_version()
+                                                    )),
+                                            ),
+                                    )
+                                }),
+                        ),
+                    )
+                    .child(switcher)
+                    .children(picker),
             )
             .child(
                 SidebarGroup::new(t!("app.group.vault")).child(
@@ -2482,6 +3030,348 @@ impl AppView {
                     }),
                 )),
             )
+    }
+
+    /// Settings → Accounts.
+    fn open_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_section(Section::Settings, window, cx);
+        self.settings
+            .update(cx, |s, cx| s.show_page(SettingsPage::Accounts, window, cx));
+    }
+
+    /// First start after the data moved to one store per account.
+    fn layout_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.update(cx, |m, _| m.take_layout_notice()) {
+            return;
+        }
+        let accounts = self.model.read(cx).accounts.len();
+        window.open_dialog(cx, move |d, _, _| {
+            d.title(t!("accounts.layout_notice.title"))
+                .w(px(480.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().child(if accounts > 0 {
+                            t!("accounts.layout_notice.with_account")
+                        } else {
+                            t!("accounts.layout_notice.device_only")
+                        }))
+                        .child(div().text_sm().child(t!("accounts.layout_notice.backup"))),
+                )
+                .footer(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("layout-notice-ok")
+                            .primary()
+                            .label(t!("common.ok"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    ),
+                )
+        });
+    }
+
+    /// The account switcher at the top of the sidebar: each account, all of
+    /// them, This device only, Add account and Manage accounts.
+    fn render_switcher(&mut self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
+        let m = self.model.read(cx);
+        let infos = m.account_infos();
+        let view = accounts::normalize_view(&infos, m.view);
+        let (title, subtitle) = accounts::switcher_title(&infos, view);
+        let theme = cx.theme();
+        let badge: AnyElement = match view {
+            ViewMode::Account(id) => infos
+                .iter()
+                .find(|a| a.id == id)
+                .map(|a| avatar(&accounts::AccountRow::new(a), 26.).into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
+            ViewMode::All => ui::icon(IconName::Users)
+                .size(px(18.))
+                .text_color(theme.primary)
+                .into_any_element(),
+            ViewMode::Device => ui::icon(IconName::Laptop)
+                .size(px(18.))
+                .text_color(theme.muted_foreground)
+                .into_any_element(),
+        };
+        let model = self.model.clone();
+        let app = cx.entity().downgrade();
+        let muted = theme.muted_foreground;
+        Button::new("account-switcher")
+            .ghost()
+            .w_full()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .size(px(26.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(badge),
+                    )
+                    .when(!collapsed, |this| {
+                        this.child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_start()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_sm()
+                                        .font_medium()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(subtitle),
+                                ),
+                        )
+                        .child(
+                            ui::icon(IconName::ChevronsUpDown)
+                                .size(px(14.))
+                                .text_color(muted),
+                        )
+                    }),
+            )
+            .dropdown_menu(move |mut menu, _, cx| {
+                let (infos, view) = {
+                    let m = model.read(cx);
+                    (m.account_infos(), m.view)
+                };
+                let set = |view: ViewMode, model: Entity<AppModel>| {
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        model.update(cx, |m, cx| m.set_view(view, cx))
+                    }
+                };
+                for entry in accounts::switcher_entries(&infos, view) {
+                    menu = match entry {
+                        SwitcherEntry::Account { row, selected } => {
+                            let id = row.id;
+                            let status = row.status;
+                            menu.item(
+                                PopupMenuItem::element(move |_, cx| {
+                                    let theme = cx.theme();
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(avatar(&row, 22.))
+                                        .child(
+                                            v_flex()
+                                                .child(div().text_sm().child(row.email.clone()))
+                                                .when_some(row.server.clone(), |this, s| {
+                                                    this.child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(theme.muted_foreground)
+                                                            .child(s),
+                                                    )
+                                                })
+                                                .when(
+                                                    status != termoak_client::AccountStatus::Active,
+                                                    |this| {
+                                                        this.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(theme.warning)
+                                                                .child(accounts::status_text(
+                                                                    status, false,
+                                                                )),
+                                                        )
+                                                    },
+                                                ),
+                                        )
+                                })
+                                .checked(selected)
+                                .on_click(set(ViewMode::Account(id), model.clone())),
+                            )
+                        }
+                        SwitcherEntry::All { selected } => menu.item(
+                            PopupMenuItem::new(t!("accounts.switcher.all"))
+                                .icon(ui::icon(IconName::Users))
+                                .checked(selected)
+                                .on_click(set(ViewMode::All, model.clone())),
+                        ),
+                        SwitcherEntry::Device { selected } => menu.item(
+                            PopupMenuItem::new(t!("accounts.switcher.device"))
+                                .icon(ui::icon(IconName::Laptop))
+                                .checked(selected)
+                                .on_click(set(ViewMode::Device, model.clone())),
+                        ),
+                        SwitcherEntry::Add => {
+                            let model = model.clone();
+                            menu.separator().item(
+                                PopupMenuItem::new(t!("accounts.add_menu"))
+                                    .icon(ui::icon(IconName::UserPlus))
+                                    .on_click(move |_, window, cx| {
+                                        add_account::open(
+                                            model.clone(),
+                                            add_account::Start::Choose,
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                            )
+                        }
+                        SwitcherEntry::Manage => {
+                            let app = app.clone();
+                            menu.item(
+                                PopupMenuItem::new(t!("accounts.manage_menu"))
+                                    .icon(ui::icon(IconName::Settings))
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(app) = app.upgrade() {
+                                            app.update(cx, |app, cx| app.open_accounts(window, cx));
+                                        }
+                                    }),
+                            )
+                        }
+                    };
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// The vault picker under the switcher (only with more than one place
+    /// to choose from): all vaults, each vault, This device.
+    fn render_vault_picker(
+        &mut self,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if collapsed {
+            return None;
+        }
+        let m = self.model.read(cx);
+        let vaults = m.vaults_in_view();
+        let device_items = m.has_device_items();
+        if !accounts::show_vault_picker(vaults.len(), device_items) {
+            return None;
+        }
+        let filter = m.vault_filter;
+        let (icon, label) = match filter {
+            VaultFilter::All => (IconName::Layers, t!("vaults.picker.all").to_string()),
+            VaultFilter::Device => (IconName::Laptop, t!("accounts.switcher.device").to_string()),
+            VaultFilter::Vault { account, vault } => match m.vault_entry(account, vault) {
+                Some(v) => (vaults::vault_icon(&v.vault), v.label()),
+                None => (IconName::Vault, String::new()),
+            },
+        };
+        let current = m.current_account.filter(|a| {
+            m.account(*a)
+                .is_some_and(|a| a.active() && a.vaults_supported())
+        });
+        let model = self.model.clone();
+        let muted = cx.theme().muted_foreground;
+        Some(
+            Button::new("vault-picker")
+                .small()
+                .ghost()
+                .w_full()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(ui::icon(icon).size(px(14.)).text_color(muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                        .child(
+                            ui::icon(IconName::ChevronDown)
+                                .size(px(12.))
+                                .text_color(muted),
+                        ),
+                )
+                .dropdown_menu(move |mut menu, _, cx| {
+                    let (vaults, filter, device_items, labels) = {
+                        let m = model.read(cx);
+                        let vaults = m.vaults_in_view();
+                        let labels: Vec<String> = vaults
+                            .iter()
+                            .map(|v| {
+                                m.place_label(
+                                    termoak_client::Scope::Account(v.account),
+                                    Some(v.id()),
+                                )
+                            })
+                            .collect();
+                        (vaults, m.vault_filter, m.has_device_items(), labels)
+                    };
+                    let set = |f: VaultFilter, model: Entity<AppModel>| {
+                        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                            model.update(cx, |m, cx| m.set_vault_filter(f, cx))
+                        }
+                    };
+                    menu = menu.item(
+                        PopupMenuItem::new(t!("vaults.picker.all"))
+                            .icon(ui::icon(IconName::Layers))
+                            .checked(filter == VaultFilter::All)
+                            .on_click(set(VaultFilter::All, model.clone())),
+                    );
+                    for (v, label) in vaults.iter().zip(labels) {
+                        let f = VaultFilter::Vault {
+                            account: v.account,
+                            vault: v.id(),
+                        };
+                        menu = menu.item(
+                            PopupMenuItem::new(label)
+                                .icon(ui::icon(vaults::vault_icon(&v.vault)))
+                                .checked(filter == f)
+                                .on_click(set(f, model.clone())),
+                        );
+                    }
+                    if device_items {
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("accounts.switcher.device"))
+                                .icon(ui::icon(IconName::Laptop))
+                                .checked(filter == VaultFilter::Device)
+                                .on_click(set(VaultFilter::Device, model.clone())),
+                        );
+                    }
+                    if let Some(account) = current {
+                        let model = model.clone();
+                        menu = menu.separator().item(
+                            PopupMenuItem::new(t!("vaults.new_menu"))
+                                .icon(ui::icon(IconName::Plus))
+                                .on_click(move |_, window, cx| {
+                                    vaults::open_create(model.clone(), account, None, window, cx)
+                                }),
+                        );
+                    }
+                    if let VaultFilter::Vault { account, vault } = filter {
+                        let model = model.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(t!("vaults.manage_menu"))
+                                .icon(ui::icon(IconName::Settings))
+                                .on_click(move |_, window, cx| {
+                                    vaults::open_manage(model.clone(), account, vault, window, cx)
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
     }
 
     /// Home notice: sessions running on the server (they are already at the
@@ -2713,31 +3603,5 @@ impl Render for AppView {
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
-    }
-}
-
-/// Notification for an event of a task on this computer: it needs approval
-/// or it ended.
-fn local_task_note(ev: &termoak_ai::TaskEvent) -> Option<(crate::state::ToastKind, SharedString)> {
-    use crate::state::ToastKind;
-    use termoak_ai::{TaskEvent, TaskStatus};
-    match ev {
-        TaskEvent::ApprovalRequested { summary, .. } => Some((
-            ToastKind::Warning,
-            t!("ai.local.approval_needed", action = summary.clone()),
-        )),
-        TaskEvent::Finished {
-            status: TaskStatus::Completed,
-            ..
-        } => Some((ToastKind::Success, t!("ai.local.finished"))),
-        TaskEvent::Finished {
-            status: TaskStatus::Failed,
-            error,
-            ..
-        } => Some((
-            ToastKind::Error,
-            t!("ai.local.failed", error = error.clone().unwrap_or_default()),
-        )),
-        _ => None,
     }
 }

@@ -356,6 +356,8 @@ fn pump(
                     }
                 }
                 Ok(Cmd::Resize(cols, rows)) => pty.on_resize(window_size(cols, rows)),
+                // Sharing goes through the relay.
+                Ok(Cmd::Share(_)) => {}
                 Ok(Cmd::Close | Cmd::CloseSession) | Err(TryRecvError::Disconnected) => {
                     return End::Closed;
                 }

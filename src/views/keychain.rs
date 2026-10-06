@@ -13,14 +13,12 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 use termoak_core::Id;
-use termoak_core::model::{
-    Identity, IdentitySecret, Record, SecretUpdate, SshKey, SshKeySecret, SyncMode,
-};
+use termoak_core::model::{Identity, IdentitySecret, SecretUpdate, SshKey, SshKeySecret, SyncMode};
 use termoak_ssh::keys::{self, KeyType};
 
 use super::OpenRequest;
 use crate::runtime;
-use crate::state::{AppModel, ToastKind};
+use crate::state::{AppModel, Item, ToastKind};
 use crate::ui::{self, Choice, IconName};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,7 +317,7 @@ impl KeychainView {
         );
     }
 
-    fn rename_key(&mut self, rec: Record<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
+    fn rename_key(&mut self, rec: Item<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(rec.data.label.clone()));
         ui::focus_later(&input, window, cx);
         let model = self.model.clone();
@@ -336,9 +334,10 @@ impl KeychainView {
                 if label.is_empty() {
                     return false;
                 }
-                let mut key = rec.data.clone();
-                key.label = label;
-                let task = model.update(cx, |m, cx| m.save(key, SecretUpdate::Keep, None, cx));
+                let id = rec.data.id;
+                let task = model.update(cx, |m, cx| {
+                    m.update_item::<SshKey>(id, move |k| k.label = label, cx)
+                });
                 window
                     .spawn(cx, async move |cx| {
                         if let Err(e) = task.await {
@@ -351,7 +350,7 @@ impl KeychainView {
         );
     }
 
-    fn delete_key(&mut self, rec: Record<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_key(&mut self, rec: Item<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
             window,
@@ -377,7 +376,7 @@ impl KeychainView {
 
     fn edit_identity(
         &mut self,
-        rec: Option<Record<Identity>>,
+        rec: Option<Item<Identity>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -406,14 +405,26 @@ impl KeychainView {
                     t!("keychain.optional")
                 })
         });
+        // Where the identity is (or goes): its key must be of the same vault
+        // or of This device; "this device only" is for This device items.
+        let place = {
+            let m = self.model.read(cx);
+            match &rec {
+                Some(r) => (r.scope, m.vault_of(r)),
+                None => m.place_of_target(m.new_item_target()),
+            }
+        };
+        let on_device = place.0 == termoak_client::Scope::Device;
         let mut key_items = vec![Choice::new(t!("keychain.no_key"), None)];
-        key_items.extend(
-            self.model
-                .read(cx)
-                .keys
-                .iter()
-                .map(|k| Choice::new(k.data.label.clone(), Some(k.data.id))),
-        );
+        {
+            let m = self.model.read(cx);
+            key_items.extend(
+                m.keys
+                    .iter()
+                    .filter(|k| m.fits_place(k, place))
+                    .map(|k| Choice::new(k.data.label.clone(), Some(k.data.id))),
+            );
+        }
         let key = ui::choice_state(
             key_items,
             Some(&data.as_ref().and_then(|d| d.key_id)),
@@ -462,17 +473,19 @@ impl KeychainView {
                         cx,
                     ))
                     .child(ui::field(t!("keychain.ssh_key"), Select::new(&key), cx))
-                    .child(
-                        Checkbox::new("device-only")
-                            .label(t!("keychain.device_only"))
-                            .checked(f.device_only)
-                            .on_click(move |v, _, cx| {
-                                fa.update(cx, |f, cx| {
-                                    f.device_only = *v;
-                                    cx.notify();
-                                })
-                            }),
-                    )
+                    .when(on_device, |this| {
+                        this.child(
+                            Checkbox::new("device-only")
+                                .label(t!("keychain.device_only"))
+                                .checked(f.device_only)
+                                .on_click(move |v, _, cx| {
+                                    fa.update(cx, |f, cx| {
+                                        f.device_only = *v;
+                                        cx.notify();
+                                    })
+                                }),
+                        )
+                    })
                     .into_any_element()
             },
             move |window, cx| {
@@ -496,7 +509,7 @@ impl KeychainView {
                         password: Some(password),
                     })
                 };
-                let mode = if f2.read(cx).device_only {
+                let mode = if on_device && f2.read(cx).device_only {
                     SyncMode::DeviceOnly
                 } else {
                     SyncMode::Synced
@@ -522,7 +535,7 @@ impl KeychainView {
 
     fn delete_identity(
         &mut self,
-        rec: Record<Identity>,
+        rec: Item<Identity>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -549,8 +562,46 @@ impl KeychainView {
 
     // ----- Rendering -----
 
+    /// Vault chip, "Use only" and what can be done with an item.
+    fn place<T: termoak_core::model::Entity>(
+        &self,
+        rec: &Item<T>,
+        cx: &mut Context<Self>,
+    ) -> (Option<gpui::AnyElement>, crate::accounts::Caps) {
+        let m = self.model.read(cx);
+        let chips =
+            crate::accounts::show_vault_picker(m.vaults_in_view().len(), m.has_device_items());
+        let chip = chips
+            .then(|| m.vault_entry_of(rec).cloned())
+            .flatten()
+            .map(|v| super::vaults::chip(&v, cx).into_any_element());
+        (chip, m.caps_of(rec))
+    }
+
+    fn move_button(&self, id: impl Into<gpui::ElementId>, item: termoak_client::ItemRef) -> Button {
+        let model = self.model.clone();
+        Button::new(id)
+            .small()
+            .ghost()
+            .icon(ui::icon(IconName::ArrowRightLeft))
+            .tooltip(t!("hosts.menu.move_to"))
+            .on_click(move |_: &ClickEvent, window, cx| {
+                super::transfer::open(
+                    model.clone(),
+                    vec![item],
+                    termoak_core::transfer::TransferMode::Move,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+    }
+
     fn render_keys(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let keys = self.model.read(cx).keys.clone();
+        let keys: Vec<Item<SshKey>> = {
+            let m = self.model.read(cx);
+            m.keys.iter().filter(|k| m.in_filter(k)).cloned().collect()
+        };
         if keys.is_empty() {
             return ui::empty_state(
                 IconName::KeyRound,
@@ -560,10 +611,11 @@ impl KeychainView {
             )
             .into_any_element();
         }
-        let theme = cx.theme();
         v_flex()
             .gap_2()
             .children(keys.into_iter().enumerate().map(|(i, rec)| {
+                let (chip, caps) = self.place(&rec, cx);
+                let theme = cx.theme();
                 let k = rec.data.clone();
                 let public = k.public_key.clone();
                 let (r1, r2) = (rec.clone(), rec.clone());
@@ -612,6 +664,13 @@ impl KeychainView {
                                             t!("keychain.device_only_pill"),
                                             theme.muted_foreground,
                                         ))
+                                    })
+                                    .children(chip)
+                                    .when(caps.use_only_badge, |this| {
+                                        this.child(ui::pill(
+                                            t!("vaults.use_only_badge"),
+                                            theme.warning,
+                                        ))
                                     }),
                             )
                             .child(
@@ -640,36 +699,46 @@ impl KeychainView {
                                 );
                             }),
                     )
-                    .child(
-                        Button::new(("rename-key", i))
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::Pencil))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.rename_key(r1.clone(), window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("delete-key", i))
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::Trash))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.delete_key(r2.clone(), window, cx)
-                            })),
-                    )
+                    .when(caps.move_out, |this| {
+                        this.child(self.move_button(("move-key", i), rec.item_ref()))
+                    })
+                    .when(caps.edit, |this| {
+                        this.child(
+                            Button::new(("rename-key", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Pencil))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.rename_key(r1.clone(), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("delete-key", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Trash))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.delete_key(r2.clone(), window, cx)
+                                })),
+                        )
+                    })
             }))
             .into_any_element()
     }
 
     fn render_identities(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let model = self.model.read(cx);
-        let identities = model.identities.clone();
+        let identities: Vec<Item<Identity>> = model
+            .identities
+            .iter()
+            .filter(|i| model.in_filter(i))
+            .cloned()
+            .collect();
         let key_label = |id: Option<Id>| -> Option<String> {
             id.and_then(|id| model.keys.iter().find(|k| k.data.id == id))
                 .map(|k| k.data.label.clone())
         };
-        let rows: Vec<(Record<Identity>, Option<String>)> = identities
+        let rows: Vec<(Item<Identity>, Option<String>)> = identities
             .into_iter()
             .map(|r| {
                 let kl = key_label(r.data.key_id);
@@ -685,10 +754,11 @@ impl KeychainView {
             )
             .into_any_element();
         }
-        let theme = cx.theme();
         v_flex()
             .gap_2()
             .children(rows.into_iter().enumerate().map(|(i, (rec, key))| {
+                let (chip, caps) = self.place(&rec, cx);
+                let theme = cx.theme();
                 let (r1, r2) = (rec.clone(), rec.clone());
                 h_flex()
                     .id(("identity", i))
@@ -709,10 +779,22 @@ impl KeychainView {
                             .flex_1()
                             .min_w_0()
                             .child(
-                                div()
-                                    .font_semibold()
-                                    .text_sm()
-                                    .child(rec.data.label.clone()),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .font_semibold()
+                                            .text_sm()
+                                            .child(rec.data.label.clone()),
+                                    )
+                                    .children(chip)
+                                    .when(caps.use_only_badge, |this| {
+                                        this.child(ui::pill(
+                                            t!("vaults.use_only_badge"),
+                                            theme.warning,
+                                        ))
+                                    }),
                             )
                             .child(div().text_xs().text_color(theme.muted_foreground).child({
                                 let mut parts = vec![rec.data.username.clone()];
@@ -725,24 +807,29 @@ impl KeychainView {
                                 parts.join(" · ")
                             })),
                     )
-                    .child(
-                        Button::new(("edit-identity", i))
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::Pencil))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.edit_identity(Some(r1.clone()), window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("delete-identity", i))
-                            .small()
-                            .ghost()
-                            .icon(ui::icon(IconName::Trash))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.delete_identity(r2.clone(), window, cx)
-                            })),
-                    )
+                    .when(caps.move_out, |this| {
+                        this.child(self.move_button(("move-identity", i), rec.item_ref()))
+                    })
+                    .when(caps.edit, |this| {
+                        this.child(
+                            Button::new(("edit-identity", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Pencil))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.edit_identity(Some(r1.clone()), window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("delete-identity", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Trash))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.delete_identity(r2.clone(), window, cx)
+                                })),
+                        )
+                    })
             }))
             .into_any_element()
     }

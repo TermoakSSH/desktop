@@ -6,9 +6,11 @@
 //!    the app relaunches already updated, before opening any window.
 //! 2. The tokio runtime used by the SSH engine and the API is created.
 //! 3. The local vault is opened. Its key is in the system keychain, read
-//!    once (see `vault_key`); if the keychain refuses and there is already
-//!    data, an error screen offers to try again instead of inventing a key.
-//! 4. The interface language is chosen and the window is opened.
+//!    once (`termoak_client::vault::load_or_create_key`); if the keychain
+//!    refuses and there is already data, an error screen offers to try
+//!    again instead of inventing a key.
+//! 4. The interface language is chosen and the window is opened (File →
+//!    New window opens more on the same data, see `windows.rs`).
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -22,20 +24,24 @@ rust_i18n::i18n!("locales", fallback = "en");
 #[macro_use]
 mod i18n;
 
+mod accounts;
 mod app;
+mod links;
 mod local_ai;
 mod menus;
+mod notifications;
 mod panes;
 mod prompts;
 mod qr;
 mod runtime;
+mod sharing;
 mod state;
 mod terminal;
 mod theme;
 mod ui;
 mod update;
-mod vault_key;
 mod views;
+mod windows;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +63,15 @@ use crate::update::UpdateModel;
 fn main() {
     init_tracing();
     let data_dir = termoak_client::vault::data_dir();
+
+    // A `termoak://` link opened from outside: to the running instance if
+    // there is one, otherwise to the window of this one.
+    if let Some(link) = links::from_args(std::env::args()) {
+        if links::forward_to_running(&data_dir, &link) {
+            return;
+        }
+        links::deliver(link);
+    }
 
     // System language until the saved choice is read (startup errors).
     i18n::apply(None);
@@ -89,43 +104,48 @@ fn main() {
 
     // 4. Interface, in the saved language.
     i18n::apply(settings.language.as_deref());
-    gpui_platform::application()
-        .with_assets(gpui_kit_assets::AllAssets)
-        .run(move |cx: &mut App| {
-            gpui_component::init(cx);
-            runtime::init(cx, rt);
-            theme::init(cx, settings.dark);
-            // The terminal keys first: the menu bar shows the shortcuts
-            // bound when it is built (in `app::init`).
-            terminal::init(cx);
-            app::init(cx);
+    links::listen(&data_dir);
+    links::register_scheme(&data_dir);
+    let application = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
+    application.on_open_urls(|urls| urls.into_iter().for_each(links::deliver));
+    application.run(move |cx: &mut App| {
+        // Before any window: Windows toasts need the AppUserModelID and
+        // Linux shows the name in the notifications.
+        cx.set_app_identity(notifications::APP_ID, notifications::APP_NAME);
+        gpui_component::init(cx);
+        runtime::init(cx, rt);
+        theme::init(cx, settings.dark);
+        // The terminal keys first: the menu bar shows the shortcuts
+        // bound when it is built (in `app::init`).
+        terminal::init(cx);
+        app::init(cx);
 
-            let options = window_options(cx);
-            let opened = match workspace {
-                Ok(ws) => cx.open_window(options, move |window, cx| {
-                    let (prompter, prompts_rx) = DesktopPrompter::new();
-                    let prompter = Arc::new(prompter);
-                    let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
-                    let updates = cx.new(|cx| UpdateModel::new(updater, cx));
-                    let view = cx.new(|cx| AppView::new(model, updates, prompts_rx, window, cx));
-                    window.focus(&view.focus_handle(cx), cx);
-                    cx.new(|cx| Root::new(view, window, cx))
-                }),
-                Err(error) => cx.open_window(options, move |window, cx| {
-                    let view = cx.new(|_| StartupError {
-                        message: error.message.into(),
-                        keychain: error.keychain,
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                }),
-            };
-            if let Err(e) = opened {
-                eprintln!("could not open the window: {e}");
-                cx.quit();
-                return;
-            }
-            cx.activate(true);
-        });
+        let options = window_options(cx);
+        let opened = match workspace {
+            Ok(ws) => cx.open_window(options, move |window, cx| {
+                let (prompter, prompts_rx) = DesktopPrompter::new();
+                let prompter = Arc::new(prompter);
+                let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
+                let updates = cx.new(|cx| UpdateModel::new(updater, cx));
+                let view = cx.new(|cx| AppView::new(model, updates, Some(prompts_rx), window, cx));
+                window.focus(&view.focus_handle(cx), cx);
+                cx.new(|cx| Root::new(view, window, cx))
+            }),
+            Err(error) => cx.open_window(options, move |window, cx| {
+                let view = cx.new(|_| StartupError {
+                    message: error.message.into(),
+                    keychain: error.keychain,
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            }),
+        };
+        if let Err(e) = opened {
+            eprintln!("could not open the window: {e}");
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+    });
 }
 
 fn init_tracing() {
@@ -140,24 +160,64 @@ fn init_tracing() {
 /// Opens the local vault. Its key is in the system keychain and `keyring`
 /// must not be used from the main thread nor inside tokio: it runs in its
 /// own thread, with a time limit in case the keychain does not respond.
-fn open_workspace() -> Result<Workspace, vault_key::OpenError> {
+fn open_workspace() -> Result<Workspace, OpenError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("termoak-vault".into())
         .spawn(move || {
-            let _ = tx.send(vault_key::open_workspace());
+            let _ = tx.send(open_vault());
         })
-        .map_err(|e| vault_key::OpenError {
-            message: e.to_string(),
-            keychain: false,
-        })?;
+        .map_err(|e| OpenError::other(e.to_string()))?;
     rx.recv_timeout(Duration::from_secs(60))
         .unwrap_or_else(|_| {
-            Err(vault_key::OpenError {
+            Err(OpenError {
                 message: t!("startup.keychain_timeout").to_string(),
                 keychain: true,
             })
         })
+}
+
+/// Why the local vault could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenError {
+    message: String,
+    /// The system keychain refused or failed: allowing access and trying
+    /// again may fix it.
+    keychain: bool,
+}
+
+impl OpenError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            keychain: false,
+        }
+    }
+}
+
+impl From<termoak_client::ClientError> for OpenError {
+    fn from(e: termoak_client::ClientError) -> Self {
+        match e {
+            termoak_client::ClientError::KeychainUnavailable(error) => Self {
+                message: t!("startup.keychain_denied", error = error).to_string(),
+                keychain: true,
+            },
+            e => Self::other(e.to_string()),
+        }
+    }
+}
+
+/// Opens the user's workspace (data directory and database) with the vault
+/// key from `TERMOAK_VAULT_KEY` or the system keychain. The rules about the
+/// keychain (read once, never a new key when it refuses and there is data,
+/// the AceitunoakSSH item, `vault.key`) are the core's
+/// (`termoak_client::vault::load_key` with the system keychain).
+fn open_vault() -> Result<Workspace, OpenError> {
+    use termoak_client::vault;
+    let dir = vault::data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| OpenError::other(e.to_string()))?;
+    let key = vault::load_or_create_key(&dir)?;
+    Ok(Workspace::open(&dir, key)?)
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {
@@ -165,7 +225,7 @@ fn window_options(cx: &mut App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(860.), px(540.))),
-        app_id: Some("com.termoak.Termoak".into()),
+        app_id: Some(notifications::APP_ID.into()),
         ..TitleBar::window_options()
     }
 }

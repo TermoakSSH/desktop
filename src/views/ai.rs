@@ -12,6 +12,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
@@ -199,6 +200,11 @@ impl AiView {
                 cx.notify();
             },
         );
+    }
+
+    /// Shows a task (from a notification).
+    pub fn open_task(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Some(id), window, cx);
     }
 
     fn select(&mut self, id: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
@@ -411,19 +417,26 @@ impl AiView {
 
     fn render_new_task(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
-        let hosts: Vec<(Id, String, bool)> = self
-            .model
-            .read(cx)
-            .hosts
-            .iter()
-            .map(|h| {
-                (
-                    h.data.id,
-                    h.data.label.clone(),
-                    h.meta.sync_mode == SyncMode::DeviceOnly,
-                )
-            })
-            .collect();
+        // The server AI reaches the hosts of its account (This device ones
+        // and other accounts' cannot be used there).
+        let hosts: Vec<(Id, String, bool)> = {
+            let m = self.model.read(cx);
+            let account = m.ai_account.or(m.current_account);
+            m.hosts
+                .iter()
+                .filter(|h| {
+                    self.local || h.scope == termoak_client::Scope::Device || h.account() == account
+                })
+                .map(|h| {
+                    (
+                        h.data.id,
+                        h.data.label.clone(),
+                        h.meta.sync_mode == SyncMode::DeviceOnly
+                            || (!self.local && h.account().is_none()),
+                    )
+                })
+                .collect()
+        };
         let mode = self.mode;
         let mode_button =
             |id: &'static str, value: &'static str, hint: SharedString, cx: &mut Context<Self>| {
@@ -643,6 +656,51 @@ impl AiView {
     }
 }
 
+impl AiView {
+    /// With several signed-in accounts: whose server AI the panel uses.
+    fn render_account_picker(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let m = self.model.read(cx);
+        let active: Vec<(Id, crate::accounts::AccountRow)> = m
+            .accounts
+            .iter()
+            .filter(|a| a.active())
+            .map(|a| (a.id(), crate::accounts::AccountRow::new(&a.info)))
+            .collect();
+        if active.len() < 2 {
+            return None;
+        }
+        let chosen = m.ai_account.or(m.current_account);
+        let label = active
+            .iter()
+            .find(|(id, _)| Some(*id) == chosen)
+            .map(|(_, r)| r.label())
+            .unwrap_or_default();
+        let model = self.model.clone();
+        Some(
+            Button::new("ai-account")
+                .small()
+                .icon(ui::icon(IconName::CircleUser))
+                .label(t!("ai.account", account = label))
+                .tooltip(t!("ai.account_tooltip"))
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (id, row) in &active {
+                        let model = model.clone();
+                        let id = *id;
+                        menu = menu.item(
+                            PopupMenuItem::new(row.label())
+                                .checked(Some(id) == chosen)
+                                .on_click(move |_, _, cx| {
+                                    model.update(cx, |m, cx| m.set_ai_account(Some(id), cx))
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for AiView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let local = self.model.read(cx).ai_run_on() == RunOn::Local;
@@ -671,11 +729,15 @@ impl Render for AiView {
                 } else {
                     t!("ai.subtitle")
                 },
-                div().when_some(self.error.clone(), |this, e| {
-                    this.text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(truncate(&e, 80))
-                }),
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .children((!local).then(|| self.render_account_picker(cx)).flatten())
+                    .child(div().when_some(self.error.clone(), |this, e| {
+                        this.text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(truncate(&e, 80))
+                    })),
                 cx,
             ))
             .child(

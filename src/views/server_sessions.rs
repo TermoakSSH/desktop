@@ -1,12 +1,16 @@
 //! Server sessions: terminals that live on the Termoak server (they stay
 //! open even if you close the app) and sessions others have shared with
-//! you. From here you get back into them.
+//! you. From here you get back into them, share yours and see who typed in
+//! them (Activity). With several accounts in sight, the sessions of every
+//! account are listed together with the account's badge.
 
 use gpui::{
-    ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
+    div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 use serde_json::Value;
@@ -20,19 +24,34 @@ use crate::ui::{self, IconName};
 /// A session as described by the API.
 #[derive(Clone)]
 struct SessionRow {
+    /// Account whose server has it.
+    account: Id,
     id: Id,
     title: String,
     kind: String,
     state: String,
     detail: String,
+    /// People inside (or sockets, for servers before live sharing).
     viewers: usize,
     created_at: i64,
     access: String,
+    /// Who shared it with you.
+    owner_name: Option<String>,
+}
+
+/// People inside a session as listed (`participants`, without those in the
+/// waiting room; servers before live sharing only have `viewers`).
+fn people_inside(v: &Value) -> usize {
+    match v["participants"].as_array() {
+        Some(list) if !list.is_empty() => list.iter().filter(|p| p["waiting"] != true).count(),
+        _ => v["viewers"].as_array().map(|a| a.len()).unwrap_or(0),
+    }
 }
 
 impl SessionRow {
-    fn from_view(v: &Value) -> Option<Self> {
+    fn from_view(account: Id, v: &Value) -> Option<Self> {
         Some(Self {
+            account,
             id: v["id"].as_str()?.parse().ok()?,
             title: v["title"]
                 .as_str()
@@ -45,14 +64,19 @@ impl SessionRow {
                 .or_else(|| v["state"]["reason"].as_str())
                 .unwrap_or("")
                 .to_string(),
-            viewers: v["viewers"].as_array().map(|a| a.len()).unwrap_or(0),
+            viewers: people_inside(v),
             created_at: v["created_at"].as_i64().unwrap_or(0),
             access: v["access"].as_str().unwrap_or("owner").to_string(),
+            owner_name: v["owner_name"]
+                .as_str()
+                .filter(|n| !n.trim().is_empty())
+                .map(str::to_string),
         })
     }
 
-    fn from_info(v: &Value) -> Option<Self> {
+    fn from_info(account: Id, v: &Value) -> Option<Self> {
         Some(Self {
+            account,
             id: v["id"].as_str()?.parse().ok()?,
             title: v["title"]
                 .as_str()
@@ -67,6 +91,7 @@ impl SessionRow {
                 .or(v["created_at"].as_i64())
                 .unwrap_or(0),
             access: "owner".into(),
+            owner_name: None,
         })
     }
 }
@@ -78,6 +103,8 @@ pub struct ServerSessionsView {
     recent: Vec<SessionRow>,
     loading: bool,
     error: Option<String>,
+    /// "Join with link" field.
+    join_link: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -85,8 +112,10 @@ impl EventEmitter<OpenRequest> for ServerSessionsView {}
 
 impl ServerSessionsView {
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let subs =
-            vec![cx.subscribe_in(
+        let join_link =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("join.link_placeholder")));
+        let subs = vec![
+            cx.subscribe_in(
                 &model,
                 window,
                 |this, _, ev: &ModelEvent, window, cx| match ev {
@@ -94,7 +123,19 @@ impl ServerSessionsView {
                     ModelEvent::Server(v) if v["type"] == "session" => this.refresh(window, cx),
                     _ => {}
                 },
-            )];
+            ),
+            // The badges of the rows.
+            cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.subscribe_in(
+                &join_link,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = ev {
+                        this.join(window, cx);
+                    }
+                },
+            ),
+        ];
         let mut view = Self {
             model,
             active: Vec::new(),
@@ -102,40 +143,71 @@ impl ServerSessionsView {
             recent: Vec::new(),
             loading: false,
             error: None,
+            join_link,
             _subs: subs,
         };
         view.refresh(window, cx);
         view
     }
 
+    /// Accounts in sight that can be asked (signed in).
+    fn sources(&self, cx: &gpui::App) -> Vec<(Id, termoak_client::ApiClient)> {
+        let m = self.model.read(cx);
+        m.accounts_in_view()
+            .into_iter()
+            .filter_map(|a| m.api_of(Some(a.id())).map(|api| (a.id(), api)))
+            .collect()
+    }
+
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(api) = self.model.read(cx).api.clone() else {
+        let sources = self.sources(cx);
+        if sources.is_empty() {
             self.active.clear();
             self.shared.clear();
             self.recent.clear();
             cx.notify();
             return;
-        };
+        }
         self.loading = true;
         cx.notify();
         runtime::run_in(
             cx,
             window,
-            async move { api.get::<Value>("/api/v1/sessions").await },
+            async move {
+                let mut out = Vec::new();
+                let mut errors = Vec::new();
+                for (account, api) in sources {
+                    match api.get::<Value>("/api/v1/sessions").await {
+                        Ok(v) => out.push((account, v)),
+                        Err(e) => errors.push(crate::state::api_error(e)),
+                    }
+                }
+                if out.is_empty() && !errors.is_empty() {
+                    return Err(errors.join("; "));
+                }
+                Ok::<_, String>(out)
+            },
             |this, res, _, cx| {
                 this.loading = false;
                 match res {
-                    Ok(v) => {
-                        let list =
-                            |key: &str, f: fn(&Value) -> Option<SessionRow>| -> Vec<SessionRow> {
+                    Ok(all) => {
+                        this.active.clear();
+                        this.shared.clear();
+                        this.recent.clear();
+                        for (account, v) in all {
+                            let list = |key: &str,
+                                        f: fn(Id, &Value) -> Option<SessionRow>|
+                             -> Vec<SessionRow> {
                                 v[key]
                                     .as_array()
-                                    .map(|a| a.iter().filter_map(f).collect())
+                                    .map(|a| a.iter().filter_map(|x| f(account, x)).collect())
                                     .unwrap_or_default()
                             };
-                        this.active = list("active", SessionRow::from_view);
-                        this.shared = list("shared", SessionRow::from_view);
-                        this.recent = list("recent", SessionRow::from_info);
+                            this.active.extend(list("active", SessionRow::from_view));
+                            this.shared.extend(list("shared", SessionRow::from_view));
+                            this.recent.extend(list("recent", SessionRow::from_info));
+                        }
+                        this.recent.sort_by_key(|r| std::cmp::Reverse(r.created_at));
                         this.error = None;
                     }
                     Err(e) => this.error = Some(e),
@@ -145,8 +217,66 @@ impl ServerSessionsView {
         );
     }
 
+    /// Opens the "Join with link" dialog with what was pasted.
+    fn join(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.join_link.read(cx).value().trim().to_string();
+        if !text.is_empty() && crate::sharing::parse_join_link(&text).is_none() {
+            ui::error(window, cx, t!("join.invalid_link"));
+            return;
+        }
+        self.join_link
+            .update(cx, |i, cx| i.set_value("", window, cx));
+        let weak = cx.entity().downgrade();
+        super::join::open(
+            self.model.clone(),
+            Some(text).filter(|t| !t.is_empty()),
+            std::rc::Rc::new(move |req, _, cx| {
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |_, cx| cx.emit(req));
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn render_join(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        ui::card(cx)
+            .p_3()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(ui::icon(IconName::Link).size(px(16.)))
+                    .child(div().font_semibold().text_sm().child(t!("join.title")))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("join.section_hint")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.join_link)))
+                    .child(
+                        Button::new("join-with-link")
+                            .primary()
+                            .icon(ui::icon(IconName::LogIn))
+                            .label(t!("join.join"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.join(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn terminate(&mut self, row: SessionRow, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(api) = self.model.read(cx).api.clone() else {
+        let Some(api) = self.model.read(cx).api_of(Some(row.account)) else {
             return;
         };
         let weak = cx.entity().downgrade();
@@ -191,6 +321,16 @@ impl ServerSessionsView {
         closed: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let alerts = self.model.read(cx).session_alerts.clone();
+        let badges = {
+            let m = self.model.read(cx);
+            crate::accounts::show_account_badges(m.accounts_in_view().len()).then(|| {
+                m.accounts
+                    .iter()
+                    .map(|a| (a.id(), crate::accounts::AccountRow::new(&a.info)))
+                    .collect::<Vec<_>>()
+            })
+        };
         let theme = cx.theme();
         v_flex()
             .gap_2()
@@ -225,7 +365,12 @@ impl ServerSessionsView {
                 let open_req = OpenRequest::Attach {
                     session_id: r.id,
                     title: r.title.clone(),
+                    account: Some(r.account),
                 };
+                let badge = badges
+                    .as_ref()
+                    .and_then(|b| b.iter().find(|(id, _)| *id == r.account))
+                    .map(|(_, row)| row.clone());
                 let row = r.clone();
                 let key: SharedString = format!("{id}-{i}").into();
                 h_flex()
@@ -254,12 +399,45 @@ impl ServerSessionsView {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
+                                    .when_some(badge, |this, row| {
+                                        this.child(
+                                            h_flex()
+                                                .id(SharedString::from(format!("{id}-acc-{i}")))
+                                                .child(super::accounts::avatar(&row, 18.))
+                                                .tooltip({
+                                                    let label = row.label();
+                                                    move |window, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            label.clone(),
+                                                        )
+                                                        .build(window, cx)
+                                                    }
+                                                }),
+                                        )
+                                    })
                                     .child(div().font_semibold().text_sm().child(r.title.clone()))
                                     .child(ui::pill(state_label, color))
+                                    // A terminal of someone's computer, shared through
+                                    // the server (not necessarily with a team).
                                     .when(r.kind == "relay", |this| {
                                         this.child(ui::pill(
-                                            t!("server_sessions.shared_from_team"),
+                                            t!("server_sessions.kind_relay"),
                                             theme.info,
+                                        ))
+                                    })
+                                    .when_some(
+                                        r.owner_name.clone().filter(|_| r.access != "owner"),
+                                        |this, owner| {
+                                            this.child(ui::pill(
+                                                t!("server_sessions.shared_by", name = owner),
+                                                theme.muted_foreground,
+                                            ))
+                                        },
+                                    )
+                                    .when_some(alerts.get(&r.id).copied(), |this, n| {
+                                        this.child(ui::pill(
+                                            tn!("server_sessions.waiting_for_you", n),
+                                            theme.warning,
                                         ))
                                     })
                                     .when(r.access == "view", |this| {
@@ -306,6 +484,7 @@ impl ServerSessionsView {
                     })
                     .when(!closed && r.access == "owner", |this| {
                         let model = self.model.clone();
+                        let api = self.model.read(cx).api_of(Some(r.account));
                         let (session_id, relay) = (r.id, r.kind == "relay");
                         this.child(
                             Button::new(("share", i))
@@ -316,6 +495,7 @@ impl ServerSessionsView {
                                 .on_click(move |_: &ClickEvent, window, cx| {
                                     super::share::open(
                                         model.clone(),
+                                        api.clone(),
                                         session_id,
                                         None,
                                         relay,
@@ -335,6 +515,30 @@ impl ServerSessionsView {
                                 })),
                         )
                     })
+                    // Who typed and when (from the recording).
+                    .when(r.access == "owner", |this| {
+                        let model = self.model.clone();
+                        let account = r.account;
+                        let (session_id, title) = (r.id, r.title.clone());
+                        this.child(
+                            Button::new(("activity", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::Activity))
+                                .tooltip(t!("server_sessions.activity.tooltip"))
+                                .on_click(move |_: &ClickEvent, window, cx| {
+                                    if let Some(api) = model.read(cx).api_of(Some(account)) {
+                                        super::activity::open(
+                                            api,
+                                            session_id,
+                                            title.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                    })
             }))
             .into_any_element()
     }
@@ -342,15 +546,19 @@ impl ServerSessionsView {
 
 impl Render for ServerSessionsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let logged_in = self.model.read(cx).logged_in();
+        let logged_in = !self.sources(cx).is_empty();
         let body: gpui::AnyElement = if !logged_in {
-            ui::empty_state(
-                IconName::Cloud,
-                t!("server_sessions.no_server_title"),
-                t!("server_sessions.no_server_detail"),
-                cx,
-            )
-            .into_any_element()
+            // Links work without an account.
+            v_flex()
+                .gap_6()
+                .child(self.render_join(cx))
+                .child(ui::empty_state(
+                    IconName::Cloud,
+                    t!("server_sessions.no_server_title"),
+                    t!("server_sessions.no_server_detail"),
+                    cx,
+                ))
+                .into_any_element()
         } else {
             let active = self.active.clone();
             let shared = self.shared.clone();
@@ -365,6 +573,7 @@ impl Render for ServerSessionsView {
                             .child(t!("server_sessions.load_failed", error = e)),
                     )
                 })
+                .child(self.render_join(cx))
                 .child(self.render_rows("active", t!("server_sessions.active"), &active, false, cx))
                 .child(self.render_rows("shared", t!("server_sessions.shared"), &shared, false, cx))
                 .child(self.render_rows("recent", t!("server_sessions.recent"), &recent, true, cx))

@@ -16,12 +16,12 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, WindowExt, h_flex, v_flex};
 use termoak_core::Id;
-use termoak_core::model::{Record, SecretUpdate, Snippet};
+use termoak_core::model::{SecretUpdate, Snippet};
 use termoak_ssh::{ExecOptions, ExecOutput};
 
 use super::OpenRequest;
 use crate::runtime;
-use crate::state::AppModel;
+use crate::state::{AppModel, Item};
 use crate::ui::{self, IconName};
 
 enum RunState {
@@ -55,8 +55,8 @@ impl SnippetsView {
         }
     }
 
-    fn edit(&mut self, rec: Option<Record<Snippet>>, window: &mut Window, cx: &mut Context<Self>) {
-        let data = rec.map(|r| r.data);
+    fn edit(&mut self, rec: Option<Item<Snippet>>, window: &mut Window, cx: &mut Context<Self>) {
+        let data = rec.map(|r| r.rec.data);
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t!("snippets.form.name_placeholder"))
@@ -149,7 +149,7 @@ impl SnippetsView {
         );
     }
 
-    fn delete(&mut self, rec: Record<Snippet>, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete(&mut self, rec: Item<Snippet>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
             window,
@@ -248,13 +248,18 @@ impl SnippetsView {
                 cx,
                 window,
                 async move {
-                    let conn = ws.connect(host_id, prompter, use_agent).await?;
+                    let conn = ws
+                        .connect(host_id, prompter, use_agent)
+                        .await
+                        .map_err(crate::state::api_error)?;
                     let out = conn
                         .exec(&script, &ExecOptions::default())
                         .await
-                        .map_err(termoak_client::ClientError::from)?;
+                        .map_err(|e| {
+                            crate::state::api_error(termoak_client::ClientError::from(e))
+                        })?;
                     conn.disconnect().await;
-                    Ok::<_, termoak_client::ClientError>(out)
+                    Ok::<_, String>(out)
                 },
                 move |this, res, _, cx| {
                     if let Some(r) = this.runs.get_mut(ix) {
@@ -399,7 +404,16 @@ impl SnippetsView {
 
 impl Render for SnippetsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snippets = self.model.read(cx).snippets.clone();
+        // Only what the vault picker lets through; Use-only snippets can be
+        // used (and copied) but not changed.
+        let snippets: Vec<(Item<Snippet>, bool)> = {
+            let m = self.model.read(cx);
+            m.snippets
+                .iter()
+                .filter(|s| m.in_filter(s))
+                .map(|s| (s.clone(), m.caps_of(s).edit))
+                .collect()
+        };
         let results = self.render_results(cx);
         let theme = cx.theme();
         let list: gpui::AnyElement = if snippets.is_empty() {
@@ -414,115 +428,136 @@ impl Render for SnippetsView {
             h_flex()
                 .flex_wrap()
                 .gap_3()
-                .children(snippets.into_iter().enumerate().map(|(i, rec)| {
-                    let s = rec.data.clone();
-                    let (s_run, r_edit, r_del) = (s.clone(), rec.clone(), rec.clone());
-                    let script_copy = s.script.clone();
-                    let preview: String = s.script.lines().take(3).collect::<Vec<_>>().join("\n");
-                    v_flex()
-                        .id(("snippet", i))
-                        .w(px(340.))
-                        .p_3()
-                        .gap_2()
-                        .rounded(theme.radius_lg)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.secondary)
-                        .child(
-                            h_flex()
+                .children(
+                    snippets
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (rec, editable))| {
+                            let s = rec.data.clone();
+                            let (s_run, r_edit, r_del) = (s.clone(), rec.clone(), rec.clone());
+                            let script_copy = s.script.clone();
+                            let preview: String =
+                                s.script.lines().take(3).collect::<Vec<_>>().join("\n");
+                            v_flex()
+                                .id(("snippet", i))
+                                .w(px(340.))
+                                .p_3()
                                 .gap_2()
-                                .items_center()
+                                .rounded(theme.radius_lg)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.secondary)
                                 .child(
-                                    ui::icon(IconName::SquareTerminal)
-                                        .size(px(16.))
-                                        .text_color(theme.primary),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .font_semibold()
-                                        .text_sm()
-                                        .child(s.name.clone()),
-                                )
-                                .child(
-                                    Button::new(("edit-snippet", i))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(ui::icon(IconName::Pencil))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
-                                                this.edit(Some(r_edit.clone()), window, cx)
-                                            },
-                                        )),
-                                )
-                                .child(
-                                    Button::new(("delete-snippet", i))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(ui::icon(IconName::Trash))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
-                                                this.delete(r_del.clone(), window, cx)
-                                            },
-                                        )),
-                                ),
-                        )
-                        .when(!s.description.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(s.description.clone()),
-                            )
-                        })
-                        .child(
-                            div()
-                                .p_2()
-                                .rounded(theme.radius)
-                                .bg(theme.background)
-                                .font_family(ui::mono_family(cx))
-                                .text_xs()
-                                .max_h(px(64.))
-                                .overflow_hidden()
-                                .child(preview),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .flex_wrap()
-                                .children(
-                                    s.tags
-                                        .iter()
-                                        .map(|t| ui::pill(t.clone(), theme.muted_foreground)),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    Button::new(("copy-snippet", i))
-                                        .xsmall()
-                                        .ghost()
-                                        .icon(ui::icon(IconName::Copy))
-                                        .tooltip(t!("common.copy"))
-                                        .on_click(move |_, window, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                script_copy.clone(),
-                                            ));
-                                            ui::success(window, cx, t!("snippets.copied"));
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            ui::icon(IconName::SquareTerminal)
+                                                .size(px(16.))
+                                                .text_color(theme.primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .font_semibold()
+                                                .text_sm()
+                                                .child(s.name.clone()),
+                                        )
+                                        .when(!editable, |this| {
+                                            this.child(
+                                                ui::icon(IconName::Lock)
+                                                    .size(px(12.))
+                                                    .text_color(theme.warning),
+                                            )
+                                        })
+                                        .when(editable, |this| {
+                                            this.child(
+                                                Button::new(("edit-snippet", i))
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::Pencil))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, window, cx| {
+                                                            this.edit(
+                                                                Some(r_edit.clone()),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(("delete-snippet", i))
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .icon(ui::icon(IconName::Trash))
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, window, cx| {
+                                                            this.delete(r_del.clone(), window, cx)
+                                                        },
+                                                    )),
+                                            )
                                         }),
                                 )
+                                .when(!s.description.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(s.description.clone()),
+                                    )
+                                })
                                 .child(
-                                    Button::new(("run-snippet", i))
-                                        .xsmall()
-                                        .primary()
-                                        .icon(ui::icon(IconName::Play))
-                                        .label(t!("snippets.run.title"))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
-                                                this.run_dialog(s_run.clone(), window, cx)
-                                            },
-                                        )),
-                                ),
-                        )
-                }))
+                                    div()
+                                        .p_2()
+                                        .rounded(theme.radius)
+                                        .bg(theme.background)
+                                        .font_family(ui::mono_family(cx))
+                                        .text_xs()
+                                        .max_h(px(64.))
+                                        .overflow_hidden()
+                                        .child(preview),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .flex_wrap()
+                                        .children(
+                                            s.tags.iter().map(|t| {
+                                                ui::pill(t.clone(), theme.muted_foreground)
+                                            }),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            Button::new(("copy-snippet", i))
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(ui::icon(IconName::Copy))
+                                                .tooltip(t!("common.copy"))
+                                                .on_click(move |_, window, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(
+                                                            script_copy.clone(),
+                                                        ),
+                                                    );
+                                                    ui::success(window, cx, t!("snippets.copied"));
+                                                }),
+                                        )
+                                        .child(
+                                            Button::new(("run-snippet", i))
+                                                .xsmall()
+                                                .primary()
+                                                .icon(ui::icon(IconName::Play))
+                                                .label(t!("snippets.run.title"))
+                                                .on_click(cx.listener(
+                                                    move |this, _: &ClickEvent, window, cx| {
+                                                        this.run_dialog(s_run.clone(), window, cx)
+                                                    },
+                                                )),
+                                        ),
+                                )
+                        }),
+                )
                 .into_any_element()
         };
         v_flex()
@@ -830,12 +865,12 @@ impl SendDialog {
         dialog
     }
 
-    fn matches(&self, cx: &gpui::App) -> Vec<Record<Snippet>> {
+    fn matches(&self, cx: &gpui::App) -> Vec<Item<Snippet>> {
         let q = self.search.read(cx).value().trim().to_lowercase();
-        self.model
-            .read(cx)
-            .snippets
+        let m = self.model.read(cx);
+        m.snippets
             .iter()
+            .filter(|s| m.in_filter(s))
             .filter(|s| {
                 q.is_empty()
                     || s.data.name.to_lowercase().contains(&q)

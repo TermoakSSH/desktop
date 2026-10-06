@@ -237,7 +237,7 @@ pub enum AiChatEvent {
 pub fn ai_backend(model: &Entity<AppModel>, cx: &App) -> Option<AiBackend> {
     let m = model.read(cx);
     let engine = cx.try_global::<LocalAiGlobal>().and_then(|g| g.0.engine());
-    choose_backend(m.ai_run_on() == RunOn::Local, m.api.clone(), engine)
+    choose_backend(m.ai_run_on() == RunOn::Local, m.ai_api(), engine)
 }
 
 /// The result of an AI request (with its [`AiFailure`]) once back on the
@@ -388,8 +388,13 @@ impl AiChat {
     /// talks to the server (on this computer it has its own conversation);
     /// the AI section follows Settings → AI.
     fn backend(&self, cx: &App) -> Option<AiBackend> {
-        if self.terminal.is_some() {
-            self.model.read(cx).api.clone().map(AiBackend::Server)
+        if let Some(terminal) = &self.terminal {
+            // The copilot uses the account of the terminal's host or session.
+            // (Its output never goes to another account's server.)
+            terminal
+                .upgrade()
+                .and_then(|t| t.read(cx).account_api(cx))
+                .map(AiBackend::Server)
         } else {
             ai_backend(&self.model, cx)
         }

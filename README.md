@@ -118,8 +118,20 @@ to every pane with the antenna lit (here, all but the log tail on
   show up as sleeping tabs that attach when clicked.
 - **Session sharing**: a local terminal is shared through the server (invite
   by email, share with one of your teams, or create a link for guests
-  without an account, with view or control permission); server sessions too,
-  from their tab or from **Server sessions**.
+  without an account); server sessions too, from their tab or from **Server
+  sessions**. Everyone joins read only and one person types at a time: each
+  share says whether guests may ask for the keyboard, when it expires,
+  whether you let people in yourself and whether the keyboard is handed over
+  without asking (and for how long at most); shares can be changed live or
+  revoked. The tab shows who is in and who drives, with your requests to
+  answer (also as a toast when the tab is not in view), and lets you give
+  the keyboard until you take it back or for 5 to 60 minutes (with a
+  countdown next to the driver), take it back, kick or block. **Activity**
+  in Server sessions shows who typed and when in a recorded session.
+  Guests see a waiting room, ask for and give back the keyboard, and get a
+  clear message when they are sent away. **Join with link** (or a
+  `termoak://join` link opened from the browser) joins as a guest, no
+  account needed.
 - **Teams** (needs a server): yours with your role and their members;
   create, rename and delete teams, add members by email, change their role
   (member, admin, owner), remove them and leave. Only what your role allows
@@ -269,7 +281,8 @@ AppImage (Linux) and `.app` packed in a `.tar.gz` (macOS). See
 | Find in the terminal | Ctrl+Shift+F | Cmd+F |
 | Clear the terminal | Ctrl+Shift+K | Cmd+K |
 | Settings | Ctrl+, | Cmd+, |
-| New host | Ctrl+Shift+N | Cmd+N |
+| New window (its own tabs, same data) | File menu (☰) | Cmd+N |
+| New host | Ctrl+Shift+N | Cmd+Shift+N |
 | Split view: add a terminal | Ctrl+Shift+D | Cmd+D |
 | Move between panes | Ctrl+Alt+arrows | Cmd+Option+arrows |
 | Focus mode | Ctrl+Shift+M | Cmd+Shift+M |
@@ -294,7 +307,6 @@ src/
   app.rs             main window: tabs, split views, sidebar, sections and AI copilot
   panes.rs           split view logic: grid layout, pane navigation, broadcast routing
   menus.rs           menu bar (macOS) and ☰ menu (Windows/Linux), shortcuts list
-  vault_key.rs       vault key in the system keychain
   theme.rs           dark/light themes and terminal palettes
   runtime.rs         bridge between tokio and GPUI
   state.rs           model: data, server session, sync, port forwards
