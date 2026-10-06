@@ -203,13 +203,15 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
     cx.on_action(|_: &OpenDocs, cx: &mut App| cx.open_url(menus::DOCS_URL));
     cx.on_action(|_: &ReportIssue, cx: &mut App| cx.open_url(menus::ISSUES_URL));
+    crate::dock::init(cx);
     set_menus(cx);
 }
 
-/// Application menu, in the current language (call it again after changing
-/// the language).
+/// Application menu (and the Dock menu on macOS), in the current language
+/// (call it again after changing the language).
 pub fn set_menus(cx: &mut App) {
     menus::set_menus(cx);
+    crate::dock::set_menu(cx);
 }
 
 /// Sections of the sidebar.
@@ -433,10 +435,17 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let first = windows::register(&model, &updates, cx.weak_entity(), window, cx);
-        if first {
+        let windows::Registered {
+            first,
+            start_services,
+        } = windows::register(&model, &updates, cx.weak_entity(), window, cx);
+        if start_services {
             Self::start_app_services(prompts_rx, model.clone(), cx);
         }
+        // macOS: the red button of the last window hides the app instead
+        // (the Dock brings it back with its tabs).
+        #[cfg(target_os = "macos")]
+        window.on_window_should_close(cx, windows::should_close);
 
         let hosts = cx.new(|cx| HostsView::new(model.clone(), window, cx));
         let keychain = cx.new(|cx| KeychainView::new(model.clone(), window, cx));
@@ -541,7 +550,7 @@ impl AppView {
         };
         // macOS asks for permission once; before the first notice, so that
         // one is not lost.
-        if first && view.model.read(cx).settings.notifications.enabled {
+        if start_services && view.model.read(cx).settings.notifications.enabled {
             notifications::request_authorization();
         }
         // If the server session was already restored, the event will not
@@ -551,7 +560,7 @@ impl AppView {
             view.restore_cloud_tabs(first, window, cx);
         }
         // The layout notice may have come before this window existed.
-        if first {
+        if start_services {
             let app = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
                 if let Some(app) = app.upgrade() {
@@ -584,8 +593,9 @@ impl AppView {
         if let Some(mut links) = crate::links::take_receiver() {
             cx.spawn(async move |_, cx| {
                 while let Some(link) = links.recv().await {
+                    // With every window closed (macOS), one opens for it.
                     cx.update(|cx| {
-                        windows::with_notice_window(cx, |app, window, cx| {
+                        windows::with_front_window(cx, move |app, window, cx| {
                             app.open_link(&link, window, cx)
                         })
                     });
@@ -621,6 +631,7 @@ impl AppView {
     /// A `termoak://` (or web join) link: join a shared session or sign up
     /// with an invitation.
     pub fn open_link(&mut self, link: &str, window: &mut Window, cx: &mut Context<Self>) {
+        windows::unhide_app();
         window.activate_window();
         if sharing::parse_join_link(link).is_some() {
             self.open_join_dialog(Some(link.to_string()), window, cx);
@@ -1862,7 +1873,12 @@ impl AppView {
         }
     }
 
-    fn select_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_section(
+        &mut self,
+        section: Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.section = section;
         // The sections that depend on the server refresh when entered.
         match section {
@@ -2318,7 +2334,12 @@ impl AppView {
     }
 
     /// Host picker for a new tab (Ctrl/Cmd+T), a new pane or quick connect.
-    fn open_host_picker(&mut self, mode: PickMode, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_host_picker(
+        &mut self,
+        mode: PickMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let model = self.model.clone();
         let weak = cx.entity().downgrade();
         let picker = cx.new(|cx| HostPicker::new(model, weak, mode, window, cx));

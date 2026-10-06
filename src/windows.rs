@@ -14,8 +14,14 @@
 //! - dormant tabs of your running server sessions are added to the first
 //!   window only.
 //!
-//! Closing the last window quits as before (GPUI's default: on macOS the
-//! app stays in the dock).
+//! The model lives as long as the app, not as a window: on macOS the app
+//! stays in the Dock with no window and opens one again on the same data
+//! (click on the Dock icon, its menu, a link, a notification).
+//!
+//! Closing the last window: on Windows and Linux the app quits (GPUI's
+//! default). On macOS the red button of the last window hides the app
+//! instead of closing it, so its tabs and connections are still there when
+//! it comes back from the Dock; ⌘Q quits.
 
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Entity, EntityId, Focusable, Global, Point,
@@ -37,9 +43,14 @@ const CASCADE: f32 = 28.;
 
 /// The windows of the app.
 pub struct AppWindows {
-    model: WeakEntity<AppModel>,
-    updates: WeakEntity<UpdateModel>,
+    /// Held here so they outlive the windows (macOS keeps the app running
+    /// with none).
+    model: Entity<AppModel>,
+    updates: Entity<UpdateModel>,
     views: Vec<(AnyWindowHandle, WeakEntity<AppView>)>,
+    /// What exists once for the whole app was set up (by the first window
+    /// ever opened).
+    services: bool,
     /// The window used last (it gets the notices).
     last_active: Option<WindowId>,
     /// One of the windows has the focus now.
@@ -51,21 +62,32 @@ pub struct AppWindows {
 
 impl Global for AppWindows {}
 
-/// Adds a window. Returns `true` for the first one (it sets up what exists
-/// once).
+/// What a window that just opened has to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Registered {
+    /// No other window is open: it gets the dormant tabs of your server
+    /// sessions and the notices.
+    pub first: bool,
+    /// The first window since the app started: it sets up what exists once
+    /// (see `AppView::start_app_services`).
+    pub start_services: bool,
+}
+
+/// Adds a window.
 pub fn register(
     model: &Entity<AppModel>,
     updates: &Entity<UpdateModel>,
     view: WeakEntity<AppView>,
     window: &Window,
     cx: &mut App,
-) -> bool {
+) -> Registered {
     let handle = window.window_handle();
     if !cx.has_global::<AppWindows>() {
         cx.set_global(AppWindows {
-            model: model.downgrade(),
-            updates: updates.downgrade(),
+            model: model.clone(),
+            updates: updates.clone(),
             views: Vec::new(),
+            services: false,
             last_active: None,
             any_active: false,
             notifier: Notifier::default(),
@@ -78,7 +100,11 @@ pub fn register(
     if first {
         w.last_active = Some(handle.window_id());
     }
-    first
+    let start_services = !std::mem::replace(&mut w.services, true);
+    Registered {
+        first,
+        start_services,
+    }
 }
 
 /// The window gained or lost the focus.
@@ -164,14 +190,17 @@ pub fn with_notice_window(
 
 /// File → New window: another window on the same model, with no tabs.
 pub fn open_new(cx: &mut App) {
+    unhide_app();
+    open_window(cx);
+}
+
+/// Opens a window on the model (the first one again if every window was
+/// closed). `false` if it could not (the vault never opened).
+fn open_window(cx: &mut App) -> bool {
     let Some(w) = cx.try_global::<AppWindows>() else {
-        return;
+        return false;
     };
-    // The model lives while a window does (on macOS, with every window
-    // closed, the app has to be opened again).
-    let (Some(model), Some(updates)) = (w.model.upgrade(), w.updates.upgrade()) else {
-        return;
-    };
+    let (model, updates) = (w.model.clone(), w.updates.clone());
     // A little below and to the right of the window in front.
     let front =
         notice_window(cx).and_then(|(h, _)| h.update(cx, |_, window, _| window.bounds()).ok());
@@ -186,10 +215,97 @@ pub fn open_new(cx: &mut App) {
         cx.new(|cx| Root::new(view, window, cx))
     });
     match opened {
-        Ok(_) => cx.activate(true),
-        Err(e) => tracing::error!(error = %e, "could not open a new window"),
+        Ok(_) => {
+            cx.activate(true);
+            true
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "could not open a new window");
+            false
+        }
     }
 }
+
+/// Brings the app to the front: the notice window, or a new one if every
+/// window was closed (macOS keeps the app in the Dock). `false` if there
+/// is no window to show.
+pub fn bring_to_front(cx: &mut App) -> bool {
+    unhide_app();
+    if let Some((handle, _)) = notice_window(cx) {
+        cx.activate(true);
+        return handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok();
+    }
+    if open_window(cx) {
+        return true;
+    }
+    // The vault never opened: the error window, if it is still there.
+    let Some(handle) = cx.windows().into_iter().next() else {
+        return false;
+    };
+    cx.activate(true);
+    handle
+        .update(cx, |_, window, _| window.activate_window())
+        .is_ok()
+}
+
+/// Runs `f` on the notice window after bringing the app to the front (and
+/// opening a window if there was none). Deferred: it may come while a
+/// window is being updated (an action, a menu).
+pub fn with_front_window(
+    cx: &mut App,
+    f: impl FnOnce(&mut AppView, &mut Window, &mut gpui::Context<AppView>) + 'static,
+) {
+    cx.defer(move |cx| {
+        if bring_to_front(cx) {
+            with_notice_window(cx, f);
+        }
+    });
+}
+
+/// macOS: the app was opened again (Dock icon, Finder) with no window on
+/// screen: the window comes back, or a new one opens on the same data.
+pub fn reopen(cx: &mut App) {
+    cx.defer(|cx| {
+        bring_to_front(cx);
+    });
+}
+
+/// macOS: the red button of a window. The last one hides the app instead
+/// of closing (its tabs and connections stay for when it comes back from
+/// the Dock); with other windows open it closes as usual.
+#[cfg(target_os = "macos")]
+pub fn should_close(window: &mut Window, cx: &mut App) -> bool {
+    let id = window.window_handle().window_id();
+    if views(cx).iter().any(|(h, _)| h.window_id() != id) {
+        return true;
+    }
+    cx.hide();
+    false
+}
+
+/// macOS: shows the app again if it was hidden (⌘H, or the red button of
+/// the last window).
+#[cfg(target_os = "macos")]
+pub fn unhide_app() {
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::{class, msg_send};
+    // SAFETY: plain AppKit calls on the main thread, where GPUI runs:
+    // `+[NSApplication sharedApplication]` and `-[NSApplication unhide:]`
+    // (its sender may be nil).
+    unsafe {
+        let class: &AnyClass = class!(NSApplication);
+        let app: *mut AnyObject = msg_send![class, sharedApplication];
+        if !app.is_null() {
+            let _: () = msg_send![app, unhide: std::ptr::null_mut::<AnyObject>()];
+        }
+    }
+}
+
+/// Only macOS hides the app.
+#[cfg(not(target_os = "macos"))]
+pub fn unhide_app() {}
 
 /// Shows an authentication question in the notice window. Without a
 /// window the question is dropped, which is the same as cancelling it.
@@ -216,8 +332,13 @@ pub fn notification_clicked(tag: &str, cx: &mut App) {
         _ => None,
     };
     let Some((handle, view)) = owner.or_else(|| notice_window(cx)) else {
+        // Every window closed (macOS): a new one, which shows what it can.
+        with_front_window(cx, move |app, window, cx| {
+            app.open_notification_target(target, window, cx)
+        });
         return;
     };
+    unhide_app();
     let _ = handle.update(cx, |_, window, cx| {
         view.update(cx, |v, cx| v.open_notification_target(target, window, cx))
     });

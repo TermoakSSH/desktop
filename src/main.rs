@@ -10,7 +10,8 @@
 //!    refuses and there is already data, an error screen offers to try
 //!    again instead of inventing a key.
 //! 4. The interface language is chosen and the window is opened (File →
-//!    New window opens more on the same data, see `windows.rs`).
+//!    New window opens more on the same data, see `windows.rs`; on macOS
+//!    the Dock icon brings it back after closing it).
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -26,6 +27,7 @@ mod i18n;
 
 mod accounts;
 mod app;
+mod dock;
 mod links;
 mod local_ai;
 mod menus;
@@ -108,6 +110,9 @@ fn main() {
     links::register_scheme(&data_dir);
     let application = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
     application.on_open_urls(|urls| urls.into_iter().for_each(links::deliver));
+    // macOS: the Dock icon clicked with no window on screen (closed or
+    // hidden): the window comes back, with its tabs.
+    application.on_reopen(windows::reopen);
     application.run(move |cx: &mut App| {
         // Before any window: Windows toasts need the AppUserModelID and
         // Linux shows the name in the notifications.

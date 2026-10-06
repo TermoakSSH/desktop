@@ -84,7 +84,11 @@ to every pane with the antenna lit (here, all but the log tail on
   program uses bracketed paste).
 - **Menus**: the macOS menu bar (Termoak, File, Edit, View, Terminal,
   Window, Help) and, on Windows and Linux, the same menus behind the ☰
-  button of the title bar. Help → Keyboard shortcuts lists them all.
+  button of the title bar. Help → Keyboard shortcuts lists them all. On
+  macOS, the Dock icon's menu has New local terminal, Quick connect, New
+  window, Hosts and Server sessions; closing the last window hides the app
+  (its tabs and connections stay) and the Dock icon brings it back (Cmd+Q
+  quits).
   Authentication prompts in dialogs: fingerprint of new hosts, passwords,
   passphrases and 2FA (keyboard-interactive).
 - **Command autocompletion** in SSH and local terminals: while you type, the
@@ -306,7 +310,9 @@ src/
   main.rs            startup: pending update, tokio, vault and window
   app.rs             main window: tabs, split views, sidebar, sections and AI copilot
   panes.rs           split view logic: grid layout, pane navigation, broadcast routing
+  windows.rs         several windows on the same data; macOS reopen from the Dock
   menus.rs           menu bar (macOS) and ☰ menu (Windows/Linux), shortcuts list
+  dock.rs            menu of the macOS Dock icon
   theme.rs           dark/light themes and terminal palettes
   runtime.rs         bridge between tokio and GPUI
   state.rs           model: data, server session, sync, port forwards
