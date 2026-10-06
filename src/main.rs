@@ -28,6 +28,7 @@ mod i18n;
 mod accounts;
 mod app;
 mod dock;
+mod drag;
 mod links;
 mod local_ai;
 mod menus;

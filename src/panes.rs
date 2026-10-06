@@ -144,6 +144,92 @@ pub fn focus_after_close(n: usize, focused: usize, closed: usize) -> Option<usiz
     })
 }
 
+/// Side of a pane where a dragged tab or pane is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Zone of a pane of `width` × `height` under the pointer at (`x`, `y`)
+/// (relative to the pane): the closest edge, measured against the size, so
+/// the pane is cut along its diagonals into four triangles.
+pub fn zone_at(width: f32, height: f32, x: f32, y: f32) -> Zone {
+    let (w, h) = (width.max(1.), height.max(1.));
+    let (fx, fy) = ((x / w).clamp(0., 1.), (y / h).clamp(0., 1.));
+    let edges = [
+        (fx, Zone::Left),
+        (1. - fx, Zone::Right),
+        (fy, Zone::Top),
+        (1. - fy, Zone::Bottom),
+    ];
+    edges
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, z)| z)
+        .unwrap_or(Zone::Right)
+}
+
+/// Centre of pane `ix` of the grid of `n` panes, as fractions of the width
+/// and height of the workspace.
+fn centre(n: usize, ix: usize) -> Option<(f32, f32)> {
+    let rows = grid_rows(n);
+    let (row, col) = position(n, ix)?;
+    Some((
+        (col as f32 + 0.5) / rows[row] as f32,
+        (row as f32 + 0.5) / rows.len() as f32,
+    ))
+}
+
+/// Where to insert what is dropped on `zone` of pane `target` of a grid of
+/// `n` panes (an index in `0..=n`). The grid lays itself out (see
+/// [`grid_rows`]): of every place the new pane can take, the one on that
+/// side of the target and closest to it wins (left and right: in the same
+/// row; above and below: in another row). When the grid has no such place
+/// (two side by side have no row above), before the target for left and top
+/// and after it for right and bottom.
+pub fn drop_index(n: usize, target: usize, zone: Zone) -> usize {
+    let target = target.min(n.saturating_sub(1));
+    let natural = match zone {
+        Zone::Left | Zone::Top => target,
+        Zone::Right | Zone::Bottom => (target + 1).min(n),
+    };
+    if n == 0 {
+        return 0;
+    }
+    let m = n + 1;
+    let mut best: Option<((f32, f32, usize), usize)> = None;
+    for i in 0..=n {
+        let moved = if i <= target { target + 1 } else { target };
+        let (Some((nx, ny)), Some((tx, ty))) = (centre(m, i), centre(m, moved)) else {
+            continue;
+        };
+        let (dx, dy) = (nx - tx, ny - ty);
+        let same_row = dy.abs() < 1e-4;
+        let score = match zone {
+            Zone::Left if same_row && dx < 0. => (dx.abs(), 0.),
+            Zone::Right if same_row && dx > 0. => (dx.abs(), 0.),
+            Zone::Top if dy < -1e-4 => (dy.abs(), dx.abs()),
+            Zone::Bottom if dy > 1e-4 => (dy.abs(), dx.abs()),
+            _ => continue,
+        };
+        let key = (score.0, score.1, i.abs_diff(natural));
+        let better = best.is_none_or(|(b, _)| {
+            key.0
+                .total_cmp(&b.0)
+                .then(key.1.total_cmp(&b.1))
+                .then(key.2.cmp(&b.2))
+                .is_lt()
+        });
+        if better {
+            best = Some((key, i));
+        }
+    }
+    best.map_or(natural, |(_, i)| i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +319,69 @@ mod tests {
         assert_eq!(focus_after_close(3, 0, 0), Some(0));
         assert_eq!(focus_after_close(3, 2, 0), Some(1));
         assert_eq!(focus_after_close(3, 0, 2), Some(0));
+    }
+
+    #[test]
+    fn drop_zones() {
+        // The closest edge wins.
+        assert_eq!(zone_at(100., 100., 10., 50.), Zone::Left);
+        assert_eq!(zone_at(100., 100., 90., 50.), Zone::Right);
+        assert_eq!(zone_at(100., 100., 50., 10.), Zone::Top);
+        assert_eq!(zone_at(100., 100., 50., 95.), Zone::Bottom);
+        // Relative to the size: a wide pane still has a top and a bottom.
+        assert_eq!(zone_at(400., 100., 200., 20.), Zone::Top);
+        assert_eq!(zone_at(400., 100., 60., 50.), Zone::Left);
+        // Outside or degenerate: clamped, never a panic.
+        assert_eq!(zone_at(100., 100., -5., 50.), Zone::Left);
+        assert_eq!(zone_at(0., 0., 0., 0.), Zone::Left);
+    }
+
+    #[test]
+    fn drop_placement() {
+        // One pane: left/top before it, right/bottom after it (two side by
+        // side have no row above or below).
+        assert_eq!(drop_index(1, 0, Zone::Left), 0);
+        assert_eq!(drop_index(1, 0, Zone::Right), 1);
+        assert_eq!(drop_index(1, 0, Zone::Top), 0);
+        assert_eq!(drop_index(1, 0, Zone::Bottom), 1);
+        // A | B: below either one, the new pane takes the row underneath.
+        assert_eq!(drop_index(2, 0, Zone::Bottom), 2);
+        assert_eq!(drop_index(2, 1, Zone::Bottom), 2);
+        assert_eq!(drop_index(2, 0, Zone::Left), 0);
+        assert_eq!(drop_index(2, 1, Zone::Left), 1);
+        assert_eq!(drop_index(2, 0, Zone::Right), 1);
+        assert_eq!(drop_index(2, 1, Zone::Right), 2);
+        // A B / C D: above D, the new pane goes to the top row, on the right.
+        assert_eq!(drop_index(4, 3, Zone::Top), 2);
+        // A B / C: above C, into the top row next to A and B.
+        let i = drop_index(3, 2, Zone::Top);
+        let moved = if i <= 2 { 3 } else { 2 };
+        assert!(position(4, i).unwrap().0 < position(4, moved).unwrap().0);
+        // Every answer is a valid index, and it lands on the requested side
+        // whenever the grid has a place there.
+        for n in 1..MAX_PANES {
+            for target in 0..n {
+                for zone in [Zone::Left, Zone::Right, Zone::Top, Zone::Bottom] {
+                    let i = drop_index(n, target, zone);
+                    assert!(i <= n, "{n} {target} {zone:?}");
+                    if (0..=n).any(|c| on_side(n, target, c, zone)) {
+                        assert!(on_side(n, target, i, zone), "{n} {target} {zone:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inserting at `i`, the new pane is on `zone`'s side of the target.
+    fn on_side(n: usize, target: usize, i: usize, zone: Zone) -> bool {
+        let moved = if i <= target { target + 1 } else { target };
+        let (nr, nc) = position(n + 1, i).unwrap();
+        let (tr, tc) = position(n + 1, moved).unwrap();
+        match zone {
+            Zone::Left => nr == tr && nc < tc,
+            Zone::Right => nr == tr && nc > tc,
+            Zone::Top => nr < tr,
+            Zone::Bottom => nr > tr,
+        }
     }
 }

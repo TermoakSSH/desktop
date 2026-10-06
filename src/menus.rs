@@ -12,11 +12,11 @@ use gpui::{Action, App, Menu, MenuItem, SharedString};
 
 use crate::app::{
     About, AddPane, CheckForUpdates, ClosePane, CloseTab, DuplicateSession, FocusPaneDown,
-    FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize, NewHost,
-    NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs, OpenSettings, OpenSftp, PrevTab,
-    QuickConnect, Quit, Reconnect, ReportIssue, SendSnippet, ShowAll, ShowShortcuts,
-    ToggleBroadcast, ToggleCopilot, ToggleFocusMode, ToggleFullScreen, ToggleSidebar, ZoomIn,
-    ZoomOut, ZoomReset,
+    FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize, MoveTabLeft,
+    MoveTabRight, NewHost, NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs, OpenSettings,
+    OpenSftp, PaneToNewTab, PrevTab, QuickConnect, Quit, Reconnect, ReportIssue, SendSnippet,
+    ShowAll, ShowShortcuts, ToggleBroadcast, ToggleCopilot, ToggleFocusMode, ToggleFullScreen,
+    ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::terminal;
 
@@ -46,6 +46,8 @@ pub enum Need {
     Duplicable,
     /// Some tab is open.
     AnyTab,
+    /// A tab is in view (not the home screen).
+    ActiveTab,
     /// Automatic updates are enabled in this build.
     Updates,
 }
@@ -61,6 +63,7 @@ pub struct MenuState {
     pub host: bool,
     pub duplicable: bool,
     pub any_tab: bool,
+    pub active_tab: bool,
     pub updates: bool,
 }
 
@@ -76,6 +79,7 @@ impl MenuState {
             Need::Host => self.host,
             Need::Duplicable => self.duplicable,
             Need::AnyTab => self.any_tab,
+            Need::ActiveTab => self.active_tab,
             Need::Updates => self.updates,
         }
     }
@@ -176,6 +180,7 @@ pub fn spec(macos: bool) -> Vec<MenuSpec> {
             item("menu.pane_right", FocusPaneRight, Split),
             item("menu.pane_up", FocusPaneUp, Split),
             item("menu.pane_down", FocusPaneDown, Split),
+            item("menu.pane_to_tab", PaneToNewTab, Split),
             Separator,
             item("menu.zoom_in", ZoomIn, Nothing),
             item("menu.zoom_out", ZoomOut, Nothing),
@@ -200,6 +205,9 @@ pub fn spec(macos: bool) -> Vec<MenuSpec> {
     let mut window = vec![
         item("menu.next_tab", NextTab, AnyTab),
         item("menu.previous_tab", PrevTab, AnyTab),
+        Separator,
+        item("menu.move_tab_left", MoveTabLeft, ActiveTab),
+        item("menu.move_tab_right", MoveTabRight, ActiveTab),
     ];
     if macos {
         window.extend([Separator, item("menu.minimize", Minimize, Nothing)]);
@@ -266,6 +274,11 @@ pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
         ("shortcuts.close_tab", "⌘W", "Ctrl+Shift+W"),
         ("shortcuts.next_tab", "⌘⇧] · ⌃Tab", "Ctrl+Tab"),
         ("shortcuts.previous_tab", "⌘⇧[ · ⌃⇧Tab", "Ctrl+Shift+Tab"),
+        (
+            "shortcuts.move_tab",
+            "⌃⇧PgUp · ⌃⇧PgDn",
+            "Ctrl+Shift+PgUp · Ctrl+Shift+PgDn",
+        ),
         ("shortcuts.home", "⌘1", "Ctrl+Shift+H"),
         ("shortcuts.settings", "⌘,", "Ctrl+,"),
         ("shortcuts.new_host", "⌘⇧N", "Ctrl+Shift+N"),
@@ -394,5 +407,11 @@ mod tests {
         };
         assert!(split.allows(Need::Split) && split.allows(Need::Terminal));
         assert!(!split.allows(Need::Ended));
+        assert!(!split.allows(Need::ActiveTab));
+        let tab = MenuState {
+            active_tab: true,
+            ..Default::default()
+        };
+        assert!(tab.allows(Need::ActiveTab));
     }
 }

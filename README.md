@@ -56,14 +56,18 @@ to every pane with the antenna lit (here, all but the log tail on
   happen (new hosts, skipped ones and why, ProxyJump hops, new and reused
   keys, port forwards and warnings), optionally into a group and as "this
   device only". It can be repeated: what already exists is skipped.
-- **Tabs** in the title bar: terminals and SFTP browsers. Right click on a
-  tab: Rename, Duplicate session, Move to the split view of another tab,
-  Close and Close others.
+- **Tabs** in the title bar: terminals and SFTP browsers. Drag a tab to
+  reorder it (or Ctrl+Shift+PageUp / PageDown). Right click on a tab:
+  Rename, Duplicate session, Move to the split view of another tab, Move
+  left / right, Close and Close others.
 - **Split view**: several terminals in one tab, in a grid that adapts to
-  the number (2 side by side, 4 as 2 × 2... up to 16). Click a pane to focus
-  it, move between panes with Cmd+Option+arrows (Ctrl+Alt+arrows), close
-  one, or use focus mode (Cmd/Ctrl+Shift+M: the focused pane big and the
-  others small).
+  the number (2 side by side, 4 as 2 × 2... up to 16). Drag a tab onto a
+  side of the terminal in view to put them side by side (the side lights up
+  while dragging); drag a pane by its name to another place of the grid, or
+  to the tab bar to give it a tab of its own again (View → Move pane to a
+  new tab). Click a pane to focus it, move between panes with
+  Cmd+Option+arrows (Ctrl+Alt+arrows), close one, or use focus mode
+  (Cmd/Ctrl+Shift+M: the focused pane big and the others small).
 - **Broadcast input** in a split view (Cmd+B, Ctrl+Alt+B elsewhere, or the
   Broadcast button): what you type or paste in the focused pane goes to
   every pane, each encoded for its own terminal mode. The included panes
@@ -276,6 +280,7 @@ AppImage (Linux) and `.app` packed in a `.tar.gz` (macOS). See
 | New local terminal | Ctrl+Shift+T | Cmd+Shift+T |
 | Close tab | Ctrl+W (outside the terminal) or Ctrl+Shift+W | Cmd+W |
 | Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab, Cmd+Shift+] / Cmd+Shift+[ |
+| Move the tab left / right | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown |
 | Back to home | Ctrl+Shift+H | Cmd+1 |
 | Show / hide the AI copilot | Ctrl+Shift+I | Cmd+I |
 | Copy / paste in the terminal | Ctrl+Shift+C / Ctrl+Shift+V (or Shift+Insert) | Cmd+C / Cmd+V |
@@ -311,7 +316,9 @@ terminal.
 src/
   main.rs            startup: pending update, tokio, vault and window
   app.rs             main window: tabs, split views, sidebar, sections and AI copilot
-  panes.rs           split view logic: grid layout, pane navigation, broadcast routing
+  panes.rs           split view logic: grid layout, pane navigation, broadcast routing,
+                     where dropped panes land
+  drag.rs            dragging tabs and panes: what is dragged, preview, tab order
   windows.rs         several windows on the same data; macOS reopen from the Dock
   menus.rs           menu bar (macOS) and ☰ menu (Windows/Linux), shortcuts list
   dock.rs            menu of the macOS Dock icon

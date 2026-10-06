@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, EntityId, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, prelude::FluentBuilder,
-    px, relative,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EntityId,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton,
+    ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, actions, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
@@ -29,11 +29,12 @@ use termoak_core::Id;
 use termoak_ssh::Connection;
 
 use crate::accounts::{self, SwitcherEntry, VaultFilter, ViewMode};
+use crate::drag::{self, DragPreview, DraggedPane, DraggedTab};
 use crate::local_ai::copilot::{LocalAi, LocalAiGlobal};
 use crate::local_ai::terminals::LocalTerminals;
 use crate::menus::{self, MenuState};
 use crate::notifications::{self, AiNotice, Category, Notice, Target};
-use crate::panes::{self, Dir, MAX_PANES};
+use crate::panes::{self, Dir, MAX_PANES, Zone};
 use crate::prompts::PromptRequest;
 use crate::runtime;
 use crate::sharing::{self, SessionNotice};
@@ -108,7 +109,13 @@ actions!(
         FocusPaneLeft,
         FocusPaneRight,
         FocusPaneUp,
-        FocusPaneDown
+        FocusPaneDown,
+        /// Moves the active tab one place to the left.
+        MoveTabLeft,
+        /// Moves the active tab one place to the right.
+        MoveTabRight,
+        /// Takes the focused pane out of the split view into a tab of its own.
+        PaneToNewTab
     ]
 );
 
@@ -192,6 +199,8 @@ pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-tab", NextTab, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-pageup", MoveTabLeft, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-pagedown", MoveTabRight, Some(CONTEXT)),
     ]);
     crate::views::hosts::init(cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
@@ -259,6 +268,26 @@ impl Section {
             Section::Settings => IconName::Settings,
         }
     }
+}
+
+/// Where a dragged tab or pane would land now (the drop indicator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropHint {
+    /// Before or after a tab of the title bar (by id).
+    Tab { id: usize, before: bool },
+    /// After the last tab (the empty end of the tab bar).
+    End,
+    /// On a side of a terminal of the active tab.
+    Pane { id: EntityId, zone: Zone },
+}
+
+/// What was dropped on a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropSource {
+    /// A tab of the title bar (by id).
+    Tab(usize),
+    /// A pane of a split view (its terminal).
+    Pane(EntityId),
 }
 
 /// A terminal of a workspace.
@@ -423,6 +452,8 @@ pub struct AppView {
     copilots: HashMap<EntityId, (Entity<AiChat>, Subscription)>,
     /// Own sessions running on the server (for the Home notice).
     cloud_sessions: usize,
+    /// Where what is being dragged would land (only drawn while dragging).
+    drop_hint: Option<DropHint>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -545,6 +576,7 @@ impl AppView {
             copilot_open: false,
             copilots: HashMap::new(),
             cloud_sessions: 0,
+            drop_hint: None,
             focus: cx.focus_handle(),
             _subs: subs,
         };
@@ -1820,6 +1852,374 @@ impl AppView {
         }
     }
 
+    // ----- Moving tabs and panes (drag and drop, keyboard) -----
+
+    /// Moves the tab at `from` into `slot` of the tab bar (a gap: 0 before
+    /// the first tab, `len` after the last). The active tab stays active.
+    fn move_tab(&mut self, from: usize, slot: usize, cx: &mut Context<Self>) {
+        if let Some(to) = drag::move_item(&mut self.tabs, from, slot) {
+            self.active = self.active.map(|a| drag::index_after_move(a, from, to));
+        }
+        cx.notify();
+    }
+
+    /// "Move tab left/right": the active tab, one place.
+    fn step_active_tab(&mut self, right: bool, cx: &mut Context<Self>) {
+        let Some(ix) = self.active else { return };
+        if let Some(slot) = drag::step_slot(self.tabs.len(), ix, right) {
+            self.move_tab(ix, slot, cx);
+        }
+    }
+
+    /// Takes pane `pane` out of tab `tab` without closing its terminal. A
+    /// tab left empty is removed; one left with a single pane is no longer
+    /// a split view (as when closing a pane).
+    fn take_pane(&mut self, tab: usize, pane: usize, cx: &mut Context<Self>) -> Option<Pane> {
+        let TabContent::Terminal(p) = &mut self.tabs.get_mut(tab)?.content else {
+            return None;
+        };
+        if pane >= p.items.len() {
+            return None;
+        }
+        let n = p.items.len();
+        let next = panes::focus_after_close(n, p.focused, pane).unwrap_or(0);
+        let taken = p.items.remove(pane);
+        p.excluded.remove(&taken.view.entity_id());
+        p.focused = next;
+        if p.items.len() < 2 {
+            p.maximized = false;
+            p.broadcast = false;
+            p.excluded.clear();
+        }
+        if p.items.is_empty() {
+            // Its terminal lives on elsewhere: removed without closing it.
+            self.tabs.remove(tab);
+            self.active = match self.active {
+                Some(a) if a > tab => Some(a - 1),
+                Some(a) if a == tab => None,
+                other => other,
+            };
+        } else {
+            self.sync_panes(tab, cx);
+        }
+        Some(taken)
+    }
+
+    /// A pane of a split view dropped on the tab bar: it becomes a tab of
+    /// its own in that place.
+    fn pane_to_tab(
+        &mut self,
+        terminal: EntityId,
+        slot: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((tab, pane)) = self.find_pane(terminal) else {
+            return;
+        };
+        let alone = self.tabs[tab].panes().is_some_and(|p| p.items.len() < 2);
+        if alone {
+            // Nothing to take out: the tab itself moves.
+            self.move_tab(tab, slot, cx);
+            return;
+        }
+        // The tab the slot is in front of (ids survive the change).
+        let before = self.tabs.get(slot).map(|t| t.id);
+        let Some(taken) = self.take_pane(tab, pane, cx) else {
+            return;
+        };
+        let at = before
+            .and_then(|id| self.tab_index(id))
+            .unwrap_or(self.tabs.len());
+        let id = self.next_id;
+        self.next_id += 1;
+        self.tabs.insert(
+            at,
+            Tab {
+                id,
+                content: TabContent::Terminal(Panes::new(vec![taken])),
+                custom_title: None,
+            },
+        );
+        if let Some(a) = self.active
+            && a >= at
+        {
+            self.active = Some(a + 1);
+        }
+        self.sync_panes(at, cx);
+        self.activate(Some(at), window, cx);
+    }
+
+    /// "Move pane to a new tab": the focused pane of the active split view,
+    /// next to it.
+    fn on_pane_to_new_tab(
+        &mut self,
+        _: &PaneToNewTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active else { return };
+        let Some(id) = self.focused_terminal().map(|t| t.entity_id()) else {
+            return;
+        };
+        self.pane_to_tab(id, tab + 1, window, cx);
+    }
+
+    /// A tab (`Some(id)`) or a pane (`terminal`) dropped on side `zone` of
+    /// the terminal `target`: its terminals join that split view there
+    /// (as many as fit). A tab dropped on itself, or a pane on itself, does
+    /// nothing.
+    fn drop_on_pane(
+        &mut self,
+        source: DropSource,
+        target: EntityId,
+        zone: Zone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((dst, _)) = self.find_pane(target) else {
+            return;
+        };
+        let dst_id = self.tabs[dst].id;
+        let dst_len = self.tabs[dst].panes().map_or(0, |p| p.items.len());
+        let moved: Vec<Pane> = match source {
+            DropSource::Pane(id) if id == target => return,
+            DropSource::Pane(id) => {
+                let Some((src, pane)) = self.find_pane(id) else {
+                    return;
+                };
+                if src == dst {
+                    // Rearranged inside the same split view: its broadcast
+                    // and focus mode stay as they are.
+                    let TabContent::Terminal(p) = &mut self.tabs[dst].content else {
+                        return;
+                    };
+                    let moving = p.items.remove(pane);
+                    let at = p
+                        .position(target)
+                        .map_or(p.items.len(), |t| panes::drop_index(p.items.len(), t, zone));
+                    p.items.insert(at, moving);
+                    self.sync_panes(dst, cx);
+                    self.focus_pane(dst, at, window, cx);
+                    return;
+                }
+                if dst_len >= MAX_PANES {
+                    ui::notify(
+                        window,
+                        cx,
+                        ToastKind::Warning,
+                        t!("app.split.full", max = MAX_PANES),
+                    );
+                    return;
+                }
+                self.take_pane(src, pane, cx).into_iter().collect()
+            }
+            DropSource::Tab(id) if id == dst_id => return,
+            DropSource::Tab(id) => {
+                let Some(src) = self.tab_index(id) else {
+                    return;
+                };
+                // A dormant session attaches first.
+                self.wake(src, window, cx);
+                let Some(src_len) = self.tabs[src].panes().map(|p| p.items.len()) else {
+                    // SFTP: not a terminal.
+                    return;
+                };
+                let room = MAX_PANES.saturating_sub(dst_len);
+                if room == 0 || src_len == 0 {
+                    ui::notify(
+                        window,
+                        cx,
+                        ToastKind::Warning,
+                        t!("app.split.full", max = MAX_PANES),
+                    );
+                    return;
+                }
+                // Taken from the end so the indexes still to take hold; the
+                // first ones that fit go, in their order.
+                let mut taken: Vec<Pane> = Vec::new();
+                for pane in (0..room.min(src_len)).rev() {
+                    let Some(src) = self.tab_index(id) else { break };
+                    if let Some(p) = self.take_pane(src, pane, cx) {
+                        taken.push(p);
+                    }
+                }
+                taken.reverse();
+                taken
+            }
+        };
+        if moved.is_empty() {
+            return;
+        }
+        let Some(dst) = self.tab_index(dst_id) else {
+            return;
+        };
+        let TabContent::Terminal(p) = &mut self.tabs[dst].content else {
+            return;
+        };
+        let Some(target_ix) = p.position(target) else {
+            return;
+        };
+        let at = panes::drop_index(p.items.len(), target_ix, zone);
+        p.items.splice(at..at, moved);
+        p.focused = at;
+        self.sync_panes(dst, cx);
+        self.activate(Some(dst), window, cx);
+        self.focus_pane(dst, at, window, cx);
+    }
+
+    /// The pointer moves over a tab while dragging: before or after it.
+    /// `moving`: the tab that would move (none for a pane that becomes a
+    /// new tab); no indicator where it would stay in place.
+    fn hover_tab(
+        &mut self,
+        id: usize,
+        accepts: bool,
+        moving: Option<usize>,
+        bounds: Bounds<Pixels>,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = at.x < bounds.center().x;
+        let moves = self
+            .tab_index(id)
+            .is_some_and(|ix| self.drop_moves(moving, drag::slot_of(ix, before)));
+        let hint =
+            (accepts && moves && bounds.contains(&at)).then_some(DropHint::Tab { id, before });
+        self.set_hint(
+            hint,
+            |h| matches!(h, DropHint::Tab { id: i, .. } if i == id),
+            cx,
+        );
+    }
+
+    /// The pointer moves over the empty end of the tab bar while dragging:
+    /// after the last tab.
+    fn hover_strip_end(
+        &mut self,
+        accepts: bool,
+        moving: Option<usize>,
+        bounds: Bounds<Pixels>,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let moves = self.drop_moves(moving, self.tabs.len());
+        let hint = (accepts && moves && bounds.contains(&at)).then_some(DropHint::End);
+        self.set_hint(hint, |h| h == DropHint::End, cx);
+    }
+
+    /// The zone of terminal `id` something was just dropped on (and the
+    /// hint is over).
+    fn take_pane_zone(&mut self, id: EntityId) -> Option<Zone> {
+        match self.drop_hint.take() {
+            Some(DropHint::Pane { id: h, zone }) if h == id => Some(zone),
+            _ => None,
+        }
+    }
+
+    /// A dragged pane comes from this window.
+    fn owns_pane(&self, d: &DraggedPane) -> bool {
+        self.find_pane(d.terminal).is_some()
+    }
+
+    /// Dropping in `slot` of the tab bar changes something: a new tab, or
+    /// the tab at `moving` going somewhere else.
+    fn drop_moves(&self, moving: Option<usize>, slot: usize) -> bool {
+        moving.is_none_or(|from| drag::move_target(self.tabs.len(), from, slot).is_some())
+    }
+
+    /// What a drag over the tab bar is: whether this window takes it and
+    /// the tab it would move (`None`: a pane that becomes a new tab).
+    fn strip_drag_tab(&self, d: Option<&DraggedTab>, me: EntityId) -> (bool, Option<usize>) {
+        match d.filter(|d| d.app == me) {
+            Some(d) => (true, self.tab_index(d.tab)),
+            None => (false, None),
+        }
+    }
+
+    /// The same for a dragged pane: alone in its tab, that tab moves.
+    fn strip_drag_pane(&self, d: Option<&DraggedPane>) -> (bool, Option<usize>) {
+        match d.and_then(|d| self.find_pane(d.terminal)) {
+            Some((tab, _)) => {
+                let alone = self.tabs[tab].panes().is_some_and(|p| p.items.len() < 2);
+                (true, alone.then_some(tab))
+            }
+            None => (false, None),
+        }
+    }
+
+    /// The pointer moves over a terminal of the active tab while dragging:
+    /// the side it is closest to.
+    fn hover_pane(
+        &mut self,
+        id: EntityId,
+        accepts: bool,
+        bounds: Bounds<Pixels>,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let hint = (accepts && bounds.contains(&at)).then(|| {
+            let rel = at - bounds.origin;
+            DropHint::Pane {
+                id,
+                zone: panes::zone_at(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    f32::from(rel.x),
+                    f32::from(rel.y),
+                ),
+            }
+        });
+        self.set_hint(
+            hint,
+            |h| matches!(h, DropHint::Pane { id: i, .. } if i == id),
+            cx,
+        );
+    }
+
+    /// Sets the drop hint (`Some`), or clears it if `owned` says the current
+    /// one is this target's (`None`): every target sees every move.
+    fn set_hint(
+        &mut self,
+        hint: Option<DropHint>,
+        owned: impl Fn(DropHint) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = match hint {
+            Some(h) => Some(h),
+            None if self.drop_hint.is_some_and(&owned) => None,
+            None => self.drop_hint,
+        };
+        if next != self.drop_hint {
+            self.drop_hint = next;
+            cx.notify();
+        }
+    }
+
+    /// The slot of the tab bar a drop on tab `id` goes to (from the hint:
+    /// before or after it).
+    fn slot_for_tab(&self, id: usize) -> Option<usize> {
+        let ix = self.tab_index(id)?;
+        let before = match self.drop_hint {
+            Some(DropHint::Tab { id: h, before }) if h == id => before,
+            _ => true,
+        };
+        Some(drag::slot_of(ix, before))
+    }
+
+    /// A tab of this window that can be dropped on the terminals of the
+    /// active tab (another terminal tab, or a dormant session).
+    fn tab_joins_split(&self, d: &DraggedTab, me: EntityId) -> bool {
+        d.app == me
+            && self.tab_index(d.tab).is_some_and(|ix| {
+                Some(ix) != self.active
+                    && matches!(
+                        self.tabs[ix].content,
+                        TabContent::Terminal(_) | TabContent::Dormant { .. }
+                    )
+            })
+    }
+
     /// Asks for a new name for a tab (empty: the automatic one again).
     fn rename_tab(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_index(id) else {
@@ -1933,6 +2333,7 @@ impl AppView {
                     .and_then(|i| self.tabs.get(i))
                     .is_some_and(|t| matches!(t.content, TabContent::Sftp(_))),
             any_tab: !self.tabs.is_empty(),
+            active_tab: self.active.is_some(),
             updates: self.updates.read(cx).status != UpdateStatus::Disabled,
         }
     }
@@ -1975,6 +2376,14 @@ impl AppView {
             None => None,
         };
         self.activate(prev, window, cx);
+    }
+
+    fn on_move_tab_left(&mut self, _: &MoveTabLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_active_tab(false, cx);
+    }
+
+    fn on_move_tab_right(&mut self, _: &MoveTabRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_active_tab(true, cx);
     }
 
     fn on_go_home(&mut self, _: &GoHome, window: &mut Window, cx: &mut Context<Self>) {
@@ -2392,6 +2801,17 @@ impl AppView {
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let (w1, w2, w3, w4) = (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+        let (w5, w6) = (weak.clone(), weak.clone());
+        // Where the tab is, to enable moving it left or right.
+        let (ix, len) = weak
+            .upgrade()
+            .map(|a| {
+                let a = a.read(cx);
+                (a.tab_index(tab_id), a.tabs.len())
+            })
+            .unwrap_or((None, 0));
+        let left = ix.and_then(|i| drag::step_slot(len, i, false));
+        let right = ix.and_then(|i| drag::step_slot(len, i, true));
         let menu = menu
             .item(
                 PopupMenuItem::new(t!("app.tab.rename"))
@@ -2437,6 +2857,35 @@ impl AppView {
         };
         menu.separator()
             .item(
+                PopupMenuItem::new(t!("app.tab.move_left"))
+                    .icon(ui::icon(IconName::ArrowLeft))
+                    .disabled(left.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(app) = w5.upgrade() {
+                            app.update(cx, |this, cx| {
+                                if let (Some(ix), Some(slot)) = (this.tab_index(tab_id), left) {
+                                    this.move_tab(ix, slot, cx);
+                                }
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(t!("app.tab.move_right"))
+                    .icon(ui::icon(IconName::ArrowRight))
+                    .disabled(right.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(app) = w6.upgrade() {
+                            app.update(cx, |this, cx| {
+                                if let (Some(ix), Some(slot)) = (this.tab_index(tab_id), right) {
+                                    this.move_tab(ix, slot, cx);
+                                }
+                            });
+                        }
+                    }),
+            )
+            .separator()
+            .item(
                 PopupMenuItem::new(t!("app.tab.close"))
                     .icon(ui::icon(IconName::X))
                     .on_click(move |_, window, cx| {
@@ -2459,7 +2908,12 @@ impl AppView {
     }
 
     fn render_tab_strip(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let dragging = cx.has_active_drag();
+        let hint = if dragging { self.drop_hint } else { None };
+        let me = cx.entity_id();
+        let last_tab = self.tabs.last().map(|t| t.id);
         let theme = cx.theme();
+        let primary = theme.primary;
         let home_active = self.active.is_none();
         let weak = cx.entity().downgrade();
         let terminal_tabs: Vec<(usize, SharedString)> = self
@@ -2542,9 +2996,36 @@ impl AppView {
                 .cloned()
                 .collect();
             let weak = weak.clone();
+            let dragged = DraggedTab {
+                app: me,
+                tab: tab_id,
+                title: title.clone(),
+                icon,
+            };
+            // Drop indicator: a bar in the gap before or after the tab.
+            let bar_before = hint
+                == Some(DropHint::Tab {
+                    id: tab_id,
+                    before: true,
+                });
+            let bar_after =
+                hint == Some(DropHint::Tab {
+                    id: tab_id,
+                    before: false,
+                }) || (hint == Some(DropHint::End) && last_tab == Some(tab_id));
+            let bar = move || {
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .bottom(px(2.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(primary)
+            };
             strip = strip.child(
                 h_flex()
                     .id(("tab", tab.id))
+                    .relative()
                     .block_mouse_except_scroll()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .h(px(28.))
@@ -2622,6 +3103,45 @@ impl AppView {
                                 }
                             })),
                     )
+                    // Dragged to another place of the bar, or onto a
+                    // terminal to make a split view.
+                    .on_drag(dragged, |d, _, _, cx| {
+                        cx.new(|_| DragPreview::new(d.title.clone(), d.icon))
+                    })
+                    .on_drag_move(
+                        cx.listener(move |this, e: &DragMoveEvent<DraggedTab>, _, cx| {
+                            let d = e.dragged_item().downcast_ref::<DraggedTab>();
+                            let (ok, moving) = this.strip_drag_tab(d, cx.entity_id());
+                            this.hover_tab(tab_id, ok, moving, e.bounds, e.event.position, cx);
+                        }),
+                    )
+                    .on_drag_move(cx.listener(
+                        move |this, e: &DragMoveEvent<DraggedPane>, _, cx| {
+                            let d = e.dragged_item().downcast_ref::<DraggedPane>();
+                            let (ok, moving) = this.strip_drag_pane(d);
+                            this.hover_tab(tab_id, ok, moving, e.bounds, e.event.position, cx);
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, d: &DraggedTab, _, cx| {
+                        let slot = this.slot_for_tab(tab_id);
+                        this.drop_hint = None;
+                        if d.app == cx.entity_id()
+                            && let (Some(from), Some(slot)) = (this.tab_index(d.tab), slot)
+                        {
+                            this.move_tab(from, slot, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .on_drop(cx.listener(move |this, d: &DraggedPane, window, cx| {
+                        let slot = this.slot_for_tab(tab_id);
+                        this.drop_hint = None;
+                        if let Some(slot) = slot {
+                            this.pane_to_tab(d.terminal, slot, window, cx);
+                        }
+                        cx.notify();
+                    }))
+                    .when(bar_before, |this| this.child(bar().left(px(-3.))))
+                    .when(bar_after, |this| this.child(bar().right(px(-3.))))
                     .context_menu(move |menu, window, cx| {
                         Self::tab_menu(
                             menu,
@@ -2636,20 +3156,58 @@ impl AppView {
                     }),
             );
         }
+        // The + and the empty rest of the bar: a drop there goes after the
+        // last tab. While dragging it takes the mouse (otherwise the empty
+        // bar moves the window).
         strip.child(
-            div()
-                .id("tab-new-area")
-                .block_mouse_except_scroll()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            h_flex()
+                .id("tab-strip-end")
+                .flex_1()
+                .h_full()
+                .min_w(px(56.))
+                .items_center()
+                .when(dragging, |this| this.block_mouse_except_scroll())
+                .on_drag_move(cx.listener(|this, e: &DragMoveEvent<DraggedTab>, _, cx| {
+                    let d = e.dragged_item().downcast_ref::<DraggedTab>();
+                    let (ok, moving) = this.strip_drag_tab(d, cx.entity_id());
+                    this.hover_strip_end(ok, moving, e.bounds, e.event.position, cx);
+                }))
+                .on_drag_move(cx.listener(|this, e: &DragMoveEvent<DraggedPane>, _, cx| {
+                    let d = e.dragged_item().downcast_ref::<DraggedPane>();
+                    let (ok, moving) = this.strip_drag_pane(d);
+                    this.hover_strip_end(ok, moving, e.bounds, e.event.position, cx);
+                }))
+                .on_drop(cx.listener(|this, d: &DraggedTab, _, cx| {
+                    this.drop_hint = None;
+                    if d.app == cx.entity_id()
+                        && let Some(from) = this.tab_index(d.tab)
+                    {
+                        let len = this.tabs.len();
+                        this.move_tab(from, len, cx);
+                    }
+                    cx.notify();
+                }))
+                .on_drop(cx.listener(|this, d: &DraggedPane, window, cx| {
+                    this.drop_hint = None;
+                    let len = this.tabs.len();
+                    this.pane_to_tab(d.terminal, len, window, cx);
+                    cx.notify();
+                }))
                 .child(
-                    Button::new("tab-new")
-                        .xsmall()
-                        .ghost()
-                        .icon(ui::icon(IconName::Plus))
-                        .tooltip(t!("app.new_tab"))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.open_host_picker(PickMode::Tab, window, cx)
-                        })),
+                    div()
+                        .id("tab-new-area")
+                        .block_mouse_except_scroll()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new("tab-new")
+                                .xsmall()
+                                .ghost()
+                                .icon(ui::icon(IconName::Plus))
+                                .tooltip(t!("app.new_tab"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.open_host_picker(PickMode::Tab, window, cx)
+                                })),
+                        ),
                 ),
         )
     }
@@ -2818,10 +3376,90 @@ impl AppView {
             .into_any_element()
     }
 
+    /// A terminal as a drop target: a tab dropped on one of its sides joins
+    /// it in a split view there, and so does a pane of the split view
+    /// (which moves). While dragging, the side the pointer is closest to is
+    /// highlighted.
+    fn pane_drop_target(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        id: EntityId,
+        hint: Option<DropHint>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let zone = match hint {
+            Some(DropHint::Pane { id: h, zone }) if h == id => Some(zone),
+            _ => None,
+        };
+        let color = cx.theme().primary;
+        el.on_drag_move(
+            cx.listener(move |this, e: &DragMoveEvent<DraggedTab>, _, cx| {
+                let me = cx.entity_id();
+                let ok = e
+                    .dragged_item()
+                    .downcast_ref::<DraggedTab>()
+                    .is_some_and(|d| this.tab_joins_split(d, me));
+                this.hover_pane(id, ok, e.bounds, e.event.position, cx);
+            }),
+        )
+        .on_drag_move(
+            cx.listener(move |this, e: &DragMoveEvent<DraggedPane>, _, cx| {
+                let ok = e
+                    .dragged_item()
+                    .downcast_ref::<DraggedPane>()
+                    .is_some_and(|d| d.terminal != id && this.owns_pane(d));
+                this.hover_pane(id, ok, e.bounds, e.event.position, cx);
+            }),
+        )
+        .on_drop(cx.listener(move |this, d: &DraggedTab, window, cx| {
+            let zone = this.take_pane_zone(id);
+            if let Some(zone) = zone
+                && this.tab_joins_split(d, cx.entity_id())
+            {
+                this.drop_on_pane(DropSource::Tab(d.tab), id, zone, window, cx);
+            }
+            cx.notify();
+        }))
+        .on_drop(cx.listener(move |this, d: &DraggedPane, window, cx| {
+            let zone = this.take_pane_zone(id);
+            if let Some(zone) = zone
+                && this.owns_pane(d)
+            {
+                this.drop_on_pane(DropSource::Pane(d.terminal), id, zone, window, cx);
+            }
+            cx.notify();
+        }))
+        .when_some(zone, |el, zone| {
+            // Half of the terminal on that side, where the new one will be.
+            let area = div()
+                .absolute()
+                .rounded(px(4.))
+                .border_2()
+                .border_color(color)
+                .bg(color.opacity(0.18));
+            el.child(match zone {
+                Zone::Left => area.top_0().bottom_0().left_0().w(relative(0.5)),
+                Zone::Right => area.top_0().bottom_0().right_0().w(relative(0.5)),
+                Zone::Top => area.left_0().right_0().top_0().h(relative(0.5)),
+                Zone::Bottom => area.left_0().right_0().bottom_0().h(relative(0.5)),
+            })
+        })
+    }
+
     /// Terminals of a tab: alone, in a grid or in focus mode.
     fn render_panes(&self, tab: usize, p: &Panes, cx: &Context<Self>) -> AnyElement {
+        let hint = if cx.has_active_drag() {
+            self.drop_hint
+        } else {
+            None
+        };
         if !p.is_split() {
-            return p.focused().clone().into_any_element();
+            let view = p.focused().clone();
+            let id = view.entity_id();
+            let single = div().id("pane-single").relative().size_full().child(view);
+            return self
+                .pane_drop_target(single, id, hint, cx)
+                .into_any_element();
         }
         let theme = cx.theme();
         let pane_box = |i: usize| {
@@ -2835,7 +3473,7 @@ impl AppView {
             } else {
                 theme.border
             };
-            div()
+            let el = div()
                 .id(("pane", i))
                 .relative()
                 .min_w_0()
@@ -2844,7 +3482,8 @@ impl AppView {
                 .rounded(theme.radius)
                 .border_2()
                 .border_color(color)
-                .child(pane.view.clone())
+                .child(pane.view.clone());
+            self.pane_drop_target(el, id, hint, cx)
         };
         let body: AnyElement = if p.maximized {
             let focused = p.focused.min(p.items.len() - 1);
@@ -3642,6 +4281,10 @@ impl Render for AppView {
             .when(state.any_tab, |this| {
                 this.on_action(cx.listener(Self::on_close_tab))
             })
+            .when(state.active_tab, |this| {
+                this.on_action(cx.listener(Self::on_move_tab_left))
+                    .on_action(cx.listener(Self::on_move_tab_right))
+            })
             .when(state.terminal, |this| {
                 this.on_action(cx.listener(Self::on_toggle_copilot))
                     .on_action(cx.listener(Self::on_add_pane))
@@ -3666,6 +4309,7 @@ impl Render for AppView {
                     .on_action(cx.listener(Self::on_pane_right))
                     .on_action(cx.listener(Self::on_pane_up))
                     .on_action(cx.listener(Self::on_pane_down))
+                    .on_action(cx.listener(Self::on_pane_to_new_tab))
             })
             .child(
                 TitleBar::new()

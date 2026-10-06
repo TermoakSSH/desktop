@@ -46,6 +46,7 @@ use self::element::{PADDING, TerminalElement};
 use self::model::{Snapshot, TermEvent, TermModel};
 use self::share_ui::ShareState;
 pub use self::share_ui::{RequestKind, ShareRequest};
+use crate::drag::{DragPreview, DraggedPane};
 use crate::runtime;
 use crate::state::{AppModel, ToastKind, api_error};
 use crate::theme::TermPalette;
@@ -2601,16 +2602,43 @@ impl TerminalView {
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.tab_bar)
-            .child(div().size(px(8.)).rounded_full().bg(dot))
             .child(
-                div()
-                    .text_sm()
-                    .font_medium()
+                // In a split view the name is a handle: dragged to the tab
+                // bar it becomes a tab of its own, onto another terminal it
+                // moves there.
+                h_flex()
+                    .id("pane-handle")
                     .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .child(self.label(cx)),
+                    .gap_2()
+                    .items_center()
+                    .when(compact, |this| {
+                        let dragged = DraggedPane {
+                            terminal: cx.entity_id(),
+                            title: self.label(cx).into(),
+                        };
+                        this.cursor_grab()
+                            .child(
+                                ui::icon(IconName::GripVertical)
+                                    .size(px(14.))
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .on_drag(dragged, |d, _, _, cx| {
+                                cx.new(|_| {
+                                    DragPreview::new(d.title.clone(), IconName::SquareTerminal)
+                                })
+                            })
+                    })
+                    .child(div().size(px(8.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.label(cx)),
+                    ),
             )
             .when(!compact, |this| {
                 this.child(ui::pill(kind_label, kind_color))
