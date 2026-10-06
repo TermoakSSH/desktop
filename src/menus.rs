@@ -13,9 +13,10 @@ use gpui::{Action, App, Menu, MenuItem, SharedString};
 use crate::app::{
     About, AddPane, CheckForUpdates, ClosePane, CloseTab, DuplicateSession, FocusPaneDown,
     FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize, NewHost,
-    NewLocalTerminal, NewTab, NextTab, OpenDocs, OpenSettings, OpenSftp, PrevTab, QuickConnect,
-    Quit, Reconnect, ReportIssue, SendSnippet, ShowAll, ShowShortcuts, ToggleBroadcast,
-    ToggleCopilot, ToggleFocusMode, ToggleFullScreen, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+    NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs, OpenSettings, OpenSftp, PrevTab,
+    QuickConnect, Quit, Reconnect, ReportIssue, SendSnippet, ShowAll, ShowShortcuts,
+    ToggleBroadcast, ToggleCopilot, ToggleFocusMode, ToggleFullScreen, ToggleSidebar, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use crate::terminal;
 
@@ -40,8 +41,8 @@ pub enum Need {
     Ended,
     /// The focused terminal is connected to a host (SFTP).
     Host,
-    /// The focused terminal can be opened again (not an attached session
-    /// without a host).
+    /// The active tab can be opened again (an SFTP browser, or a terminal
+    /// that is not an attached session without a host).
     Duplicable,
     /// Some tab is open.
     AnyTab,
@@ -138,6 +139,7 @@ pub fn spec(macos: bool) -> Vec<MenuSpec> {
     menus.push(MenuSpec {
         title: Some("menu.file"),
         entries: vec![
+            item("menu.new_window", NewWindow, Nothing),
             item("menu.new_tab", NewTab, Nothing),
             item("menu.new_local_terminal", NewLocalTerminal, Nothing),
             item("menu.new_host", NewHost, Nothing),
@@ -258,6 +260,7 @@ pub fn set_menus(cx: &mut App) {
 /// description, macOS keys and Windows/Linux keys.
 pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
+        ("shortcuts.new_window", "⌘N", "—"),
         ("shortcuts.new_tab", "⌘T", "Ctrl+T"),
         ("shortcuts.local_terminal", "⌘⇧T", "Ctrl+Shift+T"),
         ("shortcuts.close_tab", "⌘W", "Ctrl+Shift+W"),
@@ -265,7 +268,7 @@ pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
         ("shortcuts.previous_tab", "⌘⇧[ · ⌃⇧Tab", "Ctrl+Shift+Tab"),
         ("shortcuts.home", "⌘1", "Ctrl+Shift+H"),
         ("shortcuts.settings", "⌘,", "Ctrl+,"),
-        ("shortcuts.new_host", "⌘N", "Ctrl+Shift+N"),
+        ("shortcuts.new_host", "⌘⇧N", "Ctrl+Shift+N"),
         ("shortcuts.copy", "⌘C", "Ctrl+Shift+C"),
         ("shortcuts.paste", "⌘V", "Ctrl+Shift+V · Shift+Insert"),
         ("shortcuts.select_all", "⌘A", "Ctrl+Shift+A"),

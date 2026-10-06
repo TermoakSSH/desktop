@@ -29,11 +29,11 @@ use termoak_core::Id;
 use termoak_ssh::Connection;
 
 use crate::local_ai::copilot::{LocalAi, LocalAiGlobal};
-use crate::local_ai::terminals::{LocalTerminals, TermRequest, screen_tail};
+use crate::local_ai::terminals::LocalTerminals;
 use crate::menus::{self, MenuState};
-use crate::notifications::{self, AiNotice, Category, Notice, Notifier, Target};
+use crate::notifications::{self, AiNotice, Category, Notice, Target};
 use crate::panes::{self, Dir, MAX_PANES};
-use crate::prompts::{self, PromptRequest};
+use crate::prompts::PromptRequest;
 use crate::runtime;
 use crate::sharing::{self, SessionNotice};
 use crate::state::{AppModel, ModelEvent, ToastKind};
@@ -57,11 +57,14 @@ use crate::views::settings::{SettingsPage, SettingsView};
 use crate::views::sftp::SftpView;
 use crate::views::snippets::SnippetsView;
 use crate::views::teams::TeamsView;
+use crate::windows;
 
 actions!(
     termoak,
     [
         NewTab,
+        /// Another window on the same data, with its own tabs.
+        NewWindow,
         NewLocalTerminal,
         CloseTab,
         NextTab,
@@ -134,7 +137,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-1", GoHome, Some(CONTEXT)),
         KeyBinding::new("cmd-i", ToggleCopilot, Some(CONTEXT)),
         KeyBinding::new("cmd-,", OpenSettings, Some(CONTEXT)),
-        KeyBinding::new("cmd-n", NewHost, Some(CONTEXT)),
+        KeyBinding::new("cmd-n", NewWindow, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-n", NewHost, Some(CONTEXT)),
         KeyBinding::new("cmd-d", AddPane, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-m", ToggleFocusMode, Some(CONTEXT)),
         KeyBinding::new("cmd-b", ToggleBroadcast, Some(CONTEXT)),
@@ -187,6 +191,9 @@ pub fn init(cx: &mut App) {
     ]);
     crate::views::hosts::init(cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    // Deferred: the action arrives while the window in front is being
+    // updated, and the new one is placed from its bounds.
+    cx.on_action(|_: &NewWindow, cx: &mut App| cx.defer(windows::open_new));
     cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
     cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
@@ -408,9 +415,6 @@ pub struct AppView {
     copilots: HashMap<EntityId, (Entity<AiChat>, Subscription)>,
     /// Own sessions running on the server (for the Home notice).
     cloud_sessions: usize,
-    /// Notifications of the system posted while the window was in the
-    /// background (repeats and where a click leads).
-    notifier: Notifier,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -419,34 +423,14 @@ impl AppView {
     pub fn new(
         model: Entity<AppModel>,
         updates: Entity<UpdateModel>,
-        prompts_rx: tokio::sync::mpsc::UnboundedReceiver<PromptRequest>,
+        prompts_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PromptRequest>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        prompts::listen(prompts_rx, window, cx);
-
-        // The AI that runs on this computer: its tools reach the terminals
-        // of this window through these requests.
-        let (terminals, mut term_rx) = LocalTerminals::new();
-        let store = model.read(cx).ws.store.clone();
-        let rt = runtime::handle(cx);
-        let local_ai = {
-            let _rt = rt.enter();
-            Arc::new(LocalAi::new(store, Arc::new(terminals)))
-        };
-        cx.set_global(LocalAiGlobal(local_ai.clone()));
-        Self::start_local_engine(local_ai, model.clone(), window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            while let Some(req) = term_rx.recv().await {
-                if this
-                    .update(cx, |app, cx| app.answer_terminal(req, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
+        let first = windows::register(&model, &updates, cx.weak_entity(), window, cx);
+        if first {
+            Self::start_app_services(prompts_rx, model.clone(), cx);
+        }
 
         let hosts = cx.new(|cx| HostsView::new(model.clone(), window, cx));
         let keychain = cx.new(|cx| KeychainView::new(model.clone(), window, cx));
@@ -469,14 +453,26 @@ impl AppView {
                 cx.notify();
             }),
             cx.subscribe_in(&model, window, |this, _, ev: &ModelEvent, window, cx| {
+                // Notices show up in one window only (the one used last).
+                let notices = windows::is_notice_window(window, cx);
                 match ev {
-                    ModelEvent::Toast(kind, msg) => ui::notify(window, cx, *kind, msg.clone()),
-                    ModelEvent::Server(v) if v["type"] == "ai" => this.on_ai_event(v, window, cx),
+                    ModelEvent::Toast(kind, msg) if notices => {
+                        ui::notify(window, cx, *kind, msg.clone())
+                    }
+                    ModelEvent::Server(v) if v["type"] == "ai" && notices => {
+                        this.on_ai_event(v, window, cx)
+                    }
                     // When starting signed in or when signing in: the running
-                    // sessions, as dormant tabs.
-                    ModelEvent::SessionChanged => this.restore_cloud_tabs(true, window, cx),
+                    // sessions, as dormant tabs (in the first window).
+                    ModelEvent::SessionChanged => {
+                        let add_tabs = windows::is_first_window(window, cx);
+                        this.restore_cloud_tabs(add_tabs, window, cx)
+                    }
                     ModelEvent::Server(v) if v["type"] == "session" => {
                         this.restore_cloud_tabs(false, window, cx);
+                        if !notices {
+                            return;
+                        }
                         if v["notice"]["type"] == "session_closed"
                             && let Some(id) = v["notice"]["session_id"]
                                 .as_str()
@@ -492,7 +488,12 @@ impl AppView {
                 }
             }),
             cx.subscribe_in(&updates, window, |this, _, ev: &UpdateEvent, window, cx| {
-                this.on_update_event(ev, window, cx);
+                if windows::is_notice_window(window, cx) {
+                    this.on_update_event(ev, window, cx);
+                }
+            }),
+            cx.observe_window_activation(window, |_, window, cx| {
+                windows::set_active(window, window.is_window_active(), cx);
             }),
         ];
         subs.push(cx.subscribe_in(&hosts, window, Self::on_open_request));
@@ -527,46 +528,77 @@ impl AppView {
             copilot_open: false,
             copilots: HashMap::new(),
             cloud_sessions: 0,
-            notifier: Notifier::default(),
             focus: cx.focus_handle(),
             _subs: subs,
         };
-        // A click on a notification of the system: the window comes to the
-        // front with what it was about.
-        let app = cx.weak_entity();
-        let handle = window.window_handle();
-        cx.on_system_notification_response(move |response, cx| {
-            let Some(app) = app.upgrade() else { return };
-            let _ = handle.update(cx, |_, window, cx| {
-                app.update(cx, |app, cx| {
-                    app.on_notification_click(&response.tag, window, cx)
-                });
-            });
-        });
         // macOS asks for permission once; before the first notice, so that
         // one is not lost.
-        if view.model.read(cx).settings.notifications.enabled {
+        if first && view.model.read(cx).settings.notifications.enabled {
             notifications::request_authorization();
         }
-        // If the server session was already restored, the event will not come.
+        // If the server session was already restored, the event will not
+        // come. Only the first window gets the dormant tabs; a new one starts
+        // empty.
         if logged_in {
-            view.restore_cloud_tabs(true, window, cx);
+            view.restore_cloud_tabs(first, window, cx);
         }
-        // `termoak://` links opened from outside (at startup or later).
-        if let Some(mut links) = crate::links::take_receiver() {
-            cx.spawn_in(window, async move |this, cx| {
-                while let Some(link) = links.recv().await {
-                    if this
-                        .update_in(cx, |app, window, cx| app.open_link(&link, window, cx))
-                        .is_err()
-                    {
-                        break;
-                    }
+        view
+    }
+
+    /// What exists once for the whole app, set up by the first window and
+    /// shared by every window (see `windows.rs`): the authentication
+    /// questions, the links opened from outside, the clicks on
+    /// notifications of the system and the AI that runs on this computer.
+    fn start_app_services(
+        prompts_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PromptRequest>>,
+        model: Entity<AppModel>,
+        cx: &mut Context<Self>,
+    ) {
+        // Questions of the SSH engine: in the window in use.
+        if let Some(mut rx) = prompts_rx {
+            cx.spawn(async move |_, cx| {
+                while let Some(req) = rx.recv().await {
+                    cx.update(|cx| windows::show_prompt(req, cx));
                 }
             })
             .detach();
         }
-        view
+        // `termoak://` links opened from outside (at startup or later).
+        if let Some(mut links) = crate::links::take_receiver() {
+            cx.spawn(async move |_, cx| {
+                while let Some(link) = links.recv().await {
+                    cx.update(|cx| {
+                        windows::with_notice_window(cx, |app, window, cx| {
+                            app.open_link(&link, window, cx)
+                        })
+                    });
+                }
+            })
+            .detach();
+        }
+        // A click on a notification of the system: the window comes to the
+        // front with what it was about.
+        cx.on_system_notification_response(|response, cx| {
+            windows::notification_clicked(&response.tag, cx)
+        });
+
+        // The AI that runs on this computer: its tools reach the terminals
+        // of every window through these requests.
+        let (terminals, mut term_rx) = LocalTerminals::new();
+        let store = model.read(cx).ws.store.clone();
+        let rt = runtime::handle(cx);
+        let local_ai = {
+            let _rt = rt.enter();
+            Arc::new(LocalAi::new(store, Arc::new(terminals)))
+        };
+        cx.set_global(LocalAiGlobal(local_ai.clone()));
+        Self::start_local_engine(local_ai, model, cx);
+        cx.spawn(async move |_, cx| {
+            while let Some(req) = term_rx.recv().await {
+                cx.update(|cx| windows::answer_terminal(req, cx));
+            }
+        })
+        .detach();
     }
 
     /// A `termoak://` (or web join) link: join a shared session or sign up
@@ -725,11 +757,9 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let session_id = notice.session_id();
-        let watching = self.tabs.iter().any(|t| {
-            matches!(t.content, TabContent::Terminal(_))
-                && t.server_sessions(cx).contains(&session_id)
-        });
-        if watching {
+        if self.has_session(session_id, cx)
+            || windows::session_open_elsewhere(session_id, cx.entity_id(), cx)
+        {
             return;
         }
         if notice.needs_owner() {
@@ -810,44 +840,52 @@ impl AppView {
 
     /// Posts a notice as a notification of the system if the window is in
     /// the background and its kind is on in Settings (see `notifications`).
+    /// (Any window of the app in front counts: the toast is enough.)
     fn notify_system(&mut self, notice: Notice, window: &Window, cx: &mut Context<Self>) {
         let prefs = self.model.read(cx).settings.notifications;
-        if let Some(n) =
-            self.notifier
-                .admit(&prefs, notice, window.is_window_active(), Instant::now())
-        {
+        let active = window.is_window_active() || windows::any_active(cx);
+        let admitted = cx.try_global::<windows::AppWindows>().is_some().then(|| {
+            cx.global_mut::<windows::AppWindows>().notifier.admit(
+                &prefs,
+                notice,
+                active,
+                Instant::now(),
+            )
+        });
+        if let Some(n) = admitted.flatten() {
             cx.show_system_notification(n);
         }
     }
 
-    /// A notification of the system was clicked: the window comes to the
-    /// front and opens what it was about.
-    fn on_notification_click(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// A notification of the system was clicked (`windows.rs` picks the
+    /// window): it comes to the front and opens what it was about.
+    pub fn open_notification_target(
+        &mut self,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.activate(true);
         window.activate_window();
-        match self.notifier.clicked(tag) {
-            Some(Target::Terminal(id)) => self.show_terminal(id, window, cx),
-            Some(Target::Session { session_id, title }) => {
+        match target {
+            Target::Terminal(id) => self.show_terminal(id, window, cx),
+            Target::Session { session_id, title } => {
                 self.open(OpenRequest::Attach { session_id, title }, window, cx)
             }
-            Some(Target::AiTask(task_id)) => {
+            Target::AiTask(task_id) => {
                 self.select_section(Section::Ai, window, cx);
                 self.ai.update(cx, |v, cx| v.open_task(task_id, window, cx));
             }
-            None => {}
         }
     }
 
     /// Starts the engine of the AI tasks on this computer and passes its
     /// events on like the server's (marked `"local"`).
-    fn start_local_engine(
-        local_ai: Arc<LocalAi>,
-        model: Entity<AppModel>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_local_engine(local_ai: Arc<LocalAi>, model: Entity<AppModel>, cx: &mut Context<Self>) {
         let started = runtime::spawn(cx, async move { local_ai.start_engine().await });
-        cx.spawn_in(window, async move |_, cx| {
+        // Not tied to a window: it keeps going while any window is open.
+        let model = model.downgrade();
+        cx.spawn(async move |_, cx| {
             let engine = match started.await {
                 Ok(e) => e,
                 Err(e) => {
@@ -870,10 +908,9 @@ impl AppView {
                 v["type"] = "ai".into();
                 // The window shows its notices (`on_ai_event`).
                 v["local"] = true.into();
-                let alive = cx
-                    .update(|_, cx| {
-                        model.update(cx, |_, cx| cx.emit(ModelEvent::Server(v)));
-                    })
+                // The model goes away with the last window.
+                let alive = model
+                    .update(cx, |_, cx| cx.emit(ModelEvent::Server(v)))
                     .is_ok();
                 if !alive {
                     break;
@@ -883,8 +920,8 @@ impl AppView {
         .detach();
     }
 
-    /// Every open terminal (all the panes of every tab).
-    fn all_terminals(&self) -> Vec<Entity<TerminalView>> {
+    /// Every open terminal of this window (all the panes of every tab).
+    pub fn terminals(&self) -> Vec<Entity<TerminalView>> {
         self.tabs
             .iter()
             .filter_map(Tab::panes)
@@ -892,51 +929,17 @@ impl AppView {
             .collect()
     }
 
-    /// Answers the local AI about the open terminals.
-    fn answer_terminal(&mut self, req: TermRequest, cx: &mut Context<Self>) {
-        let terms = self.all_terminals();
-        let find = |id: Id, cx: &App| terms.iter().find(|t| t.read(cx).ai_id() == id).cloned();
-        let missing = |id: Id| format!("there is no open terminal {id}; use list_sessions");
-        match req {
-            TermRequest::List(reply) => {
-                let list = terms
-                    .iter()
-                    .map(|t| {
-                        let v = t.read(cx);
-                        let host_id = match v.kind() {
-                            TermKind::Local { host_id } => Some(*host_id),
-                            TermKind::Server { host_id, .. } => *host_id,
-                            _ => None,
-                        };
-                        termoak_ai::SessionSummary {
-                            id: v.ai_id(),
-                            title: v.title(cx).to_string(),
-                            host_id,
-                            status: v.ai_status().into(),
-                            viewers: 1,
-                        }
-                    })
-                    .collect();
-                let _ = reply.send(list);
-            }
-            TermRequest::Read {
-                id,
-                max_chars,
-                reply,
-            } => {
-                let res = find(id, cx)
-                    .map(|t| screen_tail(&t.read(cx).screen_text(), max_chars))
-                    .ok_or_else(|| missing(id));
-                let _ = reply.send(res);
-            }
-            TermRequest::Type { id, input, reply } => {
-                let res = match find(id, cx) {
-                    Some(t) => t.update(cx, |t, cx| t.ai_type(&input, cx)),
-                    None => Err(missing(id)),
-                };
-                let _ = reply.send(res);
-            }
-        }
+    /// The terminal `id` is in a tab of this window.
+    pub fn has_terminal(&self, id: EntityId) -> bool {
+        self.find_pane(id).is_some()
+    }
+
+    /// The server session is open in a terminal of this window.
+    pub fn has_session(&self, session_id: Id, cx: &App) -> bool {
+        self.tabs.iter().any(|t| {
+            matches!(t.content, TabContent::Terminal(_))
+                && t.server_sessions(cx).contains(&session_id)
+        })
     }
 
     /// Fetches the server sessions. With `add_tabs`, own running sessions
@@ -997,11 +1000,13 @@ impl AppView {
                     this.drop_dormant(id);
                 }
                 if add_tabs {
+                    let me = cx.entity_id();
                     for (session_id, title) in running {
                         let open = this
                             .tabs
                             .iter()
-                            .any(|t| t.server_sessions(cx).contains(&session_id));
+                            .any(|t| t.server_sessions(cx).contains(&session_id))
+                            || windows::session_open_elsewhere(session_id, me, cx);
                         if !open {
                             let id = this.next_id;
                             this.next_id += 1;
@@ -1359,7 +1364,11 @@ impl AppView {
                     cx,
                 );
                 let key = notifications::request_key(*kind == RequestKind::Join, *participant);
-                if let Some(tag) = self.notifier.forget(&key) {
+                let tag = cx
+                    .try_global::<windows::AppWindows>()
+                    .is_some()
+                    .then(|| cx.global_mut::<windows::AppWindows>().notifier.forget(&key));
+                if let Some(tag) = tag.flatten() {
                     cx.dismiss_system_notification(&tag);
                 }
             }
@@ -1718,7 +1727,8 @@ impl AppView {
         };
         let req = match &self.tabs[ix].content {
             TabContent::Terminal(p) => duplicate_request(p.focused().read(cx).kind()),
-            TabContent::Dormant { .. } | TabContent::Sftp(_) => None,
+            TabContent::Sftp(s) => Some(s.read(cx).duplicate_request()),
+            TabContent::Dormant { .. } => None,
         };
         match req {
             Some(req) => self.open(req, window, cx),
@@ -1765,7 +1775,11 @@ impl AppView {
             selection: term.is_some_and(|t| t.has_selection()),
             ended: term.is_some_and(|t| t.ended()),
             host: term.is_some_and(|t| t.host().is_some()),
-            duplicable: term.is_some_and(|t| duplicate_request(t.kind()).is_some()),
+            duplicable: term.is_some_and(|t| duplicate_request(t.kind()).is_some())
+                || self
+                    .active
+                    .and_then(|i| self.tabs.get(i))
+                    .is_some_and(|t| matches!(t.content, TabContent::Sftp(_))),
             any_tab: !self.tabs.is_empty(),
             updates: self.updates.read(cx).status != UpdateStatus::Disabled,
         }
@@ -2215,6 +2229,7 @@ impl AppView {
         weak: gpui::WeakEntity<Self>,
         tab_id: usize,
         is_terminal: bool,
+        can_duplicate: bool,
         others: Vec<(usize, SharedString)>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
@@ -2233,7 +2248,7 @@ impl AppView {
             .item(
                 PopupMenuItem::new(t!("app.tab.duplicate"))
                     .icon(ui::icon(IconName::CopyPlus))
-                    .disabled(!is_terminal)
+                    .disabled(!can_duplicate)
                     .on_click(move |_, window, cx| {
                         if let Some(app) = w2.upgrade() {
                             app.update(cx, |this, cx| this.duplicate_tab(tab_id, window, cx));
@@ -2363,6 +2378,7 @@ impl AppView {
             };
             let tab_id = tab.id;
             let is_terminal = matches!(tab.content, TabContent::Terminal(_));
+            let can_duplicate = !matches!(tab.content, TabContent::Dormant { .. });
             let others: Vec<(usize, SharedString)> = terminal_tabs
                 .iter()
                 .filter(|(id, _)| *id != tab_id)
@@ -2455,6 +2471,7 @@ impl AppView {
                             weak.clone(),
                             tab_id,
                             is_terminal,
+                            can_duplicate,
                             others.clone(),
                             window,
                             cx,

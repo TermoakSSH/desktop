@@ -2,7 +2,8 @@
 //! passwords, passphrases and 2FA codes (keyboard-interactive).
 //!
 //! The SSH engine runs on tokio and asks through [`DesktopPrompter`]; the
-//! question travels through a channel to the window, which opens a dialog
+//! question travels through a channel to the window in use (see
+//! `windows.rs`), which opens a dialog
 //! and sends the answer back through a `oneshot`. Closing the dialog is the
 //! same as cancelling.
 
@@ -11,7 +12,7 @@ use std::rc::Rc;
 
 use async_trait::async_trait;
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    App, AppContext, Entity, IntoElement, ParentElement, SharedString, Styled, Window, div,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, v_flex};
@@ -122,22 +123,6 @@ impl AuthPrompter for DesktopPrompter {
         });
         rx.await.ok().flatten()
     }
-}
-
-/// Handles the questions in the given window (one after another).
-pub fn listen<T: 'static>(
-    mut rx: mpsc::UnboundedReceiver<PromptRequest>,
-    window: &Window,
-    cx: &mut Context<T>,
-) {
-    cx.spawn_in(window, async move |_, cx| {
-        while let Some(req) = rx.recv().await {
-            if cx.update(|window, cx| show(req, window, cx)).is_err() {
-                break;
-            }
-        }
-    })
-    .detach();
 }
 
 /// Single-use answer shared by the buttons of the dialog.

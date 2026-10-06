@@ -161,6 +161,15 @@ impl SftpView {
         self.title.clone()
     }
 
+    /// What opens another browser of the same host ("Duplicate session"),
+    /// reusing its SSH connection while it is open (no new login).
+    pub fn duplicate_request(&self) -> crate::views::OpenRequest {
+        crate::views::OpenRequest::Sftp {
+            host_id: self.host_id,
+            conn: self.ssh.clone().filter(|c| !c.is_closed()),
+        }
+    }
+
     /// Closes the SFTP session.
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         if let Conn::Ready(sftp) =

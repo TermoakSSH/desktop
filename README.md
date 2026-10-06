@@ -264,7 +264,8 @@ AppImage (Linux) and `.app` packed in a `.tar.gz` (macOS). See
 | Find in the terminal | Ctrl+Shift+F | Cmd+F |
 | Clear the terminal | Ctrl+Shift+K | Cmd+K |
 | Settings | Ctrl+, | Cmd+, |
-| New host | Ctrl+Shift+N | Cmd+N |
+| New window (its own tabs, same data) | File menu (☰) | Cmd+N |
+| New host | Ctrl+Shift+N | Cmd+Shift+N |
 | Split view: add a terminal | Ctrl+Shift+D | Cmd+D |
 | Move between panes | Ctrl+Alt+arrows | Cmd+Option+arrows |
 | Focus mode | Ctrl+Shift+M | Cmd+Shift+M |

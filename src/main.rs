@@ -9,7 +9,8 @@
 //!    once (`termoak_client::vault::load_or_create_key`); if the keychain
 //!    refuses and there is already data, an error screen offers to try
 //!    again instead of inventing a key.
-//! 4. The interface language is chosen and the window is opened.
+//! 4. The interface language is chosen and the window is opened (File →
+//!    New window opens more on the same data, see `windows.rs`).
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -39,6 +40,7 @@ mod theme;
 mod ui;
 mod update;
 mod views;
+mod windows;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,7 +126,7 @@ fn main() {
                 let prompter = Arc::new(prompter);
                 let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
                 let updates = cx.new(|cx| UpdateModel::new(updater, cx));
-                let view = cx.new(|cx| AppView::new(model, updates, prompts_rx, window, cx));
+                let view = cx.new(|cx| AppView::new(model, updates, Some(prompts_rx), window, cx));
                 window.focus(&view.focus_handle(cx), cx);
                 cx.new(|cx| Root::new(view, window, cx))
             }),
