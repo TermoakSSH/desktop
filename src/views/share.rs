@@ -29,17 +29,19 @@ use crate::state::{AppModel, ToastKind, api_error};
 use crate::terminal::TerminalView;
 use crate::ui::{self, Choice, ChoiceState, IconName};
 
-/// Opens the dialog to share the session `session_id`. `terminal` is the
-/// tab shared from this computer (for "Stop sharing").
+/// Opens the dialog to share the session `session_id` of the account of
+/// `api`. `terminal` is the tab shared from this computer (for "Stop
+/// sharing").
 pub fn open(
     model: Entity<AppModel>,
+    api: Option<ApiClient>,
     session_id: Id,
     terminal: Option<WeakEntity<TerminalView>>,
     is_relay: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(api) = model.read(cx).api.clone() else {
+    let Some(api) = api else {
         ui::notify(window, cx, ToastKind::Warning, t!("share.need_login"));
         return;
     };

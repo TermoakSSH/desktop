@@ -1,6 +1,8 @@
 //! Sections of the main window.
 
+pub mod accounts;
 pub mod activity;
+pub mod add_account;
 pub mod admin;
 pub mod ai;
 pub mod ai_chat;
@@ -20,7 +22,10 @@ pub mod sftp;
 pub mod share;
 pub mod snippets;
 pub mod teams;
+pub mod transfer;
 pub mod two_factor;
+pub mod upload;
+pub mod vaults;
 
 use std::sync::Arc;
 
@@ -32,10 +37,15 @@ use termoak_ssh::Connection;
 pub enum OpenRequest {
     /// SSH terminal from this computer.
     Local { host_id: Id },
-    /// Terminal that lives on the server.
+    /// Terminal that lives on the server (the host's account; This device
+    /// hosts: the current account).
     Server { host_id: Id },
-    /// Attach to a server session.
-    Attach { session_id: Id, title: String },
+    /// Attach to a server session of an account (`None`: the current one).
+    Attach {
+        session_id: Id,
+        title: String,
+        account: Option<Id>,
+    },
     /// Join a session shared with a link (maybe on another server).
     JoinLink {
         session_id: Id,

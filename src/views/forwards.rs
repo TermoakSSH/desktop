@@ -15,10 +15,10 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use termoak_core::Id;
-use termoak_core::model::{ForwardKind, PortForward, Record, SecretUpdate};
+use termoak_core::model::{ForwardKind, PortForward, SecretUpdate};
 
 use super::OpenRequest;
-use crate::state::AppModel;
+use crate::state::{AppModel, Item};
 use crate::ui::{self, Choice, IconName};
 
 pub struct ForwardsView {
@@ -69,18 +69,25 @@ impl ForwardsView {
 
     fn edit(
         &mut self,
-        rec: Option<Record<PortForward>>,
+        rec: Option<Item<PortForward>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let data = rec.map(|r| r.data);
-        let hosts: Vec<Choice<Option<Id>>> = self
-            .model
-            .read(cx)
-            .hosts
-            .iter()
-            .map(|h| Choice::new(h.data.label.clone(), Some(h.data.id)))
-            .collect();
+        // An existing tunnel stays in its place: only hosts it may reference
+        // (same vault, or This device). A new one goes where its host is.
+        let place = {
+            let m = self.model.read(cx);
+            rec.as_ref().map(|r| (r.scope, m.vault_of(r)))
+        };
+        let data = rec.map(|r| r.rec.data);
+        let hosts: Vec<Choice<Option<Id>>> = {
+            let m = self.model.read(cx);
+            m.hosts
+                .iter()
+                .filter(|h| place.is_none_or(|p| m.fits_place(h, p)))
+                .map(|h| Choice::new(h.data.label.clone(), Some(h.data.id)))
+                .collect()
+        };
         if hosts.is_empty() {
             ui::error(window, cx, t!("forwards.error.no_hosts"));
             return;
@@ -273,7 +280,15 @@ impl ForwardsView {
                     },
                     auto_start: *a2.read(cx),
                 };
-                let task = model.update(cx, |m, cx| m.save(forward, SecretUpdate::Keep, None, cx));
+                let task = model.update(cx, |m, cx| {
+                    let target = (forward.id.is_nil())
+                        .then(|| m.host_record(forward.host_id).map(|h| m.target_of(h)))
+                        .flatten();
+                    match target {
+                        Some(t) => m.save_to(t, forward, SecretUpdate::Keep, None, cx),
+                        None => m.save(forward, SecretUpdate::Keep, None, cx),
+                    }
+                });
                 window
                     .spawn(cx, async move |cx| {
                         if let Err(e) = task.await {
@@ -286,7 +301,7 @@ impl ForwardsView {
         );
     }
 
-    fn delete(&mut self, rec: Record<PortForward>, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete(&mut self, rec: Item<PortForward>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
             window,
@@ -314,17 +329,23 @@ impl ForwardsView {
 impl Render for ForwardsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let m = self.model.read(cx);
-        let forwards = m.forwards.clone();
+        let forwards: Vec<Item<PortForward>> = m
+            .forwards
+            .iter()
+            .filter(|f| m.in_filter(f))
+            .cloned()
+            .collect();
         let rows: Vec<_> = forwards
             .into_iter()
             .map(|rec| {
+                let editable = m.caps_of(&rec).edit;
                 let running = m
                     .running_forwards
                     .get(&rec.data.id)
                     .map(|r| (r.bound_port, r.stats()));
                 let starting = m.starting_forwards.contains(&rec.data.id);
                 let host = m.host_label(rec.data.host_id);
-                (rec, running, starting, host)
+                (rec, running, starting, host, editable)
             })
             .collect();
         let theme = cx.theme();
@@ -340,7 +361,7 @@ impl Render for ForwardsView {
             v_flex()
                 .gap_2()
                 .children(rows.into_iter().enumerate().map(
-                    |(i, (rec, running, starting, host))| {
+                    |(i, (rec, running, starting, host, editable))| {
                         let f = rec.data.clone();
                         let bind = format!("{}:{}", f.bind_address, f.bind_port);
                         let dest = format!(
@@ -455,28 +476,30 @@ impl Render for ForwardsView {
                                         this.model.update(cx, |m, cx| m.start_forward(f, None, cx));
                                     }))
                             })
-                            .child(
-                                Button::new(("edit-forward", i))
-                                    .small()
-                                    .ghost()
-                                    .icon(ui::icon(IconName::Pencil))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.edit(Some(r_edit.clone()), window, cx)
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new(("delete-forward", i))
-                                    .small()
-                                    .ghost()
-                                    .icon(ui::icon(IconName::Trash))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.delete(r_del.clone(), window, cx)
-                                        },
-                                    )),
-                            )
+                            .when(editable, |this| {
+                                this.child(
+                                    Button::new(("edit-forward", i))
+                                        .small()
+                                        .ghost()
+                                        .icon(ui::icon(IconName::Pencil))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, window, cx| {
+                                                this.edit(Some(r_edit.clone()), window, cx)
+                                            },
+                                        )),
+                                )
+                                .child(
+                                    Button::new(("delete-forward", i))
+                                        .small()
+                                        .ghost()
+                                        .icon(ui::icon(IconName::Trash))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, window, cx| {
+                                                this.delete(r_del.clone(), window, cx)
+                                            },
+                                        )),
+                                )
+                            })
                     },
                 ))
                 .into_any_element()

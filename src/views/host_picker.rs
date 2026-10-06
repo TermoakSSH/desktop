@@ -292,7 +292,7 @@ impl HostPicker {
         };
         let task = self
             .model
-            .update(cx, |m, cx| m.save_host(host, None, None, None, cx));
+            .update(cx, |m, cx| m.save_host(host, None, None, None, None, cx));
         let app = self.app.clone();
         let pane = self.mode == PickMode::Pane;
         window

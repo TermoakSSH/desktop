@@ -5,6 +5,9 @@
 //! - admin: also rename and manage members (without touching the owners);
 //! - owner (or server administrator): everything, including deleting the
 //!   team and appointing owners.
+//!
+//! The "Vaults" tab lists the team's vaults (team owners and admins create
+//! them); deleting a team says which vaults go with it.
 
 use gpui::{
     AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -15,11 +18,14 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::select::Select;
+use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use serde_json::{Value, json};
 use termoak_core::Id;
 use termoak_core::model::{Team, TeamMember, TeamRole};
 
+use super::vaults;
+use crate::accounts::VaultEntry;
 use crate::runtime;
 use crate::state::{AppModel, ModelEvent, api_error};
 use crate::theme;
@@ -88,9 +94,17 @@ impl Permissions {
     }
 }
 
+/// Tabs of a team.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamTab {
+    Members,
+    Vaults,
+}
+
 pub struct TeamsView {
     model: Entity<AppModel>,
     selected: Option<Id>,
+    tab: TeamTab,
     members: Vec<TeamMember>,
     loading_members: bool,
     members_error: Option<String>,
@@ -143,6 +157,7 @@ impl TeamsView {
         Self {
             model,
             selected: None,
+            tab: TeamTab::Members,
             members: Vec::new(),
             loading_members: false,
             members_error: None,
@@ -393,11 +408,28 @@ impl TeamsView {
 
     fn delete_team(&mut self, team: Team, window: &mut Window, cx: &mut Context<Self>) {
         let weak = cx.entity().downgrade();
+        // Deleting a team deletes its vaults and their items.
+        let vaults = self.team_vaults(team.id, cx);
+        let items: i64 = vaults.iter().map(VaultEntry::item_count).sum();
+        let message = if vaults.is_empty() {
+            t!("teams.delete_confirm", name = team.name.clone())
+        } else {
+            t!(
+                "teams.delete_confirm_vaults",
+                name = team.name.clone(),
+                vaults = vaults
+                    .iter()
+                    .map(VaultEntry::label)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                items = items
+            )
+        };
         ui::confirm(
             window,
             cx,
             t!("teams.delete_title"),
-            t!("teams.delete_confirm", name = team.name),
+            message,
             t!("teams.delete"),
             true,
             move |window, cx| {
@@ -618,6 +650,139 @@ impl TeamsView {
                         None if admin => ui::pill(t!("teams.server_admin_short"), theme.info),
                         None => ui::pill("—", theme.muted_foreground),
                     })
+            }))
+            .into_any_element()
+    }
+
+    /// Vaults of a team, as the current account sees them.
+    fn team_vaults(&self, team: Id, cx: &gpui::App) -> Vec<VaultEntry> {
+        let m = self.model.read(cx);
+        m.current_account
+            .and_then(|a| m.account(a))
+            .map(|a| {
+                a.vaults
+                    .iter()
+                    .filter(|v| v.vault.owner_team_id == Some(team))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// "Vaults" tab: the team's vaults, a new one (team owners and admins).
+    fn render_vaults(
+        &self,
+        team: &Team,
+        can_create: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let m = self.model.read(cx);
+        let account = m.current_account;
+        let supported = account
+            .and_then(|a| m.account(a))
+            .is_some_and(|a| a.vaults_supported());
+        let vaults = self.team_vaults(team.id, cx);
+        let model = self.model.clone();
+        if !supported {
+            return div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(t!("accounts.no_vaults"))
+                .into_any_element();
+        }
+        let team2 = team.clone();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("teams.vaults_hint")),
+                    )
+                    .when(can_create, |this| {
+                        let model = model.clone();
+                        this.child(
+                            Button::new("team-new-vault")
+                                .small()
+                                .primary()
+                                .icon(ui::icon(IconName::Plus))
+                                .label(t!("vaults.new"))
+                                .on_click(move |_: &ClickEvent, window, cx| {
+                                    if let Some(a) = account {
+                                        vaults::open_create(
+                                            model.clone(),
+                                            a,
+                                            Some(team2.clone()),
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                }),
+                        )
+                    }),
+            )
+            .when(vaults.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("teams.no_vaults")),
+                )
+            })
+            .children(vaults.into_iter().enumerate().map(|(i, v)| {
+                let model = model.clone();
+                let (acc, vid) = (v.account, v.id());
+                h_flex()
+                    .gap_3()
+                    .p_3()
+                    .items_center()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        ui::icon(vaults::vault_icon(&v.vault))
+                            .size(px(18.))
+                            .text_color(vaults::vault_color(&v.vault)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(div().font_semibold().text_sm().child(v.label()))
+                                    .child(ui::pill(vaults::role_label(v.role()), theme.primary))
+                                    .when(v.strict(), |this| {
+                                        this.child(ui::pill(
+                                            t!("vaults.strict_badge"),
+                                            theme.warning,
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(vaults::counts_text(&v.vault)),
+                            ),
+                    )
+                    .child(
+                        Button::new(("team-vault-manage", i))
+                            .small()
+                            .icon(ui::icon(IconName::Settings))
+                            .label(t!("vaults.manage"))
+                            .on_click(move |_: &ClickEvent, window, cx| {
+                                vaults::open_manage(model.clone(), acc, vid, window, cx)
+                            }),
+                    )
             }))
             .into_any_element()
     }
@@ -853,9 +1018,34 @@ impl TeamsView {
                 })
         });
 
+        let tabs = TabBar::new("team-tabs")
+            .selected_index(match self.tab {
+                TeamTab::Members => 0,
+                TeamTab::Vaults => 1,
+            })
+            .child(Tab::new().label(t!("teams.members")))
+            .child(Tab::new().label(t!("teams.vaults")))
+            .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                this.tab = if *ix == 1 {
+                    TeamTab::Vaults
+                } else {
+                    TeamTab::Members
+                };
+                cx.notify();
+            }));
+        if self.tab == TeamTab::Vaults {
+            let vaults = self.render_vaults(&team, perms.rename, cx);
+            return v_flex()
+                .gap_5()
+                .child(header)
+                .child(tabs)
+                .child(vaults)
+                .into_any_element();
+        }
         v_flex()
             .gap_5()
             .child(header)
+            .child(tabs)
             .children(add)
             .child(
                 v_flex()

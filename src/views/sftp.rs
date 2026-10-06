@@ -195,14 +195,17 @@ impl SftpView {
             async move {
                 let conn = match existing {
                     Some(c) => c,
-                    None => ws.connect(host_id, prompter, use_agent).await?,
+                    None => ws
+                        .connect(host_id, prompter, use_agent)
+                        .await
+                        .map_err(crate::state::api_error)?,
                 };
                 let sftp = conn
                     .sftp()
                     .await
-                    .map_err(termoak_client::ClientError::from)?;
+                    .map_err(|e| crate::state::api_error(termoak_client::ClientError::from(e)))?;
                 let home = sftp.home().await.unwrap_or_else(|_| "/".into());
-                Ok::<_, termoak_client::ClientError>((conn, Arc::new(sftp), home))
+                Ok::<_, String>((conn, Arc::new(sftp), home))
             },
             |this, res, window, cx| {
                 match res {

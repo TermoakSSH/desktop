@@ -6,6 +6,13 @@
 //!
 //! Keyboard: Enter saves, Ctrl+Enter (⌘↩ on macOS) saves and connects and
 //! Escape closes the panel.
+//!
+//! The "Vault" field says where the host lives: chosen when creating it
+//! (default: the vault of the picker, the last one used or the personal
+//! one), read-only afterwards with "Move to…" and "Copy to…". Groups, keys,
+//! identities, jumps and the startup snippet are offered from the same
+//! vault (and This device). A Use-only host opens read-only, without its
+//! secrets.
 
 use std::collections::BTreeMap;
 
@@ -18,14 +25,17 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::select::Select;
+use gpui_component::select::{Select, SelectEvent};
 use gpui_component::switch::Switch;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
+use termoak_client::{SaveTarget, Scope};
 use termoak_core::Id;
-use termoak_core::model::{Host, HostSettings, ProxyKind, ProxySettings, Record, SyncMode};
+use termoak_core::model::{Host, HostSettings, ProxyKind, ProxySettings, SyncMode};
+use termoak_core::transfer::TransferMode;
 
 use super::OpenRequest;
-use crate::state::AppModel;
+use crate::accounts::{self as vm, Destination};
+use crate::state::{AppModel, Item};
 use crate::theme;
 use crate::ui::{self, Choice, ChoiceState, IconName};
 
@@ -246,9 +256,93 @@ fn same_color(a: &str, b: &str) -> bool {
         .eq_ignore_ascii_case(b.trim().trim_start_matches('#'))
 }
 
+/// Where a new host goes, as a save target.
+fn save_target(d: &Destination) -> SaveTarget {
+    match d.scope {
+        Scope::Device => SaveTarget::Device,
+        Scope::Account(account) => SaveTarget::Account {
+            account,
+            vault: d.vault,
+        },
+    }
+}
+
+/// Index of the destination matching a save target.
+fn destination_index(list: &[Destination], target: SaveTarget) -> usize {
+    list.iter()
+        .position(|d| match target {
+            SaveTarget::Device => d.scope == Scope::Device,
+            SaveTarget::Account { account, vault } => {
+                d.scope == Scope::Account(account) && (vault.is_none() || d.vault == vault)
+            }
+            SaveTarget::Auto => false,
+        })
+        .unwrap_or(0)
+}
+
+/// Choices of the references of a host in a place: items of the same vault
+/// and of This device (`None` first).
+struct RefChoices {
+    groups: Vec<Choice<Option<Id>>>,
+    identities: Vec<Choice<Option<Id>>>,
+    keys: Vec<Choice<Option<Id>>>,
+    snippets: Vec<Choice<Option<Id>>>,
+}
+
+fn ref_choices(m: &AppModel, scope: Scope, vault: Option<Id>) -> RefChoices {
+    let fits = |s: Scope, v: Option<Id>| s == Scope::Device || (s == scope && v == vault);
+    let mut groups = vec![Choice::new(t!("host_editor.no_group"), None)];
+    groups.extend(
+        m.groups
+            .iter()
+            // A group must be in the host's own vault.
+            .filter(|g| g.scope == scope && m.vault_of(g) == vault)
+            .map(|g| Choice::new(g.data.name.clone(), Some(g.data.id))),
+    );
+    let mut identities = vec![Choice::new(t!("host_editor.no_identity"), None)];
+    identities.extend(
+        m.identities
+            .iter()
+            .filter(|i| fits(i.scope, m.vault_of(i)))
+            .map(|i| {
+                Choice::new(
+                    format!("{} ({})", i.data.label, i.data.username),
+                    Some(i.data.id),
+                )
+            }),
+    );
+    let mut keys = vec![Choice::new(t!("host_editor.no_key"), None)];
+    keys.extend(
+        m.keys
+            .iter()
+            .filter(|k| fits(k.scope, m.vault_of(k)))
+            .map(|k| Choice::new(k.data.label.clone(), Some(k.data.id))),
+    );
+    let mut snippets = vec![Choice::new(t!("common.none"), None)];
+    snippets.extend(
+        m.snippets
+            .iter()
+            .filter(|s| fits(s.scope, m.vault_of(s)))
+            .map(|sn| Choice::new(sn.data.name.clone(), Some(sn.data.id))),
+    );
+    RefChoices {
+        groups,
+        identities,
+        keys,
+        snippets,
+    }
+}
+
 pub struct HostEditor {
     model: Entity<AppModel>,
-    original: Option<Record<Host>>,
+    original: Option<Item<Host>>,
+    /// New host: where it goes (`targets[i]`).
+    targets: Vec<Destination>,
+    target: Option<ChoiceState<usize>>,
+    /// Where the host is (or will be): its scope and vault.
+    place: (Scope, Option<Id>),
+    /// Use-only host: it can be used but not seen or changed.
+    read_only: bool,
     focus: FocusHandle,
     label: Entity<InputState>,
     address: Entity<InputState>,
@@ -305,41 +399,48 @@ fn input(
 impl HostEditor {
     pub fn new(
         model: Entity<AppModel>,
-        original: Option<Record<Host>>,
+        original: Option<Item<Host>>,
         default_group: Option<Id>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let h = original.as_ref().map(|r| r.data.clone());
         let s = h.as_ref().map(|h| h.settings.clone()).unwrap_or_default();
-        let has_secret = original.as_ref().is_some_and(|r| r.meta.has_secret);
+        let read_only = original.as_ref().is_some_and(|r| !r.access.can_write());
+        let has_secret = original.as_ref().is_some_and(|r| r.meta.has_secret) && !read_only;
         let m = model.read(cx);
 
-        let mut groups = vec![Choice::new(t!("host_editor.no_group"), None)];
-        groups.extend(
-            m.groups
-                .iter()
-                .map(|g| Choice::new(g.data.name.clone(), Some(g.data.id))),
-        );
-        let mut identities = vec![Choice::new(t!("host_editor.no_identity"), None)];
-        identities.extend(m.identities.iter().map(|i| {
-            Choice::new(
-                format!("{} ({})", i.data.label, i.data.username),
-                Some(i.data.id),
-            )
-        }));
-        let mut keys = vec![Choice::new(t!("host_editor.no_key"), None)];
-        keys.extend(
-            m.keys
-                .iter()
-                .map(|k| Choice::new(k.data.label.clone(), Some(k.data.id))),
-        );
-        let mut snippets = vec![Choice::new(t!("common.none"), None)];
-        snippets.extend(
-            m.snippets
-                .iter()
-                .map(|sn| Choice::new(sn.data.name.clone(), Some(sn.data.id))),
-        );
+        // Where it is, or where a new one goes.
+        let (targets, target_ix, place) = match &original {
+            Some(r) => (Vec::new(), 0, (r.scope, m.vault_of(r))),
+            None => {
+                let accounts: Vec<_> = m
+                    .accounts_in_view()
+                    .into_iter()
+                    .map(|a| a.info.clone())
+                    .collect();
+                let targets = vm::destinations(&accounts, &m.vaults_in_view(), true);
+                let ix = destination_index(&targets, m.new_item_target());
+                let place = targets
+                    .get(ix)
+                    .map(|d| {
+                        let personal = d
+                            .scope
+                            .account()
+                            .and_then(|a| m.account(a))
+                            .and_then(|a| a.personal());
+                        (d.scope, vm::effective_vault(d.scope, d.vault, personal))
+                    })
+                    .unwrap_or((Scope::Device, None));
+                (targets, ix, place)
+            }
+        };
+        let RefChoices {
+            groups,
+            identities,
+            keys,
+            snippets,
+        } = ref_choices(m, place.0, place.1);
         let themes = vec![
             Choice::new(t!("host_editor.theme.follow"), None),
             Choice::new(t!("host_editor.theme.dark"), Some("dark".to_string())),
@@ -459,7 +560,17 @@ impl HostEditor {
                 .masked(true)
                 .placeholder(t!("host_editor.proxy.password_placeholder"))
         });
+        // A default group of another vault does not apply.
+        let group_sel = group_sel.filter(|g| groups.iter().any(|c| c.value == Some(*g)));
         let group = ui::choice_state(groups, Some(&group_sel), window, cx);
+        let target = (targets.len() > 1).then(|| {
+            let choices: Vec<Choice<usize>> = targets
+                .iter()
+                .enumerate()
+                .map(|(i, d)| Choice::new(d.label.clone(), i))
+                .collect();
+            ui::choice_state(choices, Some(&target_ix), window, cx)
+        });
         let identity = ui::choice_state(identities, Some(&s.identity_id), window, cx);
         let key = ui::choice_state(keys, Some(&s.key_id), window, cx);
         let snippet = ui::choice_state(snippets, Some(&s.startup_snippet_id), window, cx);
@@ -519,7 +630,21 @@ impl HostEditor {
             ));
         }
 
+        if let Some(target) = &target {
+            subs.push(cx.subscribe_in(
+                target,
+                window,
+                |this, _, _: &SelectEvent<Vec<Choice<usize>>>, window, cx| {
+                    this.target_changed(window, cx)
+                },
+            ));
+        }
+
         Self {
+            targets,
+            target,
+            place,
+            read_only,
             device_only: original
                 .as_ref()
                 .is_some_and(|r| r.meta.sync_mode == SyncMode::DeviceOnly),
@@ -562,6 +687,72 @@ impl HostEditor {
 
     pub fn host_id(&self) -> Option<Id> {
         self.original.as_ref().map(|r| r.data.id)
+    }
+
+    /// The chosen destination of a new host.
+    fn destination(&self, cx: &App) -> Option<Destination> {
+        match &self.target {
+            Some(t) => ui::chosen(t, cx).and_then(|i| self.targets.get(i).cloned()),
+            None => self.targets.first().cloned(),
+        }
+    }
+
+    /// Another destination for a new host: its references come from there.
+    fn target_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = self.destination(cx) else {
+            return;
+        };
+        let place = {
+            let m = self.model.read(cx);
+            let personal = d
+                .scope
+                .account()
+                .and_then(|a| m.account(a))
+                .and_then(|a| a.personal());
+            (d.scope, vm::effective_vault(d.scope, d.vault, personal))
+        };
+        if place == self.place {
+            return;
+        }
+        self.place = place;
+        let refs = ref_choices(self.model.read(cx), place.0, place.1);
+        for (state, items) in [
+            (&self.group, refs.groups),
+            (&self.identity, refs.identities),
+            (&self.key, refs.keys),
+            (&self.snippet, refs.snippets),
+        ] {
+            state.update(cx, |s, cx| {
+                s.set_items(items, window, cx);
+                s.set_selected_value(&None, window, cx);
+            });
+        }
+        // Jumps of another vault no longer apply.
+        self.jumps.clear();
+        cx.notify();
+    }
+
+    /// "Move to…" / "Copy to…" this host.
+    fn transfer(&mut self, mode: TransferMode, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rec) = &self.original else {
+            return;
+        };
+        // The host now lives elsewhere (maybe with another id): the editor
+        // closes instead of saving over the old place.
+        let me = cx.entity().downgrade();
+        let done: super::transfer::OnDone = std::rc::Rc::new(move |_, cx| {
+            if let Some(e) = me.upgrade() {
+                e.update(cx, |_, cx| cx.emit(EditorEvent::Close));
+            }
+        });
+        super::transfer::open(
+            self.model.clone(),
+            vec![rec.item_ref()],
+            mode,
+            Some(done),
+            window,
+            cx,
+        );
     }
 
     fn clear_error(&mut self, field: Field, cx: &mut Context<Self>) {
@@ -693,6 +884,13 @@ impl HostEditor {
         if self.saving {
             return;
         }
+        if self.read_only {
+            // Use only: nothing to save; it can still be used.
+            if then_connect && let Some(id) = self.host_id() {
+                cx.emit(EditorEvent::Open(OpenRequest::Local { host_id: id }));
+            }
+            return;
+        }
         let (host, password, proxy_password, mode) = match self.build(cx) {
             Ok(v) => {
                 self.errors.clear();
@@ -714,8 +912,22 @@ impl HostEditor {
         };
         self.saving = true;
         cx.notify();
+        let target = if self.original.is_none() {
+            self.destination(cx).as_ref().map(save_target)
+        } else {
+            None
+        };
+        // "This device only" applies to This device items; in an account
+        // an item moves to This device with "Move to…".
+        let mode = if self.place.0 == Scope::Device
+            || self.original.is_none() && target == Some(SaveTarget::Device)
+        {
+            mode
+        } else {
+            SyncMode::Synced
+        };
         let task = self.model.update(cx, |m, cx| {
-            m.save_host(host, password, proxy_password, Some(mode), cx)
+            m.save_host(host, password, proxy_password, Some(mode), target, cx)
         });
         cx.spawn_in(window, async move |this, cx| {
             let res = task.await;
@@ -876,14 +1088,19 @@ impl HostEditor {
         let theme = cx.theme();
         let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret);
         let own_id = self.host_id();
-        let other_hosts: Vec<(Id, String)> = self
-            .model
-            .read(cx)
-            .hosts
-            .iter()
-            .filter(|h| Some(h.data.id) != own_id)
-            .map(|h| (h.data.id, h.data.label.clone()))
-            .collect();
+        let (scope, vault) = self.place;
+        let other_hosts: Vec<(Id, String)> = {
+            let m = self.model.read(cx);
+            m.hosts
+                .iter()
+                .filter(|h| Some(h.data.id) != own_id)
+                // Jumps of the same vault, or of This device.
+                .filter(|h| {
+                    h.scope == Scope::Device || (h.scope == scope && m.vault_of(h) == vault)
+                })
+                .map(|h| (h.data.id, h.data.label.clone()))
+                .collect()
+        };
         let jumps: AnyElement = if other_hosts.is_empty() {
             div()
                 .text_sm()
@@ -1043,7 +1260,22 @@ impl HostEditor {
 impl Render for HostEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editing = self.original.is_some();
-        let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret);
+        let read_only = self.read_only;
+        let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret) && !read_only;
+        // The "Vault" field: where it is (with Move/Copy) or where it goes.
+        let (place_label, caps, strict) = {
+            let m = self.model.read(cx);
+            match &self.original {
+                Some(r) => (
+                    m.place_label(r.scope, m.vault_of(r)),
+                    Some(m.caps_of(r)),
+                    m.vault_entry_of(r).is_some_and(|v| v.strict()),
+                ),
+                None => (String::new(), None, false),
+            }
+        };
+        let show_place = editing || self.target.is_some();
+        let device_place = self.place.0 == Scope::Device;
         let title: SharedString = if editing {
             self.original
                 .as_ref()
@@ -1141,12 +1373,57 @@ impl Render for HostEditor {
                 cx,
             ));
 
-        // Organization: group, tags and color.
+        let place_field = show_place.then(|| {
+            let control: AnyElement = match (&self.target, editing) {
+                (Some(target), false) => Select::new(target).into_any_element(),
+                _ => h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(place_label.clone()),
+                    )
+                    .when(caps.is_some_and(|c| c.move_out), |this| {
+                        this.child(
+                            Button::new("host-move-to")
+                                .xsmall()
+                                .icon(ui::icon(IconName::ArrowRightLeft))
+                                .label(t!("hosts.menu.move_to"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.transfer(TransferMode::Move, window, cx)
+                                })),
+                        )
+                    })
+                    .when(caps.is_some_and(|c| c.copy_out), |this| {
+                        this.child(
+                            Button::new("host-copy-to")
+                                .xsmall()
+                                .ghost()
+                                .icon(ui::icon(IconName::CopyPlus))
+                                .label(t!("hosts.menu.copy_to"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.transfer(TransferMode::Copy, window, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            };
+            ui::field(t!("host_editor.vault"), control, cx)
+        });
+
+        // Organization: vault, group, tags and color.
         let organize = section(
             t!("host_editor.section.general"),
             IconName::Folder,
             v_flex()
                 .gap_3()
+                .children(place_field)
                 .child(
                     h_flex()
                         .gap_2()
@@ -1188,11 +1465,13 @@ impl Render for HostEditor {
                             cx,
                         ))),
                 )
-                .child(ui::field(
-                    t!("host_editor.password"),
-                    Input::new(&self.password).mask_toggle(),
-                    cx,
-                ))
+                .when(!read_only, |this| {
+                    this.child(ui::field(
+                        t!("host_editor.password"),
+                        Input::new(&self.password).mask_toggle(),
+                        cx,
+                    ))
+                })
                 .when(has_secret, |this| {
                     this.child(
                         Checkbox::new("clear-password")
@@ -1292,53 +1571,55 @@ impl Render for HostEditor {
                             cx.notify();
                         })),
                 )
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            Switch::new("device-only")
-                                .label(t!("host_editor.device_only"))
-                                .checked(self.device_only)
-                                .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                    this.device_only = *v;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(hint(t!("host_editor.device_only_hint"), cx)),
-                ),
+                .when(device_place, |this| {
+                    this.child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("device-only")
+                                    .label(t!("host_editor.device_only"))
+                                    .checked(self.device_only)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        this.device_only = *v;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(hint(t!("host_editor.device_only_hint"), cx)),
+                    )
+                }),
             cx,
         );
 
-        let footer =
-            h_flex()
-                .p_3()
-                .gap_2()
-                .items_center()
-                .border_t_1()
-                .border_color(theme.border)
-                .when(editing, |this| {
-                    this.child(
-                        Button::new("delete-host")
-                            .ghost()
-                            .icon(ui::icon(IconName::Trash))
-                            .tooltip(t!("host_editor.delete.title"))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.delete(window, cx)
-                            })),
-                    )
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(t!("host_editor.keyboard_hint", connect = shortcut)),
+        let footer = h_flex()
+            .p_3()
+            .gap_2()
+            .items_center()
+            .border_t_1()
+            .border_color(theme.border)
+            .when(editing && !read_only, |this| {
+                this.child(
+                    Button::new("delete-host")
+                        .ghost()
+                        .icon(ui::icon(IconName::Trash))
+                        .tooltip(t!("host_editor.delete.title"))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| this.delete(window, cx)),
+                        ),
                 )
-                .child(
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("host_editor.keyboard_hint", connect = shortcut)),
+            )
+            .when(!read_only, |this| {
+                this.child(
                     Button::new("save-host")
                         .primary()
                         .icon(ui::icon(IconName::Save))
@@ -1347,7 +1628,8 @@ impl Render for HostEditor {
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.save(false, window, cx)
                         })),
-                );
+                )
+            });
 
         v_flex()
             .id("host-editor")
@@ -1366,6 +1648,27 @@ impl Render for HostEditor {
                             v_flex()
                                 .p_4()
                                 .gap_5()
+                                .when(read_only, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_start()
+                                            .p_3()
+                                            .rounded(theme.radius_lg)
+                                            .border_1()
+                                            .border_color(theme.warning)
+                                            .child(
+                                                ui::icon(IconName::Lock)
+                                                    .size(px(16.))
+                                                    .text_color(theme.warning),
+                                            )
+                                            .child(div().text_sm().child(if strict {
+                                                t!("host_editor.use_only_strict")
+                                            } else {
+                                                t!("host_editor.use_only")
+                                            })),
+                                    )
+                                })
                                 .child(identity_block)
                                 .child(ssh)
                                 .child(organize)

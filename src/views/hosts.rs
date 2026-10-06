@@ -21,12 +21,15 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuIte
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
+use termoak_client::Scope;
 use termoak_core::Id;
-use termoak_core::model::{Group, Host, HostSettings, Record, SecretUpdate};
+use termoak_core::model::{Group, Host, HostSettings, SecretUpdate};
+use termoak_core::transfer::TransferMode;
 
 use super::OpenRequest;
 use super::host_editor::{EditorEvent, HostEditor};
-use crate::state::AppModel;
+use crate::accounts::{self as vm, AccountRow, Place};
+use crate::state::{AppModel, Item};
 use crate::theme;
 use crate::ui::{self, IconName};
 
@@ -248,12 +251,7 @@ impl HostsView {
     }
 
     /// Opens the editor of a host (or an empty one to create it).
-    pub fn edit(
-        &mut self,
-        host: Option<Record<Host>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn edit(&mut self, host: Option<Item<Host>>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         let group = match self.filter {
             GroupFilter::Group(g) => Some(g),
@@ -283,7 +281,7 @@ impl HostsView {
         }
     }
 
-    fn toggle_favorite(&mut self, rec: &Record<Host>, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_favorite(&mut self, rec: &Item<Host>, window: &mut Window, cx: &mut Context<Self>) {
         let mut host = rec.data.clone();
         host.favorite = !host.favorite;
         let task = self
@@ -297,7 +295,7 @@ impl HostsView {
         .detach();
     }
 
-    fn delete_host(&mut self, rec: &Record<Host>, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_host(&mut self, rec: &Item<Host>, window: &mut Window, cx: &mut Context<Self>) {
         let id = rec.data.id;
         let label = rec.data.label.clone();
         let model = self.model.clone();
@@ -528,6 +526,35 @@ impl HostsView {
         .detach();
     }
 
+    /// "Move to…" / "Copy to…" another vault, account or This device. All
+    /// the hosts must be in the same place.
+    fn transfer(
+        &mut self,
+        ids: Vec<Id>,
+        mode: TransferMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let items: Vec<_> = {
+            let m = self.model.read(cx);
+            ids.iter()
+                .filter_map(|id| m.host_record(*id).map(Item::item_ref))
+                .collect()
+        };
+        // An open editor of a moved host would save over its old place.
+        let me = cx.entity().downgrade();
+        let done: super::transfer::OnDone = std::rc::Rc::new(move |_, cx| {
+            if let Some(v) = me.upgrade() {
+                v.update(cx, |v, cx| {
+                    v.editor = None;
+                    v.selection.clear();
+                    cx.notify();
+                });
+            }
+        });
+        super::transfer::open(self.model.clone(), items, mode, Some(done), window, cx);
+    }
+
     /// Deletes the selected hosts, after asking.
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ids = self.selection.ids().to_vec();
@@ -603,20 +630,36 @@ impl HostsView {
         let Some(this) = view.upgrade() else {
             return menu;
         };
-        let (targets, rec, groups, logged_in) = {
+        let (targets, rec, groups, server, caps, same_place, all_writable) = {
             let v = this.read(cx);
             let m = v.model.read(cx);
+            let targets = v.targets(id);
+            let rec = m.host_record(id).cloned();
+            let place = rec.as_ref().map(|r| (r.scope, m.vault_of(r)));
+            // Groups of the same place (references stay inside a vault).
+            let groups = m
+                .groups
+                .iter()
+                .filter(|g| Some((g.scope, m.vault_of(g))) == place)
+                .map(|g| (g.data.id, g.data.name.clone()))
+                .collect::<Vec<_>>();
+            let hosts: Vec<&Item<Host>> =
+                targets.iter().filter_map(|t| m.host_record(*t)).collect();
+            let same_place = hosts
+                .iter()
+                .all(|h| Some((h.scope, m.vault_of(h))) == place);
+            let all_writable = hosts.iter().all(|h| h.access.can_write());
             (
-                v.targets(id),
-                m.host_record(id).cloned(),
-                m.groups
-                    .iter()
-                    .map(|g| (g.data.id, g.data.name.clone()))
-                    .collect::<Vec<_>>(),
-                m.logged_in(),
+                targets,
+                rec.clone(),
+                groups,
+                m.api_for_host(id).is_some(),
+                rec.as_ref().map(|r| m.caps_of(r)),
+                same_place,
+                all_writable,
             )
         };
-        let Some(rec) = rec else {
+        let (Some(rec), Some(caps)) = (rec, caps) else {
             return menu;
         };
         let move_ids = targets.clone();
@@ -634,7 +677,7 @@ impl HostsView {
         };
         let current_group = rec.data.group_id;
         let move_menu = |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
-            if groups.is_empty() {
+            if groups.is_empty() || !all_writable || !same_place {
                 return menu;
             }
             let w = view.clone();
@@ -678,6 +721,30 @@ impl HostsView {
             )
         };
 
+        let transfer_items = |menu: PopupMenu, move_out: bool, copy_out: bool| {
+            if !same_place {
+                return menu;
+            }
+            menu.when(move_out, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.move_to"))
+                        .icon(ui::icon(IconName::ArrowRightLeft))
+                        .on_click(act(|v, ids, window, cx| {
+                            v.transfer(ids, TransferMode::Move, window, cx)
+                        })),
+                )
+            })
+            .when(copy_out, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.copy_to"))
+                        .icon(ui::icon(IconName::CopyPlus))
+                        .on_click(act(|v, ids, window, cx| {
+                            v.transfer(ids, TransferMode::Copy, window, cx)
+                        })),
+                )
+            })
+        };
+
         if n > 1 {
             let menu = menu
                 .label(tn!("hosts.bulk.selected", n))
@@ -692,11 +759,14 @@ impl HostsView {
                         .on_click(act(|v, ids, _, cx| v.open_split(ids, false, cx))),
                 );
             let menu = move_menu(menu.separator(), window, cx);
-            return menu.separator().item(
-                PopupMenuItem::new(tn!("hosts.bulk.delete", n))
-                    .icon(ui::icon(IconName::Trash))
-                    .on_click(act(|v, _, window, cx| v.delete_selected(window, cx))),
-            );
+            let menu = transfer_items(menu, all_writable, all_writable);
+            return menu.when(all_writable, |menu| {
+                menu.separator().item(
+                    PopupMenuItem::new(tn!("hosts.bulk.delete", n))
+                        .icon(ui::icon(IconName::Trash))
+                        .on_click(act(|v, _, window, cx| v.delete_selected(window, cx))),
+                )
+            });
         }
 
         let favorite = rec.data.favorite;
@@ -711,7 +781,7 @@ impl HostsView {
                     .icon(ui::icon(IconName::LayoutGrid))
                     .on_click(act(|v, ids, _, cx| v.open_split(ids, true, cx))),
             )
-            .when(logged_in, |menu| {
+            .when(server, |menu| {
                 menu.item(
                     PopupMenuItem::new(t!("hosts.menu.connect_server"))
                         .icon(ui::icon(IconName::Cloud))
@@ -736,26 +806,36 @@ impl HostsView {
             )
             .separator()
             .item(
-                PopupMenuItem::new(t!("hosts.menu.edit"))
-                    .icon(ui::icon(IconName::Pencil))
-                    .on_click(act(|v, ids, window, cx| {
-                        let rec = ids
-                            .first()
-                            .and_then(|id| v.model.read(cx).host_record(*id).cloned());
-                        if rec.is_some() {
-                            v.edit(rec, window, cx);
-                        }
-                    })),
+                PopupMenuItem::new(if caps.edit {
+                    t!("hosts.menu.edit")
+                } else {
+                    t!("hosts.menu.view")
+                })
+                .icon(ui::icon(if caps.edit {
+                    IconName::Pencil
+                } else {
+                    IconName::Eye
+                }))
+                .on_click(act(|v, ids, window, cx| {
+                    let rec = ids
+                        .first()
+                        .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                    if rec.is_some() {
+                        v.edit(rec, window, cx);
+                    }
+                })),
             )
-            .item(
-                PopupMenuItem::new(t!("hosts.menu.duplicate"))
-                    .icon(ui::icon(IconName::CopyPlus))
-                    .on_click(act(|v, ids, window, cx| {
-                        if let Some(id) = ids.first() {
-                            v.duplicate_host(*id, window, cx);
-                        }
-                    })),
-            )
+            .when(caps.duplicate, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.duplicate"))
+                        .icon(ui::icon(IconName::CopyPlus))
+                        .on_click(act(|v, ids, window, cx| {
+                            if let Some(id) = ids.first() {
+                                v.duplicate_host(*id, window, cx);
+                            }
+                        })),
+                )
+            })
             .item(
                 PopupMenuItem::new(t!("hosts.menu.copy_address"))
                     .icon(ui::icon(IconName::Copy))
@@ -765,35 +845,40 @@ impl HostsView {
                         }
                     })),
             )
-            .item(
-                PopupMenuItem::new(if favorite {
-                    t!("hosts.menu.unfavorite")
-                } else {
-                    t!("hosts.menu.favorite")
-                })
-                .icon(ui::icon(IconName::Star))
-                .on_click(act(|v, ids, window, cx| {
-                    let rec = ids
-                        .first()
-                        .and_then(|id| v.model.read(cx).host_record(*id).cloned());
-                    if let Some(rec) = rec {
-                        v.toggle_favorite(&rec, window, cx);
-                    }
-                })),
-            );
+            .when(caps.edit, |menu| {
+                menu.item(
+                    PopupMenuItem::new(if favorite {
+                        t!("hosts.menu.unfavorite")
+                    } else {
+                        t!("hosts.menu.favorite")
+                    })
+                    .icon(ui::icon(IconName::Star))
+                    .on_click(act(|v, ids, window, cx| {
+                        let rec = ids
+                            .first()
+                            .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                        if let Some(rec) = rec {
+                            v.toggle_favorite(&rec, window, cx);
+                        }
+                    })),
+                )
+            });
         let menu = move_menu(menu, window, cx);
-        menu.separator().item(
-            PopupMenuItem::new(t!("hosts.menu.delete"))
-                .icon(ui::icon(IconName::Trash))
-                .on_click(act(|v, ids, window, cx| {
-                    let rec = ids
-                        .first()
-                        .and_then(|id| v.model.read(cx).host_record(*id).cloned());
-                    if let Some(rec) = rec {
-                        v.delete_host(&rec, window, cx);
-                    }
-                })),
-        )
+        let menu = transfer_items(menu, caps.move_out, caps.copy_out);
+        menu.when(caps.delete, |menu| {
+            menu.separator().item(
+                PopupMenuItem::new(t!("hosts.menu.delete"))
+                    .icon(ui::icon(IconName::Trash))
+                    .on_click(act(|v, ids, window, cx| {
+                        let rec = ids
+                            .first()
+                            .and_then(|id| v.model.read(cx).host_record(*id).cloned());
+                        if let Some(rec) = rec {
+                            v.delete_host(&rec, window, cx);
+                        }
+                    })),
+            )
+        })
     }
 
     /// Menu of a group header: connect to all its hosts, in tabs or in a
@@ -1058,7 +1143,7 @@ impl HostsView {
             )
     }
 
-    fn matches(query: &str, rec: &Record<Host>, group_name: Option<&str>) -> bool {
+    fn matches(query: &str, rec: &Item<Host>, group_name: Option<&str>) -> bool {
         if query.is_empty() {
             return true;
         }
@@ -1101,7 +1186,7 @@ impl HostsView {
 
     fn render_card(
         &self,
-        rec: &Record<Host>,
+        rec: &Item<Host>,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1124,6 +1209,33 @@ impl HostsView {
                         .and_then(|i| m.identities.iter().find(|x| x.data.id == i))
                         .map(|i| i.data.username.clone())
                 })
+        };
+        // Where it lives: vault chip (with more than one place in sight),
+        // account badge (with more than one account) and "Use only".
+        let (vault_chip, account_badge, use_only) = {
+            let m = self.model.read(cx);
+            let in_view = m.accounts_in_view().len();
+            let chips = vm::show_vault_picker(m.vaults_in_view().len(), m.has_device_items());
+            let chip = chips.then(|| m.vault_entry_of(rec).cloned()).flatten();
+            let device = chips && rec.scope == Scope::Device;
+            let badge = vm::show_account_badges(in_view)
+                .then(|| {
+                    rec.account()
+                        .and_then(|a| m.account(a))
+                        .map(|a| AccountRow::new(&a.info))
+                })
+                .flatten();
+            (
+                chip.map(|c| super::vaults::chip(&c, cx).into_any_element())
+                    .or_else(|| {
+                        device.then(|| {
+                            ui::pill(t!("accounts.switcher.device"), cx.theme().muted_foreground)
+                                .into_any_element()
+                        })
+                    }),
+                badge,
+                m.caps_of(rec).use_only_badge,
+            )
         };
         let theme = cx.theme();
         let selected = self.editor.as_ref().and_then(|e| e.read(cx).host_id()) == Some(host.id);
@@ -1351,6 +1463,45 @@ impl HostsView {
                             .map(|t| ui::pill(t.clone(), theme.muted_foreground)),
                     ),
             )
+            .when(
+                vault_chip.is_some() || account_badge.is_some() || use_only,
+                |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .flex_wrap()
+                            .when_some(account_badge, |this, row| {
+                                this.child(
+                                    h_flex()
+                                        .id(("host-account", ix))
+                                        .child(super::accounts::avatar(&row, 16.))
+                                        .tooltip({
+                                            let label = row.label();
+                                            move |window, cx| {
+                                                Tooltip::new(label.clone()).build(window, cx)
+                                            }
+                                        }),
+                                )
+                            })
+                            .children(vault_chip)
+                            .when(use_only, |this| {
+                                this.child(
+                                    h_flex()
+                                        .id(("host-use-only", ix))
+                                        .gap_1()
+                                        .items_center()
+                                        .child(ui::icon(IconName::Lock).size(px(11.)))
+                                        .child(ui::pill(t!("vaults.use_only_badge"), theme.warning))
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new(t!("vaults.use_only_tooltip"))
+                                                .build(window, cx)
+                                        }),
+                                )
+                            }),
+                    )
+                },
+            )
             // Menu opened from the keyboard (Shift+F10, the menu key).
             .when_some(kbd_menu, |this, menu| {
                 this.child(
@@ -1426,15 +1577,44 @@ impl Render for HostsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.model.read(cx);
         let query = self.search.read(cx).value().trim().to_string();
-        let groups: Vec<Group> = model.groups.iter().map(|g| g.data.clone()).collect();
-        let hosts: Vec<Record<Host>> = model.hosts.clone();
+        // Only what the vault picker lets through.
+        let group_items: Vec<Item<Group>> = model
+            .groups
+            .iter()
+            .filter(|g| model.in_filter(g))
+            .cloned()
+            .collect();
+        let groups: Vec<Group> = group_items.iter().map(|g| g.data.clone()).collect();
+        let hosts: Vec<Item<Host>> = model
+            .hosts
+            .iter()
+            .filter(|h| model.in_filter(h))
+            .cloned()
+            .collect();
         let loaded = model.loaded;
+        // Place (account → vault, This device last) of hosts and groups.
+        let infos = model.account_infos();
+        let all_vaults = model.all_vaults();
+        let place_of =
+            |scope: Scope, vault: Option<Id>| vm::place_of(&infos, &all_vaults, scope, vault);
+        let host_place: Vec<(Place, Scope, Option<Id>)> = hosts
+            .iter()
+            .map(|h| {
+                let v = model.vault_of(h);
+                (place_of(h.scope, v), h.scope, v)
+            })
+            .collect();
+        let group_place: Vec<Place> = group_items
+            .iter()
+            .map(|g| place_of(g.scope, model.vault_of(g)))
+            .collect();
         let group_exists = |id: Option<Id>| id.is_some_and(|g| groups.iter().any(|x| x.id == g));
 
         // Search filter.
-        let visible: Vec<&Record<Host>> = hosts
+        let visible: Vec<(&Item<Host>, Place)> = hosts
             .iter()
-            .filter(|h| {
+            .zip(host_place.iter())
+            .filter(|(h, _)| {
                 let gname = h
                     .data
                     .group_id
@@ -1442,12 +1622,43 @@ impl Render for HostsView {
                     .map(|g| g.name.as_str());
                 Self::matches(&query, h, gname)
             })
+            .map(|(h, p)| (h, p.0))
             .collect();
-        let fav_count = visible.iter().filter(|h| h.data.favorite).count();
+        let fav_count = visible.iter().filter(|(h, _)| h.data.favorite).count();
         let ungrouped_count = visible
             .iter()
-            .filter(|h| !group_exists(h.data.group_id))
+            .filter(|(h, _)| !group_exists(h.data.group_id))
             .count();
+        // Places in sight, in order, with their scope and vault.
+        let mut places: Vec<(Place, Scope, Option<Id>)> = host_place.clone();
+        for (g, p) in group_items.iter().zip(&group_place) {
+            places.push((*p, g.scope, model.vault_of(g)));
+        }
+        places.sort_by_key(|p| p.0);
+        places.dedup_by_key(|p| p.0);
+        let place_labels: Vec<(
+            String,
+            Option<AccountRow>,
+            Option<crate::accounts::VaultEntry>,
+        )> = places
+            .iter()
+            .map(|(_, scope, vault)| {
+                let badge = vm::show_account_badges(model.accounts_in_view().len())
+                    .then(|| {
+                        scope
+                            .account()
+                            .and_then(|a| model.account(a))
+                            .map(|a| AccountRow::new(&a.info))
+                    })
+                    .flatten();
+                let entry = scope
+                    .account()
+                    .zip(*vault)
+                    .and_then(|(a, v)| model.vault_entry(a, v))
+                    .cloned();
+                (model.place_label(*scope, *vault), badge, entry)
+            })
+            .collect();
 
         // Group chips.
         let mut chips: Vec<gpui::AnyElement> = vec![
@@ -1473,7 +1684,7 @@ impl Render for HostsView {
         for (i, g) in groups.iter().enumerate() {
             let count = visible
                 .iter()
-                .filter(|h| h.data.group_id == Some(g.id))
+                .filter(|(h, _)| h.data.group_id == Some(g.id))
                 .count();
             chips.push(
                 self.render_chip(
@@ -1501,15 +1712,17 @@ impl Render for HostsView {
             );
         }
 
-        // Sections by group according to the filter.
-        let mut sections: Vec<(Option<Group>, Vec<&Record<Host>>)> = Vec::new();
+        // Sections by group according to the filter; with several places in
+        // sight (accounts, vaults, This device), by place first.
+        let mut sections: Vec<(Option<usize>, Option<Group>, Vec<&Item<Host>>)> = Vec::new();
         match self.filter {
             GroupFilter::Favorites => {
                 sections.push((
                     None,
+                    None,
                     visible
                         .iter()
-                        .copied()
+                        .map(|(h, _)| *h)
                         .filter(|h| h.data.favorite)
                         .collect(),
                 ));
@@ -1517,10 +1730,11 @@ impl Render for HostsView {
             GroupFilter::Group(gid) => {
                 let g = groups.iter().find(|g| g.id == gid).cloned();
                 sections.push((
+                    None,
                     g,
                     visible
                         .iter()
-                        .copied()
+                        .map(|(h, _)| *h)
                         .filter(|h| h.data.group_id == Some(gid))
                         .collect(),
                 ));
@@ -1528,31 +1742,52 @@ impl Render for HostsView {
             GroupFilter::Ungrouped => {
                 sections.push((
                     None,
+                    None,
                     visible
                         .iter()
-                        .copied()
+                        .map(|(h, _)| *h)
                         .filter(|h| !group_exists(h.data.group_id))
                         .collect(),
                 ));
             }
             GroupFilter::All => {
-                for g in &groups {
-                    let list: Vec<&Record<Host>> = visible
-                        .iter()
-                        .copied()
-                        .filter(|h| h.data.group_id == Some(g.id))
-                        .collect();
-                    if !list.is_empty() || query.is_empty() {
-                        sections.push((Some(g.clone()), list));
+                let by_place = places.len() > 1;
+                for (pi, (place, _, _)) in places.iter().enumerate() {
+                    let header = by_place.then_some(pi);
+                    let start = sections.len();
+                    for (g, gp) in groups.iter().zip(&group_place) {
+                        if gp != place {
+                            continue;
+                        }
+                        let list: Vec<&Item<Host>> = visible
+                            .iter()
+                            .filter(|(h, p)| p == place && h.data.group_id == Some(g.id))
+                            .map(|(h, _)| *h)
+                            .collect();
+                        if !list.is_empty() || query.is_empty() {
+                            sections.push((None, Some(g.clone()), list));
+                        }
                     }
-                }
-                let rest: Vec<&Record<Host>> = visible
-                    .iter()
-                    .copied()
-                    .filter(|h| !group_exists(h.data.group_id))
-                    .collect();
-                if !rest.is_empty() {
-                    sections.push((None, rest));
+                    let rest: Vec<&Item<Host>> = visible
+                        .iter()
+                        .filter(|(h, p)| {
+                            p == place
+                                && !h.data.group_id.is_some_and(|g| {
+                                    groups
+                                        .iter()
+                                        .zip(&group_place)
+                                        .any(|(x, xp)| x.id == g && xp == place)
+                                })
+                        })
+                        .map(|(h, _)| *h)
+                        .collect();
+                    if !rest.is_empty() {
+                        sections.push((None, None, rest));
+                    }
+                    // The place header goes on its first section.
+                    if let Some(first) = sections.get_mut(start) {
+                        first.0 = header;
+                    }
                 }
             }
         }
@@ -1561,7 +1796,7 @@ impl Render for HostsView {
         // longer shown leaves the selection.
         self.order = sections
             .iter()
-            .flat_map(|(_, list)| list.iter().map(|h| h.data.id))
+            .flat_map(|(_, _, list)| list.iter().map(|h| h.data.id))
             .collect();
         let order = self.order.clone();
         self.selection.retain(&order);
@@ -1588,7 +1823,46 @@ impl Render for HostsView {
                 cx,
             ));
         }
-        for (si, (group, list)) in sections.iter().enumerate() {
+        for (si, (place, group, list)) in sections.iter().enumerate() {
+            if let Some(pi) = place {
+                let (label, badge, entry) = place_labels[*pi].clone();
+                let theme = cx.theme();
+                body = body.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .when_some(badge, |this, row| {
+                            this.child(super::accounts::avatar(&row, 20.))
+                        })
+                        .map(|this| match &entry {
+                            Some(v) => this.child(
+                                ui::icon(super::vaults::vault_icon(&v.vault))
+                                    .size(px(16.))
+                                    .text_color(super::vaults::vault_color(&v.vault)),
+                            ),
+                            None if places[*pi].1 == Scope::Device => this.child(
+                                ui::icon(IconName::Laptop)
+                                    .size(px(16.))
+                                    .text_color(theme.muted_foreground),
+                            ),
+                            None => this,
+                        })
+                        .child(div().text_lg().font_semibold().child(label))
+                        .when_some(entry.filter(|v| !v.can_write()), |this, v| {
+                            this.child(ui::pill(
+                                if v.strict() {
+                                    t!("vaults.use_only_strict_badge")
+                                } else {
+                                    t!("vaults.use_only_badge")
+                                },
+                                theme.warning,
+                            ))
+                        }),
+                );
+            }
             let title_group = match self.filter {
                 GroupFilter::Favorites => None,
                 _ => group.as_ref(),

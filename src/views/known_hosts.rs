@@ -10,7 +10,9 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
-use termoak_core::model::{KnownHost, Record};
+use termoak_core::model::KnownHost;
+
+use crate::state::Item;
 
 use super::OpenRequest;
 use crate::state::AppModel;
@@ -42,7 +44,7 @@ impl KnownHostsView {
         }
     }
 
-    fn delete(&mut self, rec: Record<KnownHost>, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete(&mut self, rec: Item<KnownHost>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
             window,
@@ -73,11 +75,11 @@ impl KnownHostsView {
 impl Render for KnownHostsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).value().trim().to_lowercase();
-        let mut list: Vec<Record<KnownHost>> = self
-            .model
-            .read(cx)
+        let m = self.model.read(cx);
+        let mut list: Vec<Item<KnownHost>> = m
             .known_hosts
             .iter()
+            .filter(|k| m.in_filter(k))
             .filter(|k| {
                 query.is_empty()
                     || k.data.host.to_lowercase().contains(&query)

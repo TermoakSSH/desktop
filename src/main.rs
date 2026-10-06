@@ -24,6 +24,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 #[macro_use]
 mod i18n;
 
+mod accounts;
 mod app;
 mod links;
 mod local_ai;

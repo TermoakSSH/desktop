@@ -129,6 +129,9 @@ pub enum TermKind {
     Server {
         host_id: Option<Id>,
         session_id: Option<Id>,
+        /// Account whose server has it (`None`: the host's account, or the
+        /// current one).
+        account: Option<Id>,
         /// Joined with a link (maybe on another server, maybe as a guest).
         link: Option<LinkJoin>,
     },
@@ -375,15 +378,18 @@ impl TerminalView {
         app: Entity<AppModel>,
         host_id: Option<Id>,
         session_id: Option<Id>,
+        account: Option<Id>,
         title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let account = account.or_else(|| host_id.and_then(|h| app.read(cx).account_of_host(h)));
         let mut view = Self::base(
             app,
             TermKind::Server {
                 host_id,
                 session_id,
+                account,
                 link: None,
             },
             title,
@@ -408,6 +414,7 @@ impl TerminalView {
             TermKind::Server {
                 host_id: None,
                 session_id: Some(session_id),
+                account: None,
                 link: Some(link),
             },
             title,
@@ -602,8 +609,9 @@ impl TerminalView {
             TermKind::Server {
                 host_id,
                 session_id,
+                account,
                 ..
-            } => match app.api.clone() {
+            } => match app.api_of(*account) {
                 Some(api) => {
                     let target = match (session_id, host_id) {
                         (Some(s), _) => Some(ServerTarget::Attach { session_id: *s }),
@@ -1026,6 +1034,23 @@ impl TerminalView {
 
     fn autocomplete_enabled(&self, cx: &App) -> bool {
         self.app.read(cx).settings.autocomplete
+    }
+
+    /// Server client of the account of this terminal: its session's, its
+    /// host's, or the current account (This device hosts, shell, serial).
+    pub fn account_api(&self, cx: &App) -> Option<termoak_client::ApiClient> {
+        let app = self.app.read(cx);
+        match &self.kind {
+            TermKind::Server {
+                account: Some(a), ..
+            } => app.api_of(Some(*a)),
+            TermKind::Local { host_id }
+            | TermKind::Server {
+                host_id: Some(host_id),
+                ..
+            } => app.api_for_host(*host_id),
+            _ => app.api.clone(),
+        }
     }
 
     /// Host of the terminal (for the history and the system).
@@ -2060,7 +2085,7 @@ impl TerminalView {
 
     /// Shares the terminal through the server.
     pub fn share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(api) = self.app.read(cx).api.clone() else {
+        let Some(api) = self.account_api(cx) else {
             ui::notify(
                 window,
                 cx,
@@ -2113,8 +2138,10 @@ impl TerminalView {
         };
         let weak = cx.entity().downgrade();
         let is_relay = self.relay.is_some();
+        let api = self.account_api(cx);
         crate::views::share::open(
             self.app.clone(),
+            api,
             session_id,
             Some(weak),
             is_relay,
@@ -2137,7 +2164,7 @@ impl TerminalView {
         if !matches!(self.state, TermState::Running) {
             return None;
         }
-        let api = self.app.read(cx).api.clone()?;
+        let api = self.account_api(cx)?;
         let title = t!("terminal.copilot_session_title", host = self.label(cx)).to_string();
         let source = match &self.kind {
             TermKind::Local { .. } => Err(self.local.clone()?),
@@ -2237,7 +2264,7 @@ impl TerminalView {
     /// Explains the selection (or the visible screen) with the server AI.
     pub fn ai_explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let local = self.ai_local(cx);
-        let api = self.app.read(cx).api.clone();
+        let api = self.account_api(cx);
         if local.is_none() && api.is_none() {
             ui::notify(
                 window,
@@ -2337,7 +2364,7 @@ impl TerminalView {
 
     /// Asks the AI for a command and inserts it without running it.
     pub fn ai_suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ai_local(cx).is_none() && self.app.read(cx).api.is_none() {
+        if self.ai_local(cx).is_none() && self.account_api(cx).is_none() {
             ui::notify(
                 window,
                 cx,
@@ -2385,7 +2412,7 @@ impl TerminalView {
 
     fn request_suggestion(&mut self, request: String, window: &mut Window, cx: &mut Context<Self>) {
         let local = self.ai_local(cx);
-        let api = self.app.read(cx).api.clone();
+        let api = self.account_api(cx);
         if local.is_none() && api.is_none() {
             return;
         }

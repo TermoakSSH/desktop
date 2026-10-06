@@ -95,7 +95,12 @@ pub enum Target {
     Terminal(EntityId),
     /// A server session (yours or shared with you): its tab, opened if
     /// needed.
-    Session { session_id: Id, title: String },
+    Session {
+        session_id: Id,
+        title: String,
+        /// Account whose server has it (`None`: the current one).
+        account: Option<Id>,
+    },
     /// An AI task, in the AI section.
     AiTask(Id),
 }

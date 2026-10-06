@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{Value, json};
 use termoak_client::remote::{Participant, RemoteEvent, RemoteTerminal};
-use termoak_client::{ApiClient, LOCAL_OWNER, Workspace};
+use termoak_client::{ApiClient, Workspace};
 use termoak_core::Id;
 use termoak_core::model::{Host, SecretUpdate};
 use termoak_ssh::prompt::Prompt;
@@ -215,10 +215,9 @@ async fn run_local(
     out: mpsc::UnboundedSender<Out>,
 ) {
     let label =
-        p.ws.store
-            .get::<Host>(LOCAL_OWNER, p.host_id)
+        p.ws.find_item::<Host>(p.host_id)
             .await
-            .map(|h| h.data.label)
+            .map(|h| h.record.data.label)
             .unwrap_or_else(|_| "host".into());
     // Latest size (the window adjusts while connecting).
     let mut size = (p.cols, p.rows);
@@ -236,7 +235,8 @@ async fn run_local(
                     res = &mut connect => match res {
                         Ok(c) => break c,
                         Err(e) => {
-                            let _ = out.send(Out::Failed(e.to_string()));
+                            // Vault rules (Use only, Strict...) are translated.
+                            let _ = out.send(Out::Failed(crate::state::api_error(e)));
                             return;
                         }
                     },
@@ -269,18 +269,27 @@ async fn run_local(
         let host_id = p.host_id;
         let conn = conn.clone();
         tokio::spawn(async move {
+            // Saved where the host is, if the user can change it (Use-only
+            // members skip it: it is only metadata).
             if let Some(info) = termoak_ssh::detect::detect_os_info(&conn).await
-                && let Ok(rec) = ws.store.get::<Host>(LOCAL_OWNER, host_id).await
-                && (rec.data.os.as_deref() != Some(info.id.as_str())
-                    || rec.data.os_version.as_deref() != Some(info.display().as_str()))
+                && let Ok(item) = ws.find_item::<Host>(host_id).await
+                && item.access.can_write()
+                && (item.record.data.os.as_deref() != Some(info.id.as_str())
+                    || item.record.data.os_version.as_deref() != Some(info.display().as_str()))
             {
-                let mut host = rec.data;
+                let target = match item.scope {
+                    termoak_client::Scope::Device => termoak_client::SaveTarget::Device,
+                    termoak_client::Scope::Account(account) => {
+                        termoak_client::SaveTarget::Account {
+                            account,
+                            vault: None,
+                        }
+                    }
+                };
+                let mut host = item.record.data;
                 host.os_version = Some(info.display());
                 host.os = Some(info.id);
-                let _ = ws
-                    .store
-                    .save(LOCAL_OWNER, host, SecretUpdate::Keep, None)
-                    .await;
+                let _ = ws.save_item(target, host, SecretUpdate::Keep, None).await;
             }
         });
     }
