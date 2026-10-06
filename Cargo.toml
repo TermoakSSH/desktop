@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.3" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.3" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.3" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.3" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.4.0-next.2" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.4.0-next.2" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.4.0-next.2" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.4.0-next.2" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.3.0-next.3", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.4.0-next.2", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
