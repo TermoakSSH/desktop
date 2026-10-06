@@ -3835,7 +3835,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -8293,8 +8293,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.3.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.2#760b796f9fb54ad0fe8d5e3aa549793e5777ed50"
+version = "0.3.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.3#67b9e05ef89964102addea4528b664ee7cb39592"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8319,8 +8319,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.3.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.2#760b796f9fb54ad0fe8d5e3aa549793e5777ed50"
+version = "0.3.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.3#67b9e05ef89964102addea4528b664ee7cb39592"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8344,8 +8344,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.3.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.2#760b796f9fb54ad0fe8d5e3aa549793e5777ed50"
+version = "0.3.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.3#67b9e05ef89964102addea4528b664ee7cb39592"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -8416,8 +8416,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.3.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.2#760b796f9fb54ad0fe8d5e3aa549793e5777ed50"
+version = "0.3.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.3#67b9e05ef89964102addea4528b664ee7cb39592"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8438,8 +8438,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.3.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.2#760b796f9fb54ad0fe8d5e3aa549793e5777ed50"
+version = "0.3.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.3.0-next.3#67b9e05ef89964102addea4528b664ee7cb39592"
 dependencies = [
  "base64 0.22.1",
  "chrono",
