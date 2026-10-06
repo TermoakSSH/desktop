@@ -1,7 +1,7 @@
 [package]
 name = "termoak-desktop"
 description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
-version = "0.3.0-next.3"
+version = "0.4.0-next.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
