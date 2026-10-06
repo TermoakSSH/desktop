@@ -40,6 +40,8 @@
 #   TERMOAK_UPDATE_PUBKEY  public key; compiled into the app (build)
 #   TERMOAK_UPDATE_URL     https://YOUR-SERVER/updates/latest.json (build)
 #   TERMOAK_UPDATE_SECRET  secret key (publish)
+#   TERMOAK_OFFICIAL_SERVER  official server of the "Sign in to Termoak" button
+#                 (build; default https://termoak.com; e.g. https://next.termoak.com)
 #   GITHUB_TOKEN  GitHub token (publish and download). If unset, it is read
 #                 from ~/.config/termoak/github-token. Fine-grained, with access to
 #                 the TermoakSSH repositories, Contents: Read and write (and
@@ -231,7 +233,7 @@ build_in_docker() { # platforms...
   docker run --rm --platform linux/amd64 --user "$(id -u):$(id -g)" \
     -v "$root:/src" -w /src -e HOME=/tmp \
     -e BUILD_TARGET_DIR=/src/target/builder -e CARGO_HOME=/src/target/builder/cargo \
-    -e TERMOAK_UPDATE_PUBKEY -e TERMOAK_UPDATE_URL \
+    -e TERMOAK_UPDATE_PUBKEY -e TERMOAK_UPDATE_URL -e TERMOAK_OFFICIAL_SERVER \
     termoak-builder scripts/release-local.sh build "$component" "$@"
 }
 
