@@ -82,9 +82,16 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Smaller binaries (and AppImage, .exe and update downloads): optimized for
+# size, with fat LTO and a single codegen unit across all crates. Linux
+# binary 73 → 44 MB, Windows .exe 51 → 29 MB. Terminal throughput
+# (alacritty_terminal/vte) measured the same as with opt-level 3, so there
+# are no per-crate opt-level overrides (they cost ~0.6 MB and under fat LTO
+# the final optimization runs at this level anyway).
 [profile.release]
-lto = "thin"
-codegen-units = 4
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
 strip = "symbols"
 
 # Copy of gpui-pre-windows that uses precompiled shaders when building for
