@@ -9,9 +9,26 @@ VT/xterm emulation, painted directly with GPUI.
 
 Source: https://github.com/TermoakSSH/desktop
 
-![Hosts](docs/screenshot.png)
+![Split view with broadcast input](docs/split-view.png)
 
-![Terminal](docs/terminal.png)
+*Split view with four SSH terminals and broadcast input on: what you type goes
+to every pane with the antenna lit (here, all but the log tail on
+`monitoring`).*
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/hosts.png" alt="Hosts"><br><em>Hosts by group, with tags, a favorite and the detected system.</em></td>
+    <td width="50%"><img src="docs/host-editor.png" alt="Host editor"><br><em>The host editor: address first, credentials, group, tags and color.</em></td>
+  </tr>
+  <tr>
+    <td><img src="docs/context-menu.png" alt="Host menu"><br><em>Right click on a host: connect, split view, SFTP, favorites, move to group.</em></td>
+    <td><img src="docs/settings.png" alt="AI settings"><br><em>Settings: where the AI runs, with your own API keys or a local agent.</em></td>
+  </tr>
+  <tr>
+    <td><img src="docs/hosts-light.png" alt="Light theme"><br><em>The light theme.</em></td>
+    <td></td>
+  </tr>
+</table>
 
 ## Features
 
