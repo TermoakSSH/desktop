@@ -1913,7 +1913,9 @@ impl AppModel {
     }
 
     /// Creates an account on a server (with an invitation code when its
-    /// registration is closed).
+    /// registration is closed). `accept_terms` records that the person
+    /// accepted the server's terms of use and privacy policy.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_up(
         &mut self,
         server: ServerChoice,
@@ -1921,11 +1923,13 @@ impl AppModel {
         name: String,
         password: String,
         invite: Option<String>,
+        accept_terms: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<LoginOutcome, LoginError>> {
         let ws = self.ws.clone();
         let task = runtime::handle(cx).spawn(async move {
-            ws.sign_up(server, &email, &name, &password, invite.as_deref())
+            let terms = accept_terms.then_some(None);
+            ws.sign_up_accepting(server, &email, &name, &password, invite.as_deref(), terms)
                 .await
                 .map_err(LoginError::from)
         });

@@ -581,10 +581,12 @@ impl AddAccountDialog {
             ui::error(window, cx, t!("add_account.terms_required"));
             return;
         }
+        // Only servers that show terms record their acceptance.
+        let accept_terms = self.needs_terms() && self.terms;
         self.busy = true;
         cx.notify();
         let task = self.model.update(cx, |m, cx| {
-            m.sign_up(server, email, name, password, invite, cx)
+            m.sign_up(server, email, name, password, invite, accept_terms, cx)
         });
         self.after_login(task, true, window, cx);
     }
