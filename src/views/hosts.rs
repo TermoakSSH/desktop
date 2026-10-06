@@ -281,12 +281,14 @@ impl HostsView {
         }
     }
 
+    /// Marks or unmarks a host as a favourite (the opposite of what the
+    /// list shows), changing only that: the rest is read again from the
+    /// store, which may be newer (e.g. its detected OS).
     fn toggle_favorite(&mut self, rec: &Item<Host>, window: &mut Window, cx: &mut Context<Self>) {
-        let mut host = rec.data.clone();
-        host.favorite = !host.favorite;
-        let task = self
-            .model
-            .update(cx, |m, cx| m.save(host, SecretUpdate::Keep, None, cx));
+        let favorite = !rec.data.favorite;
+        let task = self.model.update(cx, |m, cx| {
+            m.update_item::<Host>(rec.data.id, move |h| h.favorite = favorite, cx)
+        });
         cx.spawn_in(window, async move |_, cx| {
             if let Err(e) = task.await {
                 let _ = cx.update(|window, cx| ui::error(window, cx, e));

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use termoak_client::remote::{Participant, RemoteEvent, RemoteTerminal};
 use termoak_client::{ApiClient, Workspace};
 use termoak_core::Id;
-use termoak_core::model::{Host, SecretUpdate};
+use termoak_core::model::Host;
 use termoak_ssh::prompt::Prompt;
 use termoak_ssh::{Connection, TerminalSession};
 use tokio::sync::broadcast::error::RecvError;
@@ -277,19 +277,11 @@ async fn run_local(
                 && (item.record.data.os.as_deref() != Some(info.id.as_str())
                     || item.record.data.os_version.as_deref() != Some(info.display().as_str()))
             {
-                let target = match item.scope {
-                    termoak_client::Scope::Device => termoak_client::SaveTarget::Device,
-                    termoak_client::Scope::Account(account) => {
-                        termoak_client::SaveTarget::Account {
-                            account,
-                            vault: None,
-                        }
-                    }
-                };
-                let mut host = item.record.data;
-                host.os_version = Some(info.display());
-                host.os = Some(info.id);
-                let _ = ws.save_item(target, host, SecretUpdate::Keep, None).await;
+                let _ = crate::state::update_stored::<Host>(&ws, item.item(), |host| {
+                    host.os_version = Some(info.display());
+                    host.os = Some(info.id);
+                })
+                .await;
             }
         });
     }

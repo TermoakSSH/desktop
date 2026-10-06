@@ -506,6 +506,28 @@ pub fn dedupe<T: CoreEntity>(items: Vec<Item<T>>, first: Option<Id>) -> Vec<Item
     out
 }
 
+/// Changes some fields of a stored item and leaves the rest as they are
+/// now: it is read again from its store first, because the lists in memory
+/// can be behind (the operating system detected when connecting is saved
+/// straight to the store, for example). It stays in the same place.
+pub async fn update_stored<T: CoreEntity>(
+    ws: &Workspace,
+    item: ItemRef,
+    change: impl FnOnce(&mut T),
+) -> Result<Scoped<T>, ClientError> {
+    let current = ws.get_item::<T>(item).await?;
+    let target = match current.scope {
+        Scope::Device => SaveTarget::Device,
+        Scope::Account(account) => SaveTarget::Account {
+            account,
+            vault: None,
+        },
+    };
+    let mut data = current.record.data;
+    change(&mut data);
+    ws.save_item(target, data, SecretUpdate::Keep, None).await
+}
+
 /// Global model (one entity shared by every view).
 pub struct AppModel {
     pub ws: Workspace,
@@ -1180,6 +1202,36 @@ impl AppModel {
         })
     }
 
+    /// Changes some fields of an existing item (see [`update_stored`]): for
+    /// quick actions like a favourite or a rename, which must not save the
+    /// copy of a list over newer data.
+    pub fn update_item<T: CoreEntity>(
+        &mut self,
+        id: Id,
+        change: impl FnOnce(&mut T) + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Item<T>, String>> {
+        let item = self.item_ref(T::KIND, id);
+        let ws = self.ws.clone();
+        let fut = runtime::spawn(cx, async move {
+            let item = match item {
+                Some(i) => i,
+                None => ws.locate(id).await.map_err(api_error)?,
+            };
+            update_stored(&ws, item, change)
+                .await
+                .map(Item::from)
+                .map_err(api_error)
+        });
+        cx.spawn(async move |this, cx| {
+            let res = fut.await;
+            if res.is_ok() {
+                let _ = this.update(cx, |m, cx| m.data_changed(cx));
+            }
+            res
+        })
+    }
+
     /// Remembers the vault chosen for new items of an account.
     fn remember_vault(&mut self, target: SaveTarget, cx: &mut Context<Self>) {
         if let SaveTarget::Account {
@@ -1329,28 +1381,17 @@ impl AppModel {
         group: Option<Id>,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), String>> {
-        let hosts: Vec<(SaveTarget, Host)> = self
+        let items: Vec<ItemRef> = self
             .hosts
             .iter()
             .filter(|h| ids.contains(&h.data.id) && h.data.group_id != group)
             .filter(|h| h.access.can_write())
-            .map(|h| {
-                let mut host = h.data.clone();
-                host.group_id = group;
-                let target = match h.scope {
-                    Scope::Device => SaveTarget::Device,
-                    Scope::Account(account) => SaveTarget::Account {
-                        account,
-                        vault: None,
-                    },
-                };
-                (target, host)
-            })
+            .map(Item::item_ref)
             .collect();
         let ws = self.ws.clone();
         let fut = runtime::spawn(cx, async move {
-            for (target, host) in hosts {
-                ws.save_item(target, host, SecretUpdate::Keep, None).await?;
+            for item in items {
+                update_stored::<Host>(&ws, item, |h| h.group_id = group).await?;
             }
             Ok::<_, ClientError>(())
         });
@@ -2432,6 +2473,51 @@ mod tests {
         assert_eq!(dedupe(list.clone(), Some(b))[0].data.name, "seen by b");
         assert_eq!(dedupe(list.clone(), None)[0].data.name, "seen by a");
         assert_eq!(dedupe(list, Some(a)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn quick_changes_keep_what_was_saved_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("termoak-update-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::open(&dir, termoak_core::crypto::MasterKey::generate()).unwrap();
+        let host = Host {
+            id: Id::nil(),
+            label: "web".into(),
+            address: "web.example.com".into(),
+            group_id: None,
+            tags: Vec::new(),
+            settings: Default::default(),
+            notes: String::new(),
+            color: None,
+            os: None,
+            os_version: None,
+            favorite: false,
+        };
+        let saved = ws
+            .save_item(SaveTarget::Device, host, SecretUpdate::Keep, None)
+            .await
+            .unwrap();
+        // The list keeps this copy while connecting detects the OS.
+        let listed = Item::from(saved);
+        update_stored::<Host>(&ws, listed.item_ref(), |h| {
+            h.os = Some("debian".into());
+            h.os_version = Some("Debian 13".into());
+        })
+        .await
+        .unwrap();
+        // Marking it as a favourite from the list keeps the OS.
+        let fav = update_stored::<Host>(&ws, listed.item_ref(), |h| h.favorite = true)
+            .await
+            .unwrap();
+        assert!(fav.record.data.favorite);
+        let stored = ws.get_item::<Host>(listed.item_ref()).await.unwrap();
+        assert!(stored.record.data.favorite);
+        assert_eq!(stored.record.data.os.as_deref(), Some("debian"));
+        assert_eq!(stored.record.data.os_version.as_deref(), Some("Debian 13"));
+        assert_eq!(stored.record.data.label, "web");
+        assert_eq!(stored.scope, Scope::Device);
+        drop(ws);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -334,9 +334,10 @@ impl KeychainView {
                 if label.is_empty() {
                     return false;
                 }
-                let mut key = rec.data.clone();
-                key.label = label;
-                let task = model.update(cx, |m, cx| m.save(key, SecretUpdate::Keep, None, cx));
+                let id = rec.data.id;
+                let task = model.update(cx, |m, cx| {
+                    m.update_item::<SshKey>(id, move |k| k.label = label, cx)
+                });
                 window
                     .spawn(cx, async move |cx| {
                         if let Err(e) = task.await {
