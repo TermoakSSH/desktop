@@ -37,7 +37,7 @@ use crate::panes::{self, Dir, MAX_PANES};
 use crate::prompts::PromptRequest;
 use crate::runtime;
 use crate::sharing::{self, SessionNotice};
-use crate::state::{AppModel, ModelEvent, ToastKind};
+use crate::state::{self as app_state, AppModel, ModelEvent, ToastKind};
 use crate::terminal::{
     PaneAction, PaneChrome, RequestKind, ShareRequest, TermKind, TermState, TerminalEvent,
     TerminalView, serial::SerialParams,
@@ -1052,6 +1052,16 @@ impl AppView {
                     })
                     .collect();
                 this.cloud_sessions = running.len();
+                // Sessions that ended lower the count the Home notice was
+                // closed with: a new one shows it again.
+                let dismissed = this.model.read(cx).settings.cloud_notice_dismissed;
+                if let Some(d) = app_state::cloud_notice_lowered(running.len(), dismissed) {
+                    this.model.update(cx, |m, cx| {
+                        let mut s = m.settings.clone();
+                        s.cloud_notice_dismissed = d;
+                        m.save_settings(s, cx);
+                    });
+                }
                 // Dormant tabs of sessions that already ended are dropped.
                 let ended: Vec<usize> = this
                     .tabs
@@ -2889,9 +2899,13 @@ impl AppView {
         let events_online = model.events_online;
         // Requests waiting in sessions you are not watching.
         let alerts = model.session_alert_count();
+        // Your sessions running on the server.
+        let running = self.cloud_sessions;
         let section = self.section;
         let item = |s: Section, cx: &mut Context<Self>| {
             let badge = (s == Section::ServerSessions && alerts > 0).then_some(alerts);
+            let running =
+                (s == Section::ServerSessions && alerts == 0 && running > 0).then_some(running);
             // Taller and with bigger text and icons than the stock ones (28 px):
             // the fixed height of the component is applied later, but the
             // minimum wins.
@@ -2905,8 +2919,8 @@ impl AppView {
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.select_section(s, window, cx)
                 }));
-            match badge {
-                Some(n) => item.suffix(move |_, cx| {
+            match (badge, running) {
+                (Some(n), _) => item.suffix(move |_, cx| {
                     div()
                         .min_w(px(18.))
                         .h(px(18.))
@@ -2921,7 +2935,17 @@ impl AppView {
                         .justify_center()
                         .child(n.to_string())
                 }),
-                None => item,
+                // Running sessions: a green dot with how many.
+                (None, Some(n)) => item.suffix(move |_, cx| {
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(div().size(px(7.)).rounded_full().bg(cx.theme().success))
+                        .child(n.to_string())
+                }),
+                (None, None) => item,
             }
         };
         let theme = cx.theme();
@@ -3441,6 +3465,37 @@ impl AppView {
                         this.select_section(Section::ServerSessions, window, cx)
                     })),
             )
+            .child(
+                Button::new("cloud-notice-dismiss")
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(IconName::X))
+                    .tooltip(t!("app.cloud_notice.dismiss"))
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.dismiss_cloud_notice(cx)),
+                    ),
+            )
+    }
+
+    /// The Home notice about running sessions is closed: hidden until there
+    /// are more of them (saved, for every window).
+    fn dismiss_cloud_notice(&mut self, cx: &mut Context<Self>) {
+        let n = self.cloud_sessions;
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            s.cloud_notice_dismissed = n;
+            m.save_settings(s, cx);
+        });
+        cx.notify();
+    }
+
+    /// The Home notice about running sessions is on screen.
+    fn cloud_notice_shown(&self, cx: &App) -> bool {
+        self.section != Section::ServerSessions
+            && app_state::cloud_notice_visible(
+                self.cloud_sessions,
+                self.model.read(cx).settings.cloud_notice_dismissed,
+            )
     }
 
     fn render_section(&self) -> AnyElement {
@@ -3511,10 +3566,9 @@ impl Render for AppView {
                         .flex_1()
                         .min_w_0()
                         .h_full()
-                        .when(
-                            self.cloud_sessions > 0 && self.section != Section::ServerSessions,
-                            |this| this.child(self.render_cloud_notice(cx)),
-                        )
+                        .when(self.cloud_notice_shown(cx), |this| {
+                            this.child(self.render_cloud_notice(cx))
+                        })
                         .child(div().flex_1().min_h_0().child(self.render_section())),
                 )
                 .into_any_element(),

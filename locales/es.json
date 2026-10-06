@@ -387,6 +387,7 @@
   "app.broadcast.stop": "Detener",
   "app.broadcast.tooltip": "Escribir en todos los paneles a la vez (%{shortcut})",
   "app.cloud_notice.detail": "Están arriba, en las pestañas con la nube: se conectan al pulsarlas.",
+  "app.cloud_notice.dismiss": "Ocultar hasta que haya otra sesión",
   "app.cloud_notice.open": "Ver sesiones",
   "app.cloud_notice.title_one": "%{count} sesión en marcha en el servidor",
   "app.cloud_notice.title_other": "%{count} sesiones en marcha en el servidor",

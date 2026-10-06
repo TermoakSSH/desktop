@@ -387,6 +387,7 @@
   "app.broadcast.stop": "Stop",
   "app.broadcast.tooltip": "Type in every pane at once (%{shortcut})",
   "app.cloud_notice.detail": "They are at the top, in the tabs with the cloud: they connect when clicked.",
+  "app.cloud_notice.dismiss": "Hide until another session starts",
   "app.cloud_notice.open": "View sessions",
   "app.cloud_notice.title_one": "%{count} session running on the server",
   "app.cloud_notice.title_other": "%{count} sessions running on the server",

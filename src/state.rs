@@ -89,6 +89,9 @@ pub struct Settings {
     pub last_vaults: BTreeMap<Id, Id>,
     /// The notice about the data moved to one store per account was shown.
     pub layout_notice_seen: bool,
+    /// How many server sessions were running when the Home notice about
+    /// them was closed (it comes back when there are more).
+    pub cloud_notice_dismissed: usize,
 }
 
 impl Default for Settings {
@@ -110,8 +113,23 @@ impl Default for Settings {
             device_view: false,
             last_vaults: BTreeMap::new(),
             layout_notice_seen: false,
+            cloud_notice_dismissed: 0,
         }
     }
+}
+
+/// The Home notice about your sessions running on the server is shown:
+/// there are some, and more than when it was closed.
+pub fn cloud_notice_visible(running: usize, dismissed: usize) -> bool {
+    running > 0 && running > dismissed
+}
+
+/// The count to keep after the server says `running` sessions are running,
+/// if it changes: when sessions end it goes down with them, so the notice
+/// comes back as soon as a new one starts (closed with 3, down to 1, a new
+/// one makes 2: shown).
+pub fn cloud_notice_lowered(running: usize, dismissed: usize) -> Option<usize> {
+    (running < dismissed).then_some(running)
 }
 
 impl Settings {
@@ -2387,6 +2405,33 @@ async fn events_loop(account: Id, api: ApiClient, tx: mpsc::UnboundedSender<BgMs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_notice_dismissal() {
+        // Never closed: shown while there are sessions.
+        assert!(!cloud_notice_visible(0, 0));
+        assert!(cloud_notice_visible(1, 0));
+        // Closed with 2: hidden while there are 2 or fewer...
+        assert!(!cloud_notice_visible(2, 2));
+        assert!(!cloud_notice_visible(1, 2));
+        // ...and back with a third one.
+        assert!(cloud_notice_visible(3, 2));
+        // Sessions that end lower the count; then a new one shows it again.
+        assert_eq!(cloud_notice_lowered(1, 3), Some(1));
+        assert_eq!(cloud_notice_lowered(3, 3), None);
+        assert_eq!(cloud_notice_lowered(5, 3), None);
+        let mut dismissed = 3;
+        for running in [1, 2] {
+            if let Some(d) = cloud_notice_lowered(running, dismissed) {
+                dismissed = d;
+            }
+        }
+        assert_eq!(dismissed, 1);
+        assert!(cloud_notice_visible(2, dismissed));
+        // An old settings file without the field: never closed.
+        let s: Settings = serde_json::from_str(r#"{"dark": false}"#).unwrap();
+        assert_eq!(s.cloud_notice_dismissed, 0);
+    }
     use termoak_core::CoreError;
 
     #[test]

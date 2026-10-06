@@ -119,7 +119,9 @@ to every pane with the antenna lit (here, all but the log tail on
   opened "on the server": the terminal lives there and stays open even if
   you close the app. **Server sessions** lets you get back into them and
   into the ones others share with you. On start, running server sessions
-  show up as sleeping tabs that attach when clicked.
+  show up as sleeping tabs that attach when clicked; a green dot in the
+  sidebar counts them, and the Home notice about them can be closed (it
+  comes back when another one starts).
 - **Session sharing**: a local terminal is shared through the server (invite
   by email, share with one of your teams, or create a link for guests
   without an account); server sessions too, from their tab or from **Server
