@@ -333,6 +333,74 @@ fn ref_choices(m: &AppModel, scope: Scope, vault: Option<Id>) -> RefChoices {
     }
 }
 
+/// A reference of a host that its place does not offer (a group, key,
+/// identity, snippet or jump of another vault, or one that is gone). It is
+/// kept, shown as such, until the user chooses something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unavailable {
+    /// Loaded, but in another vault or account (its name).
+    OtherVault(String),
+    /// Not among the loaded items: deleted, or not synced yet.
+    Missing,
+}
+
+impl Unavailable {
+    fn of(name: Option<String>) -> Self {
+        name.map_or(Self::Missing, Self::OtherVault)
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::OtherVault(name) => t!("host_editor.ref.other_vault", name = name).to_string(),
+            Self::Missing => t!("host_editor.ref.missing").to_string(),
+        }
+    }
+
+    fn warning(&self) -> SharedString {
+        match self {
+            Self::OtherVault(_) => t!("host_editor.ref.other_vault_hint"),
+            Self::Missing => t!("host_editor.ref.missing_hint"),
+        }
+        .into()
+    }
+}
+
+/// Keeps a reference that the choices do not offer as one more choice, so
+/// that it stays selected and saving does not clear it. Returns what it
+/// is (`None`: offered, or no reference). `name` finds it elsewhere.
+pub(crate) fn keep_unavailable(
+    choices: &mut Vec<Choice<Option<Id>>>,
+    current: Option<Id>,
+    name: impl Fn(Id) -> Option<String>,
+) -> Option<(Id, Unavailable)> {
+    let id = current?;
+    if choices.iter().any(|c| c.value == Some(id)) {
+        return None;
+    }
+    let status = Unavailable::of(name(id));
+    choices.push(Choice::new(status.label(), Some(id)));
+    Some((id, status))
+}
+
+/// References of an existing host kept although its place does not offer
+/// them.
+#[derive(Default)]
+struct KeptRefs {
+    group: Option<(Id, Unavailable)>,
+    identity: Option<(Id, Unavailable)>,
+    key: Option<(Id, Unavailable)>,
+    snippet: Option<(Id, Unavailable)>,
+    jumps: Vec<(Id, Unavailable)>,
+}
+
+/// A host can be a jump of hosts of its own vault or of This device.
+fn jump_offered(m: &AppModel, id: Id, (scope, vault): (Scope, Option<Id>)) -> bool {
+    m.hosts.iter().any(|h| {
+        h.data.id == id
+            && (h.scope == Scope::Device || (h.scope == scope && m.vault_of(h) == vault))
+    })
+}
+
 pub struct HostEditor {
     model: Entity<AppModel>,
     original: Option<Item<Host>>,
@@ -359,6 +427,7 @@ pub struct HostEditor {
     term: Entity<InputState>,
     color: Option<String>,
     jumps: Vec<Id>,
+    kept: KeptRefs,
     proxy_kind: ChoiceState<Option<ProxyKind>>,
     proxy_host: Entity<InputState>,
     proxy_port: Entity<InputState>,
@@ -436,11 +505,53 @@ impl HostEditor {
             }
         };
         let RefChoices {
-            groups,
-            identities,
-            keys,
-            snippets,
+            mut groups,
+            mut identities,
+            mut keys,
+            mut snippets,
         } = ref_choices(m, place.0, place.1);
+        // An existing host keeps references its place does not offer.
+        let mut kept = KeptRefs::default();
+        if let Some(h) = &h {
+            let id = h.id;
+            kept.group = keep_unavailable(&mut groups, h.group_id, |id| {
+                m.groups
+                    .iter()
+                    .find(|g| g.data.id == id)
+                    .map(|g| g.data.name.clone())
+            });
+            kept.identity = keep_unavailable(&mut identities, s.identity_id, |id| {
+                m.identities
+                    .iter()
+                    .find(|i| i.data.id == id)
+                    .map(|i| i.data.label.clone())
+            });
+            kept.key = keep_unavailable(&mut keys, s.key_id, |id| {
+                m.keys
+                    .iter()
+                    .find(|k| k.data.id == id)
+                    .map(|k| k.data.label.clone())
+            });
+            kept.snippet = keep_unavailable(&mut snippets, s.startup_snippet_id, |id| {
+                m.snippets
+                    .iter()
+                    .find(|sn| sn.data.id == id)
+                    .map(|sn| sn.data.name.clone())
+            });
+            let host_name = |id: Id| {
+                m.hosts
+                    .iter()
+                    .find(|o| o.data.id == id)
+                    .map(|o| o.data.label.clone())
+            };
+            kept.jumps = s
+                .jump_host_ids
+                .iter()
+                .flatten()
+                .filter(|j| **j != id && !jump_offered(m, **j, place))
+                .map(|j| (*j, Unavailable::of(host_name(*j))))
+                .collect();
+        }
         let themes = vec![
             Choice::new(t!("host_editor.theme.follow"), None),
             Choice::new(t!("host_editor.theme.dark"), Some("dark".to_string())),
@@ -652,6 +763,7 @@ impl HostEditor {
             agent_forwarding: s.agent_forwarding.unwrap_or(false),
             record: s.record_sessions.unwrap_or(false),
             jumps: s.jump_host_ids.clone().unwrap_or_default(),
+            kept,
             advanced_open: has_advanced(&s),
             color: h.as_ref().and_then(|h| h.color.clone()),
             proxy_kind,
@@ -1016,6 +1128,18 @@ impl HostEditor {
 
     // ----- Rendering -----
 
+    /// Warning under a field that still has a reference its place does not
+    /// offer.
+    fn kept_warning(
+        &self,
+        state: &ChoiceState<Option<Id>>,
+        kept: &Option<(Id, Unavailable)>,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let (id, status) = kept.as_ref()?;
+        (ui::chosen(state, cx).flatten() == Some(*id)).then(|| warning_text(status.warning(), cx))
+    }
+
     /// Field with its error (if any) under it.
     fn checked_field(
         &self,
@@ -1101,7 +1225,23 @@ impl HostEditor {
                 .map(|h| (h.data.id, h.data.label.clone()))
                 .collect()
         };
-        let jumps: AnyElement = if other_hosts.is_empty() {
+        let kept_jumps: Vec<(Id, String)> = self
+            .kept
+            .jumps
+            .iter()
+            .map(|(id, u)| (*id, u.label()))
+            .collect();
+        let jump_warnings: Vec<SharedString> = {
+            let mut w: Vec<SharedString> = Vec::new();
+            for (id, u) in &self.kept.jumps {
+                let text = u.warning();
+                if self.jumps.contains(id) && !w.contains(&text) {
+                    w.push(text);
+                }
+            }
+            w
+        };
+        let jumps: AnyElement = if other_hosts.is_empty() && kept_jumps.is_empty() {
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
@@ -1113,19 +1253,21 @@ impl HostEditor {
                 .gap_1()
                 .max_h(px(160.))
                 .overflow_y_scrollbar()
-                .children(other_hosts.iter().enumerate().map(|(i, (id, label))| {
-                    let id = *id;
-                    let pos = self.jumps.iter().position(|j| *j == id);
-                    Checkbox::new(("jump", i))
-                        .label(match pos {
-                            Some(p) => format!("{}. {label}", p + 1),
-                            None => label.clone(),
-                        })
-                        .checked(pos.is_some())
-                        .on_click(
-                            cx.listener(move |this, _: &bool, _, cx| this.toggle_jump(id, cx)),
-                        )
-                }))
+                .children(other_hosts.iter().chain(&kept_jumps).enumerate().map(
+                    |(i, (id, label))| {
+                        let id = *id;
+                        let pos = self.jumps.iter().position(|j| *j == id);
+                        Checkbox::new(("jump", i))
+                            .label(match pos {
+                                Some(p) => format!("{}. {label}", p + 1),
+                                None => label.clone(),
+                            })
+                            .checked(pos.is_some())
+                            .on_click(
+                                cx.listener(move |this, _: &bool, _, cx| this.toggle_jump(id, cx)),
+                            )
+                    },
+                ))
                 .into_any_element()
         };
         let proxy_on = ui::chosen(&self.proxy_kind, cx).flatten().is_some();
@@ -1134,12 +1276,15 @@ impl HostEditor {
             .gap_4()
             // Connection: jumps and proxy.
             .child(sub_title(t!("host_editor.section.connection"), cx))
-            .child(ui::field_with_hint(
-                t!("host_editor.jumps"),
-                jumps,
-                t!("host_editor.jumps_hint"),
-                cx,
-            ))
+            .child(
+                ui::field_with_hint(
+                    t!("host_editor.jumps"),
+                    jumps,
+                    t!("host_editor.jumps_hint"),
+                    cx,
+                )
+                .children(jump_warnings.into_iter().map(|w| warning_text(w, cx))),
+            )
             .child(ui::field_with_hint(
                 t!("host_editor.proxy.kind"),
                 Select::new(&self.proxy_kind),
@@ -1217,11 +1362,14 @@ impl HostEditor {
             )
             // Terminal: startup, environment, recording, TERM and theme.
             .child(sub_title(t!("host_editor.section.terminal"), cx))
-            .child(ui::field(
-                t!("host_editor.startup_snippet"),
-                Select::new(&self.snippet),
-                cx,
-            ))
+            .child(
+                ui::field(
+                    t!("host_editor.startup_snippet"),
+                    Select::new(&self.snippet),
+                    cx,
+                )
+                .children(self.kept_warning(&self.snippet, &self.kept.snippet, cx)),
+            )
             .child(self.checked_field(
                 Field::Env,
                 t!("host_editor.env"),
@@ -1428,11 +1576,12 @@ impl Render for HostEditor {
                     h_flex()
                         .gap_2()
                         .items_start()
-                        .child(div().flex_1().min_w_0().child(ui::field(
-                            t!("host_editor.group"),
-                            Select::new(&self.group),
-                            cx,
-                        )))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                ui::field(t!("host_editor.group"), Select::new(&self.group), cx)
+                                    .children(self.kept_warning(&self.group, &self.kept.group, cx)),
+                            ),
+                        )
                         .child(div().flex_1().min_w_0().child(ui::field(
                             t!("host_editor.tags"),
                             Input::new(&self.tags),
@@ -1483,18 +1632,28 @@ impl Render for HostEditor {
                             })),
                     )
                 })
-                .child(ui::field_with_hint(
-                    t!("host_editor.key"),
-                    Select::new(&self.key),
-                    t!("host_editor.key_hint"),
-                    cx,
-                ))
-                .child(ui::field_with_hint(
-                    t!("host_editor.identity"),
-                    Select::new(&self.identity),
-                    t!("host_editor.identity_hint"),
-                    cx,
-                )),
+                .child(
+                    ui::field_with_hint(
+                        t!("host_editor.key"),
+                        Select::new(&self.key),
+                        t!("host_editor.key_hint"),
+                        cx,
+                    )
+                    .children(self.kept_warning(&self.key, &self.kept.key, cx)),
+                )
+                .child(
+                    ui::field_with_hint(
+                        t!("host_editor.identity"),
+                        Select::new(&self.identity),
+                        t!("host_editor.identity_hint"),
+                        cx,
+                    )
+                    .children(self.kept_warning(
+                        &self.identity,
+                        &self.kept.identity,
+                        cx,
+                    )),
+                ),
             cx,
         );
 
@@ -1724,6 +1883,20 @@ fn hint(text: SharedString, cx: &App) -> gpui::Div {
         .child(text)
 }
 
+fn warning_text(text: SharedString, cx: &App) -> gpui::Div {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(cx.theme().warning)
+        .child(
+            ui::icon(IconName::TriangleAlert)
+                .size(px(12.))
+                .flex_shrink_0(),
+        )
+        .child(div().min_w_0().child(text))
+}
+
 fn error_text(text: SharedString, cx: &App) -> gpui::Div {
     h_flex()
         .gap_1()
@@ -1865,6 +2038,40 @@ mod tests {
         assert!(!has_advanced(&s));
         s.keepalive_secs = Some(0);
         assert!(has_advanced(&s));
+    }
+
+    #[test]
+    fn references_of_other_vaults_are_kept() {
+        let (here, elsewhere, gone) = (Id::from_u128(1), Id::from_u128(2), Id::from_u128(3));
+        let offered = || vec![Choice::new("None", None), Choice::new("here", Some(here))];
+        let name = |id: Id| (id == elsewhere).then(|| "prod key".to_string());
+
+        // Offered, or no reference: nothing to add.
+        let mut c = offered();
+        assert_eq!(keep_unavailable(&mut c, Some(here), name), None);
+        assert_eq!(keep_unavailable(&mut c, None, name), None);
+        assert_eq!(c.len(), 2);
+
+        // Another vault: one more choice with that value (so it stays
+        // selected and is saved as it was), labelled as such.
+        let mut c = offered();
+        let kept = keep_unavailable(&mut c, Some(elsewhere), name);
+        assert_eq!(
+            kept,
+            Some((elsewhere, Unavailable::OtherVault("prod key".into())))
+        );
+        let last = c.last().unwrap();
+        assert_eq!(last.value, Some(elsewhere));
+        assert_eq!(last.label.as_ref(), "prod key (in another vault)");
+
+        // Not loaded anywhere.
+        let mut c = offered();
+        assert_eq!(
+            keep_unavailable(&mut c, Some(gone), name),
+            Some((gone, Unavailable::Missing))
+        );
+        assert_eq!(c.last().unwrap().value, Some(gone));
+        assert_eq!(c.last().unwrap().label.as_ref(), "(missing)");
     }
 
     #[test]
