@@ -76,6 +76,13 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter"] }
 
+# Windows: Windows Hello for the app lock (src/app_lock/hello.rs), with the
+# same versions GPUI's platform crate already uses.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
+windows-future = "0.3"
+raw-window-handle = "0.6"
+
 [profile.dev]
 debug = "line-tables-only"
 

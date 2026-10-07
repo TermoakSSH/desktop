@@ -8394,6 +8394,7 @@ dependencies = [
  "objc2-user-notifications",
  "parking_lot",
  "polling",
+ "raw-window-handle",
  "reqwest",
  "rust-i18n",
  "semver",
@@ -8413,6 +8414,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows 0.62.2",
+ "windows-future 0.3.2",
  "zeroize",
 ]
 

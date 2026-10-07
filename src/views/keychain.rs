@@ -350,6 +350,31 @@ impl KeychainView {
         );
     }
 
+    /// "Copy private key": after Touch ID / Windows Hello if the lock asks.
+    fn copy_private_key(&mut self, rec: Item<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
+        let item = rec.item_ref();
+        let model = self.model.clone();
+        crate::app_lock::guard_secret(&self.model, window, cx, move |window, cx| {
+            let ws = model.read(cx).ws.clone();
+            let task = runtime::spawn(cx, async move {
+                ws.item_secret::<SshKey>(item).await.map(|s| s.private_key)
+            });
+            window
+                .spawn(cx, async move |cx| {
+                    let res = task.await;
+                    let _ = cx.update(|window, cx| match res {
+                        Ok(Some(key)) => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(key));
+                            ui::success(window, cx, t!("keychain.private_copied"));
+                        }
+                        Ok(None) => ui::error(window, cx, t!("keychain.no_private")),
+                        Err(e) => ui::error(window, cx, e),
+                    });
+                })
+                .detach();
+        });
+    }
+
     fn delete_key(&mut self, rec: Item<SshKey>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
@@ -618,7 +643,7 @@ impl KeychainView {
                 let theme = cx.theme();
                 let k = rec.data.clone();
                 let public = k.public_key.clone();
-                let (r1, r2) = (rec.clone(), rec.clone());
+                let (r1, r2, r3) = (rec.clone(), rec.clone(), rec.clone());
                 h_flex()
                     .id(("key", i))
                     .p_3()
@@ -699,6 +724,18 @@ impl KeychainView {
                                 );
                             }),
                     )
+                    .when(caps.reveal, |this| {
+                        this.child(
+                            Button::new(("copy-private", i))
+                                .small()
+                                .ghost()
+                                .icon(ui::icon(IconName::FileKey))
+                                .tooltip(t!("keychain.copy_private"))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.copy_private_key(r3.clone(), window, cx)
+                                })),
+                        )
+                    })
                     .when(caps.move_out, |this| {
                         this.child(self.move_button(("move-key", i), rec.item_ref()))
                     })

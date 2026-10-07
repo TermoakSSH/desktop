@@ -34,7 +34,8 @@ use super::OpenRequest;
 use super::host_editor::{EditorEvent, HostEditor};
 use crate::accounts::{self as vm, AccountRow, Place};
 use crate::host_status::{self, HostStatus, Probe, Shown, Skip};
-use crate::state::{AppModel, Item};
+use crate::runtime;
+use crate::state::{AppModel, Item, ToastKind};
 use crate::theme;
 use crate::ui::{self, IconName};
 use crate::workspaces::{self, SavedWorkspace, Workspaces};
@@ -317,6 +318,37 @@ impl HostsView {
                 s.host_status_off.push(id);
             }
             m.save_settings(s, cx);
+        });
+    }
+
+    // ----- Secrets -----
+
+    /// "Copy password": after Touch ID / Windows Hello if the lock asks.
+    fn copy_password(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.model.read(cx).host_record(id).map(Item::item_ref) else {
+            return;
+        };
+        let model = self.model.clone();
+        crate::app_lock::guard_secret(&self.model, window, cx, move |window, cx| {
+            let ws = model.read(cx).ws.clone();
+            let task = runtime::spawn(cx, async move {
+                ws.item_secret::<Host>(item).await.map(|s| s.password)
+            });
+            window
+                .spawn(cx, async move |cx| {
+                    let res = task.await;
+                    let _ = cx.update(|window, cx| match res {
+                        Ok(Some(password)) => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(password));
+                            ui::success(window, cx, t!("hosts.password_copied"));
+                        }
+                        Ok(None) => {
+                            ui::notify(window, cx, ToastKind::Info, t!("hosts.no_password"))
+                        }
+                        Err(e) => ui::error(window, cx, e),
+                    });
+                })
+                .detach();
         });
     }
 
@@ -1061,6 +1093,17 @@ impl HostsView {
                         }
                     })),
             )
+            .when(caps.reveal && rec.meta.has_secret, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.copy_password"))
+                        .icon(ui::icon(IconName::KeyRound))
+                        .on_click(act(|v, ids, window, cx| {
+                            if let Some(id) = ids.first() {
+                                v.copy_password(*id, window, cx);
+                            }
+                        })),
+                )
+            })
             .when(caps.edit, |menu| {
                 menu.item(
                     PopupMenuItem::new(if favorite {

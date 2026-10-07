@@ -99,6 +99,8 @@ pub struct Settings {
     pub host_status_off: Vec<Id>,
     /// The tabs of the previous session open again at start.
     pub reopen_tabs: bool,
+    /// Touch ID / Windows Hello to open the app (Settings → General).
+    pub lock: crate::app_lock::LockSettings,
 }
 
 impl Default for Settings {
@@ -124,6 +126,7 @@ impl Default for Settings {
             host_status: true,
             host_status_off: Vec::new(),
             reopen_tabs: true,
+            lock: crate::app_lock::LockSettings::default(),
         }
     }
 }

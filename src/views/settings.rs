@@ -1,6 +1,7 @@
 //! Settings: the current account (with two-step verification), appearance,
 //! language, terminal (with autocomplete), copy and paste, the hosts list
-//! and tabs (status checks, reopening the tabs), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
+//! and tabs (status checks, reopening the tabs), the app lock (macOS and
+//! Windows), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
 //! AI (where it runs, API keys, AI credit) have their own pages.
 
 use gpui::{
@@ -445,6 +446,83 @@ impl SettingsView {
                 )
                 .child(hint(t!("settings.hosts_tabs.reopen_tabs_hint"))),
         )
+    }
+
+    /// Touch ID / Windows Hello (only where the system has it).
+    fn render_lock(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let lock = self.model.read(cx).settings.lock;
+        let muted = cx.theme().muted_foreground;
+        let hint = |text: gpui::SharedString| div().text_xs().text_color(muted).child(text);
+        let method = crate::app_lock::method_name();
+        let off = !lock.enabled;
+        self.render_card(t!("settings.lock.title"), IconName::LockKeyhole, cx)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("app-lock")
+                            .label(t!("settings.lock.enabled"))
+                            .checked(lock.enabled)
+                            .on_click(cx.listener(|this, v: &bool, window, cx| {
+                                crate::app_lock::set_enabled(&this.model, *v, window, cx);
+                            })),
+                    )
+                    .child(hint(t!(
+                        "settings.lock.enabled_hint",
+                        method = method.clone()
+                    ))),
+            )
+            .child(ui::field(
+                t!("settings.lock.after"),
+                h_flex().gap_2().flex_wrap().children(
+                    crate::app_lock::AFTER_CHOICES
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, minutes)| {
+                            Button::new(("lock-after", i))
+                                .small()
+                                .label(match minutes {
+                                    0 => t!("settings.lock.after_background"),
+                                    60 => t!("settings.lock.after_hour"),
+                                    m => t!("settings.lock.after_minutes", n = m),
+                                })
+                                .disabled(off)
+                                .when(lock.after_minutes == minutes, |b| b.primary())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.set_paste(cx, |s| s.lock.after_minutes = minutes)
+                                }))
+                        }),
+                ),
+                cx,
+            ))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("lock-secrets")
+                            .label(t!("settings.lock.secrets"))
+                            .checked(lock.protect_secrets)
+                            .disabled(off)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_paste(cx, |s| s.lock.protect_secrets = v)
+                            })),
+                    )
+                    .child(hint(t!("settings.lock.secrets_hint"))),
+            )
+            .child(
+                h_flex().child(
+                    Button::new("lock-now")
+                        .small()
+                        .icon(ui::icon(IconName::Lock))
+                        .label(t!("settings.lock.lock_now"))
+                        .disabled(off)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            let lock = crate::app_lock::AppLock::global(&this.model, cx);
+                            lock.update(cx, |l, cx| l.lock_now(cx));
+                        })),
+                ),
+            )
     }
 
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -925,6 +1003,7 @@ impl Render for SettingsView {
         let paste = self.render_paste(cx);
         let notifications = self.render_notifications(cx);
         let hosts_tabs = self.render_hosts_tabs(cx);
+        let lock = crate::app_lock::supported().then(|| self.render_lock(cx));
         let updates = self.render_updates(cx);
         let about = self.render_about(cx);
         v_flex().size_full().child(header).child(
@@ -937,6 +1016,7 @@ impl Render for SettingsView {
                         .child(appearance)
                         .child(paste)
                         .child(hosts_tabs)
+                        .children(lock)
                         .child(notifications)
                         .child(updates)
                         .child(about),

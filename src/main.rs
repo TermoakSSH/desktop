@@ -27,6 +27,7 @@ mod i18n;
 
 mod accounts;
 mod app;
+mod app_lock;
 mod dock;
 mod drag;
 mod host_status;

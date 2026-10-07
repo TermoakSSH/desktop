@@ -29,6 +29,7 @@ use termoak_core::Id;
 use termoak_ssh::Connection;
 
 use crate::accounts::{self, SwitcherEntry, VaultFilter, ViewMode};
+use crate::app_lock::{self, AppLock};
 use crate::drag::{self, DragPreview, DraggedPane, DraggedTab};
 use crate::local_ai::copilot::{LocalAi, LocalAiGlobal};
 use crate::local_ai::terminals::LocalTerminals;
@@ -469,6 +470,10 @@ pub struct AppView {
     primary: bool,
     /// Your server sessions known to be running (last time they were asked).
     running_sessions: Option<Vec<Id>>,
+    /// Touch ID / Windows Hello lock (shared by the windows).
+    lock: Entity<AppLock>,
+    /// The lock was on at the last render (to give the focus back).
+    was_locked: bool,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -512,6 +517,7 @@ impl AppView {
         let admin = cx.new(|cx| AdminView::new(model.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(model.clone(), updates.clone(), window, cx));
         let workspaces = Workspaces::global(&model, cx);
+        let lock = AppLock::global(&model, cx);
 
         let mut subs = vec![
             cx.observe_in(&model, window, |this, model, window, cx| {
@@ -525,6 +531,15 @@ impl AppView {
             }),
             cx.observe_in(&workspaces, window, |this, _, window, cx| {
                 this.try_restore(window, cx);
+                cx.notify();
+            }),
+            cx.observe_in(&lock, window, |this, lock, window, cx| {
+                let locked = lock.read(cx).locked();
+                if this.was_locked && !locked {
+                    // Open again: the focus goes back to the tab in view.
+                    this.activate(this.active, window, cx);
+                }
+                this.was_locked = locked;
                 cx.notify();
             }),
             cx.subscribe_in(&model, window, |this, _, ev: &ModelEvent, window, cx| {
@@ -569,8 +584,17 @@ impl AppView {
                     this.on_update_event(ev, window, cx);
                 }
             }),
-            cx.observe_window_activation(window, |_, window, cx| {
-                windows::set_active(window, window.is_window_active(), cx);
+            cx.observe_window_activation(window, |this, window, cx| {
+                let active = window.is_window_active();
+                windows::set_active(window, active, cx);
+                let any = windows::any_active(cx);
+                this.lock.update(cx, |l, cx| {
+                    l.set_active(any);
+                    // Locked: the prompt opens by itself (once per lock).
+                    if active {
+                        l.auto_unlock(window, cx);
+                    }
+                });
             }),
         ];
         // A window that closes leaves the saved session (unless it is the
@@ -600,6 +624,7 @@ impl AppView {
         } else {
             Restore::Done
         };
+        let was_locked = lock.read(cx).locked();
         let mut view = Self {
             model,
             updates,
@@ -627,6 +652,8 @@ impl AppView {
             restore,
             primary: start_services,
             running_sessions: None,
+            lock,
+            was_locked,
             focus: cx.focus_handle(),
             _subs: subs,
         };
@@ -642,6 +669,13 @@ impl AppView {
             view.restore_cloud_tabs(first, window, cx);
         }
         view.try_restore(window, cx);
+        // Locked at start: the system prompt opens by itself.
+        if was_locked {
+            let lock = view.lock.clone();
+            window.defer(cx, move |window, cx| {
+                lock.update(cx, |l, cx| l.auto_unlock(window, cx));
+            });
+        }
         // The layout notice may have come before this window existed.
         if start_services {
             let app = cx.entity().downgrade();
@@ -4742,9 +4776,37 @@ impl Focusable for AppView {
     }
 }
 
+impl AppView {
+    /// The window while the app is locked: nothing of its content, only
+    /// the way to open it (quitting still works: ⌘Q, the close button).
+    fn render_locked(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let notification_layer = Root::render_notification_layer(window, cx);
+        let theme = cx.theme();
+        v_flex()
+            .id("termoak")
+            .track_focus(&self.focus)
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(TitleBar::new().child(div().pl_2().text_sm().child("Termoak")))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(app_lock::render_lock_screen(&self.lock, cx)),
+            )
+            .children(notification_layer)
+            .into_any_element()
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.persist_session(cx);
+        if self.lock.read(cx).locked() {
+            return self.render_locked(window, cx);
+        }
         let tab_strip = self.render_tab_strip(cx);
         let copilot = if self.copilot_open {
             self.active_copilot(window, cx)
@@ -4858,6 +4920,14 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_minimize))
             .on_action(cx.listener(Self::on_show_shortcuts))
             .on_action(cx.listener(Self::on_open_workspace))
+            // Input resets the idle time of the lock.
+            .capture_key_down(
+                cx.listener(|this, _, _, cx| this.lock.update(cx, |l, _| l.activity())),
+            )
+            .capture_any_mouse_down(
+                cx.listener(|this, _, _, cx| this.lock.update(cx, |l, _| l.activity())),
+            )
+            .on_mouse_move(cx.listener(|this, _, _, cx| this.lock.update(cx, |l, _| l.activity())))
             // The rest only when they have something to act on: on macOS
             // the menu bar disables the items whose action is not handled.
             .when(state.updates, |this| {
