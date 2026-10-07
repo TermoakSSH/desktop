@@ -150,7 +150,7 @@ impl SettingsView {
         );
     }
 
-    fn set_dark(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_dark(&mut self, dark: bool, window: &mut Window, cx: &mut Context<Self>) {
         theme::apply(dark, Some(window), cx);
         self.model.update(cx, |m, cx| {
             let mut s = m.settings.clone();

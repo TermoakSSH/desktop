@@ -11,12 +11,12 @@
 use gpui::{Action, App, Menu, MenuItem, SharedString};
 
 use crate::app::{
-    About, AddPane, CheckForUpdates, ClosePane, CloseTab, DuplicateSession, FocusPaneDown,
-    FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize, MoveTabLeft,
-    MoveTabRight, NewHost, NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs, OpenSettings,
-    OpenSftp, PaneToNewTab, PrevTab, QuickConnect, Quit, Reconnect, ReportIssue, SendSnippet,
-    ShowAll, ShowShortcuts, ToggleBroadcast, ToggleCopilot, ToggleFocusMode, ToggleFullScreen,
-    ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+    About, AddPane, CheckForUpdates, ClosePane, CloseTab, CommandPalette, DuplicateSession,
+    FocusPaneDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize,
+    MoveTabLeft, MoveTabRight, NewHost, NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs,
+    OpenSettings, OpenSftp, PaneToNewTab, PrevTab, QuickConnect, Quit, Reconnect, ReportIssue,
+    SendSnippet, ShowAll, ShowShortcuts, ToggleBroadcast, ToggleCopilot, ToggleFocusMode,
+    ToggleFullScreen, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::terminal;
 
@@ -170,6 +170,8 @@ pub fn spec(macos: bool) -> Vec<MenuSpec> {
     menus.push(MenuSpec {
         title: Some("menu.view"),
         entries: vec![
+            item("menu.command_palette", CommandPalette, Nothing),
+            Separator,
             item("menu.home", GoHome, Nothing),
             item("menu.toggle_sidebar", ToggleSidebar, Nothing),
             item("menu.copilot", ToggleCopilot, Terminal),
@@ -268,6 +270,7 @@ pub fn set_menus(cx: &mut App) {
 /// description, macOS keys and Windows/Linux keys.
 pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
+        ("shortcuts.command_palette", "⌘K", "Ctrl+K · Ctrl+Shift+P"),
         ("shortcuts.new_window", "⌘N", "—"),
         ("shortcuts.new_tab", "⌘T", "Ctrl+T"),
         ("shortcuts.local_terminal", "⌘⇧T", "Ctrl+Shift+T"),
@@ -293,7 +296,7 @@ pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
             "Shift+Enter · Shift+F3",
         ),
         ("shortcuts.find_options", "⌥⌘C · ⌥⌘R", "Alt+C · Alt+R"),
-        ("shortcuts.clear", "⌘K", "Ctrl+Shift+K"),
+        ("shortcuts.clear", "⌘⇧K", "Ctrl+Shift+K"),
         ("shortcuts.add_pane", "⌘D", "Ctrl+Shift+D"),
         ("shortcuts.focus_mode", "⌘⇧M", "Ctrl+Shift+M"),
         ("shortcuts.move_pane", "⌘⌥←↑→↓", "Ctrl+Alt+←↑→↓"),

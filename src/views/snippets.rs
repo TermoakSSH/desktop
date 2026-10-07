@@ -55,7 +55,12 @@ impl SnippetsView {
         }
     }
 
-    fn edit(&mut self, rec: Option<Item<Snippet>>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn edit(
+        &mut self,
+        rec: Option<Item<Snippet>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let data = rec.map(|r| r.rec.data);
         let name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -734,11 +739,13 @@ pub fn snippet_input(script: &str, run: bool) -> String {
 /// Terminal → Send snippet: picks a snippet, fills its variables and types
 /// it into the focused terminal or, in a split view, into every pane ("Run
 /// in all panes", checked while broadcasting). `on_send` gets the text and
-/// whether it goes to all the panes.
+/// whether it goes to all the panes. `preselect` chooses a snippet first
+/// (the command palette, for one with variables to fill in).
 pub fn open_send_dialog(
     model: Entity<AppModel>,
     split: bool,
     broadcast: bool,
+    preselect: Option<Id>,
     window: &mut Window,
     cx: &mut gpui::App,
     on_send: impl Fn(String, bool, &mut Window, &mut gpui::App) + 'static,
@@ -752,7 +759,7 @@ pub fn open_send_dialog(
         );
         return;
     }
-    let dialog = cx.new(|cx| SendDialog::new(model, split, broadcast, window, cx));
+    let dialog = cx.new(|cx| SendDialog::new(model, split, broadcast, preselect, window, cx));
     let on_send = std::rc::Rc::new(on_send);
     window.open_dialog(cx, move |d, _, _| {
         let (paste, run, enter) = (dialog.clone(), dialog.clone(), dialog.clone());
@@ -828,6 +835,7 @@ impl SendDialog {
         model: Entity<AppModel>,
         split: bool,
         broadcast: bool,
+        preselect: Option<Id>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -851,7 +859,9 @@ impl SendDialog {
                 }
             },
         );
-        let selected = model.read(cx).snippets.first().map(|s| s.data.id);
+        let selected = preselect
+            .filter(|id| model.read(cx).snippets.iter().any(|s| s.data.id == *id))
+            .or_else(|| model.read(cx).snippets.first().map(|s| s.data.id));
         let mut dialog = Self {
             model,
             search,

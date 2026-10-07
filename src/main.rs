@@ -33,6 +33,7 @@ mod links;
 mod local_ai;
 mod menus;
 mod notifications;
+mod palette;
 mod panes;
 mod prompts;
 mod qr;

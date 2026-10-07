@@ -121,7 +121,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-g", FindPrevious, Some(FIND_CONTEXT)),
         KeyBinding::new("cmd-alt-c", ToggleFindCase, Some(FIND_CONTEXT)),
         KeyBinding::new("cmd-alt-r", ToggleFindRegex, Some(FIND_CONTEXT)),
-        KeyBinding::new("cmd-k", ClearTerminal, Some(CONTEXT)),
+        // ⌘K opens the command palette (see `app::init`).
+        KeyBinding::new("cmd-shift-k", ClearTerminal, Some(CONTEXT)),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -137,6 +138,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-c", ToggleFindCase, Some(FIND_CONTEXT)),
         KeyBinding::new("alt-r", ToggleFindRegex, Some(FIND_CONTEXT)),
         KeyBinding::new("ctrl-shift-k", ClearTerminal, Some(CONTEXT)),
+        // Ctrl+K belongs to the shell (kill to the end of the line, nano's
+        // cut): elsewhere it opens the command palette (see `app::init`).
+        KeyBinding::new("ctrl-k", send("\x0b"), Some(CONTEXT)),
     ]);
 }
 

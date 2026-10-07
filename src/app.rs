@@ -65,6 +65,7 @@ use crate::views::vaults;
 use crate::windows;
 
 mod command_notice;
+mod palette;
 
 actions!(
     termoak,
@@ -117,7 +118,9 @@ actions!(
         /// Moves the active tab one place to the right.
         MoveTabRight,
         /// Takes the focused pane out of the split view into a tab of its own.
-        PaneToNewTab
+        PaneToNewTab,
+        /// Command palette: search hosts, tabs, snippets, sessions and actions.
+        CommandPalette
     ]
 );
 
@@ -141,6 +144,7 @@ const DEFAULT_FONT_SIZE: f32 = 14.;
 pub fn init(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.bind_keys([
+        KeyBinding::new("cmd-k", CommandPalette, Some(CONTEXT)),
         KeyBinding::new("cmd-t", NewTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-t", NewLocalTerminal, Some(CONTEXT)),
         KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
@@ -174,6 +178,10 @@ pub fn init(cx: &mut App) {
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
+        // In the terminal Ctrl+K belongs to the shell: there the palette
+        // opens with Ctrl+Shift+P (see `terminal::init`).
+        KeyBinding::new("ctrl-k", CommandPalette, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-p", CommandPalette, Some(CONTEXT)),
         KeyBinding::new("ctrl-t", NewTab, Some(CONTEXT)),
         KeyBinding::new("ctrl-shift-t", NewLocalTerminal, Some(CONTEXT)),
         // In the terminal, Ctrl+W belongs to the shell: there tabs close with Ctrl+Shift+W.
@@ -205,6 +213,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-shift-pagedown", MoveTabRight, Some(CONTEXT)),
     ]);
     crate::views::hosts::init(cx);
+    palette::init(cx);
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
     // Deferred: the action arrives while the window in front is being
     // updated, and the new one is placed from its bounds.
@@ -2611,6 +2620,16 @@ impl AppView {
     }
 
     fn on_send_snippet(&mut self, _: &SendSnippet, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_send_snippet(None, window, cx);
+    }
+
+    /// "Send snippet" for the active terminal (with `preselect` chosen).
+    fn open_send_snippet(
+        &mut self,
+        preselect: Option<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(p) = self.active_panes() else {
             return;
         };
@@ -2621,6 +2640,7 @@ impl AppView {
             self.model.clone(),
             split,
             broadcast,
+            preselect,
             window,
             cx,
             move |script, all, window, cx| {
@@ -4276,6 +4296,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_full_screen))
             .on_action(cx.listener(Self::on_minimize))
             .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_command_palette))
             // The rest only when they have something to act on: on macOS
             // the menu bar disables the items whose action is not handled.
             .when(state.updates, |this| {

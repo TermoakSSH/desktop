@@ -96,6 +96,17 @@ impl SessionRow {
     }
 }
 
+/// A session that can be attached to (for the command palette).
+#[derive(Debug, Clone)]
+pub struct Attachable {
+    pub id: Id,
+    pub title: String,
+    /// Account whose server has it.
+    pub account: Id,
+    /// Its state, or who shared it.
+    pub detail: String,
+}
+
 pub struct ServerSessionsView {
     model: Entity<AppModel>,
     active: Vec<SessionRow>,
@@ -148,6 +159,48 @@ impl ServerSessionsView {
         };
         view.refresh(window, cx);
         view
+    }
+
+    /// Your running sessions and the ones shared with you, as last loaded.
+    pub fn attachable(&self) -> Vec<Attachable> {
+        let state = |s: &str| match s {
+            "running" => t!("server_sessions.state.running"),
+            "connecting" => t!("server_sessions.state.connecting"),
+            "host_offline" => t!("server_sessions.state.host_offline"),
+            "failed" => t!("server_sessions.state.failed"),
+            _ => t!("server_sessions.state.closed"),
+        };
+        let own = self
+            .active
+            .iter()
+            .filter(|r| r.state != "closed" && r.access == "owner")
+            .map(|r| Attachable {
+                id: r.id,
+                title: r.title.clone(),
+                account: r.account,
+                detail: state(&r.state).to_string(),
+            });
+        let shared = self
+            .active
+            .iter()
+            .filter(|r| r.state != "closed" && r.access != "owner")
+            .chain(self.shared.iter().filter(|r| r.state != "closed"))
+            .map(|r| Attachable {
+                id: r.id,
+                title: r.title.clone(),
+                account: r.account,
+                detail: match &r.owner_name {
+                    Some(name) => t!("palette.session_shared_by", name = name).to_string(),
+                    None => t!("palette.session_shared").to_string(),
+                },
+            });
+        let mut out: Vec<Attachable> = Vec::new();
+        for s in own.chain(shared) {
+            if !out.iter().any(|o| o.id == s.id) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     /// Accounts in sight that can be asked (signed in).

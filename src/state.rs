@@ -92,6 +92,9 @@ pub struct Settings {
     /// How many server sessions were running when the Home notice about
     /// them was closed (it comes back when there are more).
     pub cloud_notice_dismissed: usize,
+    /// Entries of the command palette used last (most recent first, see
+    /// `palette::remember`).
+    pub palette_recent: Vec<String>,
 }
 
 impl Default for Settings {
@@ -114,6 +117,7 @@ impl Default for Settings {
             last_vaults: BTreeMap::new(),
             layout_notice_seen: false,
             cloud_notice_dismissed: 0,
+            palette_recent: Vec::new(),
         }
     }
 }
