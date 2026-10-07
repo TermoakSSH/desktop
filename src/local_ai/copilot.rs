@@ -748,21 +748,24 @@ pub async fn suggest(
     serde_json::to_value(suggestion).map_err(|e| e.to_string())
 }
 
-/// Quick assistant on this computer: explains a text, in the shape of
-/// `POST /api/v1/ai/explain` (`answer`, `provider`).
+/// Quick assistant on this computer: explains a text (with an optional
+/// question about it), in the shape of `POST /api/v1/ai/explain`
+/// (`answer`, `provider`).
 pub async fn explain(
     store: &Store,
     settings: &AiSettings,
     text: &str,
+    question: Option<&str>,
     context: Value,
 ) -> Result<Value, String> {
     let run = prepare(store, settings).await.map_err(|e| e.to_string())?;
     let registry = Registry::new(run.config);
     let ctx = serde_json::from_value(context).unwrap_or_default();
     let cancel = CancellationToken::new();
-    let turn = termoak_ai::assist::explain_with(&registry, &run.chain, text, None, &ctx, &cancel)
-        .await
-        .map_err(|e| error_text(&e))?;
+    let turn =
+        termoak_ai::assist::explain_with(&registry, &run.chain, text, question, &ctx, &cancel)
+            .await
+            .map_err(|e| error_text(&e))?;
     record_usage(
         store,
         None,

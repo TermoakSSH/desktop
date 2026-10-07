@@ -64,7 +64,15 @@ pub struct MarkScanner {
 
 impl MarkScanner {
     /// The marks in the next piece of output, in order.
+    #[cfg(test)]
     pub fn scan(&mut self, bytes: &[u8]) -> Vec<Mark> {
+        self.scan_at(bytes).into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// The marks in the next piece of output, in order, each with the
+    /// offset in `bytes` right after it (where the command's output starts
+    /// after `C`, or where it ended at `D`).
+    pub fn scan_at(&mut self, bytes: &[u8]) -> Vec<(usize, Mark)> {
         let mut marks = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
@@ -85,11 +93,11 @@ impl MarkScanner {
                 Scan::Esc if b == 0x1b => Scan::Esc,
                 Scan::Esc => Scan::Ground,
                 Scan::Osc(buf) | Scan::OscEsc(buf) if b == 0x07 => {
-                    marks.extend(parse(&buf));
+                    marks.extend(parse(&buf).map(|m| (i + 1, m)));
                     Scan::Ground
                 }
                 Scan::OscEsc(buf) if b == b'\\' => {
-                    marks.extend(parse(&buf));
+                    marks.extend(parse(&buf).map(|m| (i + 1, m)));
                     Scan::Ground
                 }
                 // Another sequence starts: this OSC was cut.
@@ -258,11 +266,12 @@ pub struct CommandWatch {
 impl CommandWatch {
     /// The user pressed Enter at a shell line (not in a full-screen
     /// program): `command` is the line if it is known and `prompt` what was
-    /// in front of it.
-    pub fn enter(&mut self, now: Instant, command: Option<String>, prompt: Option<String>) {
+    /// in front of it. Returns whether a new command started (without
+    /// shell integration; with it, the `C` mark starts it).
+    pub fn enter(&mut self, now: Instant, command: Option<String>, prompt: Option<String>) -> bool {
         self.next_command = command.clone();
         if self.integrated {
-            return;
+            return false;
         }
         // Enter while a program is busy printing is input for it, not a
         // new command; after a quiet moment it is a new one (the previous
@@ -273,7 +282,7 @@ impl CommandWatch {
             .as_ref()
             .is_some_and(|r| now.saturating_duration_since(r.last_output) < IDLE)
         {
-            return;
+            return false;
         }
         self.run = Some(Run {
             started: now,
@@ -283,6 +292,7 @@ impl CommandWatch {
             interactive: false,
             marked: false,
         });
+        true
     }
 
     /// Output arrived, with these marks in it; `alt_screen` is the screen in
@@ -400,6 +410,20 @@ mod tests {
         // A cut OSC followed by a new one.
         assert_eq!(s.scan(b"\x1b]133;\x1b]133;C\x07"), vec![Mark::Executed]);
         assert!(s.scan(b"\x1b]133;Z\x07\x1b]1337;x\x07").is_empty());
+    }
+
+    #[test]
+    fn marks_know_where_they_end() {
+        let mut s = MarkScanner::default();
+        let out = b"ls\r\n\x1b]133;C\x07a.txt\r\n\x1b]133;D;0\x1b\\$ ";
+        let marks = s.scan_at(out);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(&out[marks[0].0..marks[0].0 + 5], b"a.txt");
+        assert_eq!(marks[1].1, Mark::Finished(Some(0)));
+        assert_eq!(&out[marks[1].0..], b"$ ");
+        // Split across pieces: the offset is in the piece where it ends.
+        assert!(s.scan_at(b"\x1b]133").is_empty());
+        assert_eq!(s.scan_at(b";C\x07out"), vec![(3, Mark::Executed)]);
     }
 
     #[test]

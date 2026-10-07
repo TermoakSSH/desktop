@@ -41,8 +41,8 @@ use crate::runtime;
 use crate::sharing::{self, SessionNotice};
 use crate::state::{self as app_state, AppModel, ModelEvent, ToastKind};
 use crate::terminal::{
-    PaneAction, PaneChrome, RequestKind, ShareRequest, TermKind, TermState, TerminalEvent,
-    TerminalView, serial::SerialParams,
+    CopilotRequest, PaneAction, PaneChrome, RequestKind, ShareRequest, TermKind, TermState,
+    TerminalEvent, TerminalView, serial::SerialParams,
 };
 use crate::ui::{self, IconName};
 use crate::update::{self, UpdateEvent, UpdateModel, UpdateStatus};
@@ -1286,9 +1286,19 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> Option<Entity<AiChat>> {
         let term = self.focused_terminal()?;
+        Some(self.copilot_of(term, window, cx))
+    }
+
+    /// Copilot of a terminal (created the first time).
+    fn copilot_of(
+        &mut self,
+        term: Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<AiChat> {
         let key = term.entity_id();
         if let Some((chat, _)) = self.copilots.get(&key) {
-            return Some(chat.clone());
+            return chat.clone();
         }
         let model = self.model.clone();
         let weak = term.downgrade();
@@ -1303,14 +1313,21 @@ impl AppView {
             },
         );
         self.copilots.insert(key, (chat.clone(), sub));
-        Some(chat)
+        chat
     }
 
     fn set_copilot(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let opening = open && !self.copilot_open;
         self.copilot_open = open;
         if open {
             if let Some(chat) = self.active_copilot(window, cx) {
-                chat.update(cx, |c, cx| c.focus_input(window, cx));
+                chat.update(cx, |c, cx| {
+                    // The terminal's context, as removable chips.
+                    if opening {
+                        c.load_terminal_context(cx);
+                    }
+                    c.focus_input(window, cx)
+                });
             }
         } else {
             // Once closed, the AI stops working and loses access to the terminal.
@@ -1320,6 +1337,46 @@ impl AppView {
             // The focus goes back to the terminal.
             self.activate(self.active, window, cx);
         }
+        cx.notify();
+    }
+
+    /// A terminal asks its copilot for something (explain a failed command
+    /// or the selection, ask about the selection): it opens, focused on that
+    /// terminal, with its context.
+    fn copilot_request(
+        &mut self,
+        id: EntityId,
+        req: CopilotRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((tab, pane)) = self.find_pane(id) else {
+            return;
+        };
+        let Some(term) = self.tabs[tab]
+            .panes()
+            .and_then(|p| p.views().find(|v| v.entity_id() == id).cloned())
+        else {
+            return;
+        };
+        if self.active != Some(tab) {
+            self.activate(Some(tab), window, cx);
+        }
+        if let TabContent::Terminal(p) = &mut self.tabs[tab].content
+            && p.focused != pane
+        {
+            p.focused = pane;
+            self.sync_panes(tab, cx);
+        }
+        self.copilot_open = true;
+        let chat = self.copilot_of(term, window, cx);
+        chat.update(cx, |c, cx| {
+            c.load_terminal_context(cx);
+            match req {
+                CopilotRequest::Ask => c.focus_input(window, cx),
+                CopilotRequest::Explain(req) => c.quick_explain(req, window, cx),
+            }
+        });
         cx.notify();
     }
 
@@ -1651,6 +1708,7 @@ impl AppView {
         match ev {
             TerminalEvent::TitleChanged => cx.notify(),
             TerminalEvent::CommandFinished(done) => self.on_command_finished(id, done, window, cx),
+            TerminalEvent::Copilot(req) => self.copilot_request(id, req.clone(), window, cx),
             TerminalEvent::ShareRequest(req) => self.on_share_request(id, req, window, cx),
             TerminalEvent::ShareRequestDone { kind, participant } => {
                 window.remove_notification1::<ShareRequestToast>(

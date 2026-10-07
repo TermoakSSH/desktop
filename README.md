@@ -176,7 +176,19 @@ to every pane with the antenna lit (here, all but the log tail on
   messages. Next to each terminal, the **copilot** panel (Ctrl+Shift+I,
   Cmd+I on macOS) chats about that terminal, explains the selection or the
   screen, and suggests commands that are typed into the terminal without
-  pressing Enter.
+  pressing Enter. It opens with the terminal's context as chips you can
+  remove before sending (host and system, directory, last command with its
+  exit status and output, selection); obvious secrets (passwords, tokens,
+  `Authorization` headers, AWS keys, private keys) are hidden before
+  anything from the terminal goes to the AI.
+- **AI in the terminal**: when a command fails, a chip at the bottom right
+  offers *Explain* (in the copilot, with the command and its output) and
+  *Fix* (a corrected command typed at the prompt, never run; can be turned
+  off in Settings). Selected text has *Ask AI about this*, *Explain this*
+  and *Explain this error* in the right-click menu (Ctrl+Shift+E, Cmd+Shift+E
+  on macOS). Type `# what you want` at the prompt and press Ctrl+Enter
+  (Cmd+Enter) to get the command in its place, with its explanation and
+  risk; dangerous ones ask first.
 - **Account and sync** (Settings): sign in (with the two-step verification
   code, or a recovery code, if the account asks for it) or create an account
   (with an invitation code or link, checked while you type: "You will join
@@ -292,6 +304,8 @@ AppImage (Linux) and `.app` packed in a `.tar.gz` (macOS). See
 | Move the tab left / right | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown | Ctrl+Shift+PageUp / Ctrl+Shift+PageDown |
 | Back to home | Ctrl+Shift+H | Cmd+1 |
 | Show / hide the AI copilot | Ctrl+Shift+I | Cmd+I |
+| Explain the selection with AI | Ctrl+Shift+E | Cmd+Shift+E |
+| `# request` at the prompt → command (AI) | Ctrl+Enter | Cmd+Enter |
 | Copy / paste in the terminal | Ctrl+Shift+C / Ctrl+Shift+V (or Shift+Insert) | Cmd+C / Cmd+V |
 | Select the whole terminal | Ctrl+Shift+A | Cmd+A |
 | Scroll back up / down | Shift+PageUp / Shift+PageDown | Shift+PageUp / Shift+PageDown |

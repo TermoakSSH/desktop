@@ -129,16 +129,19 @@ pub async fn collect_output(
     }
     let text = termoak_ssh::ansi::strip(&String::from_utf8_lossy(&out));
     TerminalOutput {
-        text: termoak_ssh::ansi::tail(&text, 8000).to_string(),
+        // Obvious secrets are hidden before the AI gets it.
+        text: crate::terminal::redact::redact(termoak_ssh::ansi::tail(&text, 8000)),
         still_running,
     }
 }
 
-/// The end of a screen's text, at most `max_chars`.
+/// The end of a screen's text, at most `max_chars`, with its obvious
+/// secrets hidden (it goes to the AI).
 pub fn screen_tail(screen: &str, max_chars: usize) -> String {
     let trimmed = screen.trim_end();
     let n = trimmed.chars().count();
-    trimmed.chars().skip(n.saturating_sub(max_chars)).collect()
+    let tail: String = trimmed.chars().skip(n.saturating_sub(max_chars)).collect();
+    crate::terminal::redact::redact(&tail)
 }
 
 #[cfg(test)]
@@ -229,5 +232,9 @@ mod tests {
     fn tails() {
         assert_eq!(screen_tail("abc\ndef\n\n", 3), "def");
         assert_eq!(screen_tail("ab", 10), "ab");
+        assert_eq!(
+            screen_tail("$ x\npassword=hunter2\n", 100),
+            "$ x\npassword=[redacted]"
+        );
     }
 }
