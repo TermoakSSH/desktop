@@ -738,14 +738,19 @@ impl AppView {
         });
 
         // The AI that runs on this computer: its tools reach the terminals
-        // of every window through these requests.
+        // of every window through these requests, and see the hosts of the
+        // current view (kept up to date by `AppModel::reload`).
         let (terminals, mut term_rx) = LocalTerminals::new();
-        let store = model.read(cx).ws.store.clone();
+        let (ws, view) = {
+            let m = model.read(cx);
+            (m.ws.clone(), m.ai_view())
+        };
         let rt = runtime::handle(cx);
         let local_ai = {
             let _rt = rt.enter();
-            Arc::new(LocalAi::new(store, Arc::new(terminals)))
+            Arc::new(LocalAi::new(ws, Arc::new(terminals)))
         };
+        local_ai.hosts.set_view(view);
         cx.set_global(LocalAiGlobal(local_ai.clone()));
         Self::start_local_engine(local_ai, model, cx);
         cx.spawn(async move |_, cx| {

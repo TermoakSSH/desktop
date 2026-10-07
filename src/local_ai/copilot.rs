@@ -10,8 +10,9 @@
 //!   local MCP endpoint (127.0.0.1, random port and token, only for the run).
 //!
 //! The tools are the server copilot's ones, but on this computer: the hosts
-//! of the local vault (over the app's own SSH engine), the terminals open in
-//! the app, files over SFTP and memories. Every call goes through the same
+//! the app shows (This device and the accounts in view, see [`super::hosts`],
+//! over the app's own SSH engine), the terminals open in the app, files over
+//! SFTP and memories. Every call goes through the same
 //! permission policy (read-only / ask / confirm / auto) and the approvals
 //! are shown in the copilot. Usage and cost are recorded in the local
 //! database, without plan limits. Nothing goes to the Termoak server.
@@ -28,6 +29,7 @@ use termoak_ai::agent::{AgentHooks, AgentRun, SYSTEM_PROMPT, context_block, run_
 use termoak_ai::config::{AiConfig, Driver, ProviderConfig, split_spec};
 use termoak_ai::engine::AiEngine;
 use termoak_ai::engine::{TaskEvent, TaskStatus};
+use termoak_ai::hosts::HostProvider;
 use termoak_ai::mcp::McpTools;
 use termoak_ai::mcp_http::LocalMcpServer;
 use termoak_ai::message::{Message, Usage};
@@ -36,15 +38,14 @@ use termoak_ai::pricing::{UsageCost, builtin_price, cost_micros};
 use termoak_ai::provider::{Registry, ToolSpec};
 use termoak_ai::tools::{ToolContext, ToolLimits, ToolOutcome, ToolRuntime, truncate_middle};
 use termoak_ai::{AiError, ChainSource, SessionAccess};
-use termoak_client::LOCAL_OWNER;
-use termoak_core::model::Memory;
+use termoak_client::{LOCAL_OWNER, Workspace};
 use termoak_core::store::AiUsageRow;
 use termoak_core::{Id, Store, new_id};
-use termoak_ssh::{ConnectionPool, HostKeyPolicy};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::agents;
+use super::hosts::WorkspaceHosts;
 use super::keys;
 use super::{AiSettings, LocalSource, LocalTarget, local_target};
 
@@ -56,9 +57,11 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// What the local AI needs, shared by every copilot and by the local AI
 /// tasks (created once, inside the tokio runtime).
 pub struct LocalAi {
+    /// The device store: settings, keys, AI tasks and usage.
     pub store: Store,
+    /// The hosts, snippets and memories of the current view.
+    pub hosts: Arc<WorkspaceHosts>,
     pub tools: Arc<ToolRuntime>,
-    pool: Arc<ConnectionPool>,
     terminals: Arc<dyn SessionAccess>,
     /// Engine of the AI tasks on this computer (started with
     /// [`LocalAi::start_engine`]) and its MCP endpoint for agents.
@@ -66,18 +69,15 @@ pub struct LocalAi {
 }
 
 impl LocalAi {
-    /// Tools over the local vault, the app's SSH engine (known hosts only:
-    /// nobody can confirm a new host key in the middle of a task) and the
-    /// app's terminals.
-    pub fn new(store: Store, terminals: Arc<dyn SessionAccess>) -> Self {
-        let pool = ConnectionPool::new(
-            store.clone(),
-            HostKeyPolicy::Strict,
-            Duration::from_secs(300),
-        );
-        let tools = ToolRuntime::new(
-            store.clone(),
-            pool.clone(),
+    /// Tools over the hosts of the workspace's current view (This device and
+    /// the accounts in sight, each host in its own store), the app's SSH
+    /// engine (known hosts only: nobody can confirm a new host key in the
+    /// middle of a task) and the app's terminals. Needs a tokio runtime.
+    pub fn new(ws: Workspace, terminals: Arc<dyn SessionAccess>) -> Self {
+        let store = ws.store.clone();
+        let hosts = WorkspaceHosts::new(ws);
+        let tools = ToolRuntime::with_hosts(
+            hosts.clone(),
             Some(terminals.clone()),
             ToolLimits {
                 command_timeout: Duration::from_secs(120),
@@ -86,8 +86,8 @@ impl LocalAi {
         );
         Self {
             store,
+            hosts,
             tools: Arc::new(tools),
-            pool,
             terminals,
             engine: Mutex::new(None),
         }
@@ -126,9 +126,9 @@ impl LocalAi {
         if stopped > 0 {
             tracing::info!(stopped, "local AI tasks stopped when the app was closed");
         }
-        let engine = AiEngine::new(
+        let engine = AiEngine::with_hosts(
             self.store.clone(),
-            self.pool.clone(),
+            self.hosts.clone(),
             Some(self.terminals.clone()),
             config,
         )
@@ -484,12 +484,12 @@ impl LocalConversation {
             let mode = self.state.lock().mode;
             let memories: Vec<String> = self
                 .services
-                .store
-                .list::<Memory>(LOCAL_OWNER)
+                .hosts
+                .memories(LOCAL_OWNER)
                 .await
                 .unwrap_or_default()
                 .into_iter()
-                .map(|m| m.data.content)
+                .map(|m| m.content)
                 .collect();
             context_block(
                 mode,
@@ -890,7 +890,6 @@ impl McpTools for ConversationTools {
 #[cfg(test)]
 mod tests {
     use termoak_ai::TerminalOutput;
-    use termoak_core::crypto::MasterKey;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -934,8 +933,7 @@ mod tests {
     }
 
     fn services(term: Arc<FakeTerminal>) -> Arc<LocalAi> {
-        let store = Store::open_in_memory(MasterKey::generate()).unwrap();
-        Arc::new(LocalAi::new(store, term))
+        Arc::new(LocalAi::new(crate::local_ai::hosts::test_workspace(), term))
     }
 
     async fn next_approval(rx: &mut mpsc::UnboundedReceiver<TaskEvent>) -> Id {

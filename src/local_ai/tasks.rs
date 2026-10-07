@@ -207,9 +207,8 @@ mod tests {
     use termoak_ai::config::AiConfig;
     use termoak_ai::engine::TaskEvent;
     use termoak_ai::{ChainEntry, ChainSource, SessionAccess, SessionSummary, TerminalOutput};
-    use termoak_core::crypto::MasterKey;
+    use termoak_core::new_id;
     use termoak_core::store::AiTaskRow;
-    use termoak_core::{Store, new_id};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -370,9 +369,10 @@ mod tests {
             json!({"choices": [], "usage": {"prompt_tokens": 150, "completion_tokens": 8, "cost": 0.0006}}),
         ];
         let (url, seen) = mock_openai(vec![tool_turn, text_turn]).await;
-        let store = Store::open_in_memory(MasterKey::generate()).unwrap();
+        let ws = crate::local_ai::hosts::test_workspace();
+        let store = ws.store.clone();
         let term = Arc::new(FakeTerminal::default());
-        let local = Arc::new(LocalAi::new(store.clone(), term.clone()));
+        let local = Arc::new(LocalAi::new(ws.clone(), term.clone()));
         let engine = local
             .start_engine_with(config(&url), Arc::new(MockChain))
             .await
@@ -446,7 +446,7 @@ mod tests {
         row.status = "running".into();
         row.finished_at = None;
         store.ai_update_task(row).await.unwrap();
-        let restarted = Arc::new(LocalAi::new(store.clone(), term.clone()));
+        let restarted = Arc::new(LocalAi::new(ws.clone(), term.clone()));
         let engine = restarted
             .start_engine_with(config(&url), Arc::new(MockChain))
             .await

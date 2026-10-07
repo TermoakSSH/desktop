@@ -924,6 +924,14 @@ impl AppModel {
         }
     }
 
+    /// What the AI on this computer sees: the stores of the current view.
+    pub fn ai_view(&self) -> crate::local_ai::hosts::AiView {
+        crate::local_ai::hosts::AiView {
+            filter: self.item_filter(),
+            first: self.current_account,
+        }
+    }
+
     /// Stores of the current view.
     fn item_filter(&self) -> ItemFilter {
         match self.view {
@@ -944,6 +952,10 @@ impl AppModel {
         let ws = self.ws.clone();
         let filter = self.item_filter();
         let first = self.current_account;
+        // The AI on this computer sees the same stores.
+        if let Some(ai) = cx.try_global::<crate::local_ai::copilot::LocalAiGlobal>() {
+            ai.0.hosts.set_view(self.ai_view());
+        }
         // Only the latest reload is applied (an older one may end later).
         self.reload_gen += 1;
         let generation = self.reload_gen;

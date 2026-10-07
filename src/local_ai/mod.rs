@@ -6,13 +6,14 @@
 //!   ([`keys`]) or with an agent installed here ([`agents`]).
 //!
 //! With "This computer", the copilot runs here ([`copilot`]), with the tools
-//! over the local vault, the app's SSH engine and its terminals
-//! ([`terminals`]). AI tasks still run only on the server: the AI section
+//! over the hosts the app shows ([`hosts`]: This device and the accounts in
+//! view), the app's SSH engine and its terminals ([`terminals`]). AI tasks still run only on the server: the AI section
 //! says so and sends nothing (they come next, through [`RunOn`] and
 //! [`local_target`] as well).
 
 pub mod agents;
 pub mod copilot;
+pub mod hosts;
 pub mod keys;
 pub mod tasks;
 pub mod terminals;
