@@ -478,6 +478,12 @@ impl TerminalView {
         &self.kind
     }
 
+    /// The name it opened with (the host's, or the server session's
+    /// title), without what the shell sets later.
+    pub fn opened_as(&self) -> &str {
+        &self.host_label
+    }
+
     /// What the AI (copilot) needs to know about this terminal.
     pub fn copilot_context(&self, cx: &App) -> AiContext {
         let (host_id, session_id) = match &self.kind {

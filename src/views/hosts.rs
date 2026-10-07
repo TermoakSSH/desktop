@@ -37,6 +37,7 @@ use crate::host_status::{self, HostStatus, Probe, Shown, Skip};
 use crate::state::{AppModel, Item};
 use crate::theme;
 use crate::ui::{self, IconName};
+use crate::workspaces::{self, SavedWorkspace, Workspaces};
 
 /// Margin to tell a click from a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(280);
@@ -227,6 +228,8 @@ pub struct HostsView {
     status: Entity<HostStatus>,
     /// What each card on screen shows (worked out when rendering).
     shown: HashMap<Id, Shown>,
+    /// Saved workspaces ("Add to workspace").
+    workspaces: Entity<Workspaces>,
 }
 
 impl EventEmitter<OpenRequest> for HostsView {}
@@ -236,9 +239,11 @@ impl HostsView {
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("hosts.search_placeholder")));
         let status = HostStatus::global(&model, cx);
+        let workspaces = Workspaces::global(&model, cx);
         let subs = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&status, |_, _, cx| cx.notify()),
+            cx.observe(&workspaces, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -260,6 +265,7 @@ impl HostsView {
             kbd_menu: None,
             status,
             shown: HashMap::new(),
+            workspaces,
         }
     }
 
@@ -312,6 +318,110 @@ impl HostsView {
             }
             m.save_settings(s, cx);
         });
+    }
+
+    // ----- Workspaces -----
+
+    /// "Add to workspace" → a saved one.
+    fn add_to_workspace(
+        &mut self,
+        ws: Id,
+        ids: Vec<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .workspaces
+            .read(cx)
+            .get(ws)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        self.workspaces
+            .update(cx, |w, cx| w.add_hosts(ws, &ids, cx));
+        ui::success(
+            window,
+            cx,
+            tn!("workspaces.hosts_added", ids.len(), name = name),
+        );
+    }
+
+    /// "Add to workspace" → "New workspace…".
+    fn new_workspace_with(&mut self, ids: Vec<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        let default = workspaces::next_name(
+            &t!("workspaces.default_name"),
+            &self.workspaces.read(cx).list,
+        );
+        let list = self.workspaces.clone();
+        workspaces::ask_name(
+            window,
+            cx,
+            t!("workspaces.new_title"),
+            default,
+            None,
+            move |name, window, cx| {
+                let mut layout = workspaces::Layout::default();
+                for id in &ids {
+                    layout.add_host(*id);
+                }
+                list.update(cx, |w, cx| {
+                    w.add(SavedWorkspace::new(name.clone(), layout), cx)
+                });
+                ui::success(window, cx, t!("workspaces.saved", name = name));
+            },
+        );
+    }
+
+    /// The "Add to workspace" submenu.
+    fn workspace_submenu(
+        menu: PopupMenu,
+        view: WeakEntity<Self>,
+        ids: Vec<Id>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let list: Vec<(Id, String)> = view
+            .upgrade()
+            .map(|v| {
+                v.read(cx)
+                    .workspaces
+                    .read(cx)
+                    .list
+                    .iter()
+                    .map(|w| (w.id, w.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        menu.submenu_with_icon(
+            Some(ui::icon(IconName::LayoutPanelLeft)),
+            t!("workspaces.add_to"),
+            window,
+            cx,
+            move |mut sub, _, _| {
+                for (ws, name) in list.clone() {
+                    let (w, ids) = (view.clone(), ids.clone());
+                    sub = sub.item(PopupMenuItem::new(name).on_click(move |_, window, cx| {
+                        if let Some(v) = w.upgrade() {
+                            let ids = ids.clone();
+                            v.update(cx, |v, cx| v.add_to_workspace(ws, ids, window, cx));
+                        }
+                    }));
+                }
+                if !list.is_empty() {
+                    sub = sub.separator();
+                }
+                let (w, ids) = (view.clone(), ids.clone());
+                sub.item(
+                    PopupMenuItem::new(t!("workspaces.new_menu"))
+                        .icon(ui::icon(IconName::Plus))
+                        .on_click(move |_, window, cx| {
+                            if let Some(v) = w.upgrade() {
+                                let ids = ids.clone();
+                                v.update(cx, |v, cx| v.new_workspace_with(ids, window, cx));
+                            }
+                        }),
+                )
+            },
+        )
     }
 
     /// Opens the editor of a host (or an empty one to create it).
@@ -736,6 +846,7 @@ impl HostsView {
             return menu;
         };
         let move_ids = targets.clone();
+        let ws_ids = targets.clone();
         let n = targets.len();
         let w = view.clone();
         let act = move |f: fn(&mut HostsView, Vec<Id>, &mut Window, &mut Context<HostsView>)| {
@@ -831,6 +942,7 @@ impl HostsView {
                         .icon(ui::icon(IconName::LayoutGrid))
                         .on_click(act(|v, ids, _, cx| v.open_split(ids, false, cx))),
                 );
+            let menu = Self::workspace_submenu(menu, view.clone(), ws_ids, window, cx);
             let menu = menu.when(status_on, |menu| {
                 menu.item(
                     PopupMenuItem::new(t!("host_status.check_now"))
@@ -884,6 +996,7 @@ impl HostsView {
                         }
                     })),
             );
+        let menu = Self::workspace_submenu(menu, view.clone(), ws_ids, window, cx);
         let menu = menu
             .when(status_on && !status_off, |menu| {
                 menu.item(

@@ -14,9 +14,9 @@ use crate::app::{
     About, AddPane, CheckForUpdates, ClosePane, CloseTab, DuplicateSession, FocusPaneDown,
     FocusPaneLeft, FocusPaneRight, FocusPaneUp, GoHome, Hide, HideOthers, Minimize, MoveTabLeft,
     MoveTabRight, NewHost, NewLocalTerminal, NewTab, NewWindow, NextTab, OpenDocs, OpenSettings,
-    OpenSftp, PaneToNewTab, PrevTab, QuickConnect, Quit, Reconnect, ReportIssue, SendSnippet,
-    ShowAll, ShowShortcuts, ToggleBroadcast, ToggleCopilot, ToggleFocusMode, ToggleFullScreen,
-    ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
+    OpenSftp, OpenWorkspace, PaneToNewTab, PrevTab, QuickConnect, Quit, Reconnect, ReportIssue,
+    SaveWorkspace, SendSnippet, ShowAll, ShowShortcuts, ToggleBroadcast, ToggleCopilot,
+    ToggleFocusMode, ToggleFullScreen, ToggleSidebar, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::terminal;
 
@@ -148,6 +148,9 @@ pub fn spec(macos: bool) -> Vec<MenuSpec> {
             item("menu.new_local_terminal", NewLocalTerminal, Nothing),
             item("menu.new_host", NewHost, Nothing),
             item("menu.quick_connect", QuickConnect, Nothing),
+            Separator,
+            item("menu.open_workspace", OpenWorkspace, Nothing),
+            item("menu.save_workspace", SaveWorkspace, AnyTab),
             Separator,
             item("menu.close_pane", ClosePane, Split),
             item("menu.close_tab", CloseTab, AnyTab),

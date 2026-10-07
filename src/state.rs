@@ -97,6 +97,8 @@ pub struct Settings {
     pub host_status: bool,
     /// Hosts whose status is not checked (on this device).
     pub host_status_off: Vec<Id>,
+    /// The tabs of the previous session open again at start.
+    pub reopen_tabs: bool,
 }
 
 impl Default for Settings {
@@ -121,6 +123,7 @@ impl Default for Settings {
             cloud_notice_dismissed: 0,
             host_status: true,
             host_status_off: Vec::new(),
+            reopen_tabs: true,
         }
     }
 }

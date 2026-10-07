@@ -63,6 +63,9 @@ use crate::views::snippets::SnippetsView;
 use crate::views::teams::TeamsView;
 use crate::views::vaults;
 use crate::windows;
+use crate::workspaces::{
+    self as saved, Layout, Mode, PlanPane, PlanTab, SavedPane, SavedTab, Workspaces,
+};
 
 actions!(
     termoak,
@@ -115,7 +118,11 @@ actions!(
         /// Moves the active tab one place to the right.
         MoveTabRight,
         /// Takes the focused pane out of the split view into a tab of its own.
-        PaneToNewTab
+        PaneToNewTab,
+        /// Saves the tabs of the window as a named workspace.
+        SaveWorkspace,
+        /// Chooses a saved workspace to open.
+        OpenWorkspace
     ]
 );
 
@@ -454,8 +461,24 @@ pub struct AppView {
     cloud_sessions: usize,
     /// Where what is being dragged would land (only drawn while dragging).
     drop_hint: Option<DropHint>,
+    /// Saved workspaces and the last session's tabs (shared by the windows).
+    workspaces: Entity<Workspaces>,
+    /// Whether this window still has to reopen the last session's tabs.
+    restore: Restore,
+    /// The first window of the app (it opens the others of the last session).
+    primary: bool,
+    /// Your server sessions known to be running (last time they were asked).
+    running_sessions: Option<Vec<Id>>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
+}
+
+/// Reopening the last session's tabs in a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restore {
+    /// When the hosts and the saved session are read.
+    Waiting,
+    Done,
 }
 
 impl AppView {
@@ -488,6 +511,7 @@ impl AppView {
         let teams = cx.new(|cx| TeamsView::new(model.clone(), window, cx));
         let admin = cx.new(|cx| AdminView::new(model.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(model.clone(), updates.clone(), window, cx));
+        let workspaces = Workspaces::global(&model, cx);
 
         let mut subs = vec![
             cx.observe_in(&model, window, |this, model, window, cx| {
@@ -496,6 +520,11 @@ impl AppView {
                 if this.section == Section::Admin && !model.read(cx).is_admin() {
                     this.select_section(Section::Hosts, window, cx);
                 }
+                this.try_restore(window, cx);
+                cx.notify();
+            }),
+            cx.observe_in(&workspaces, window, |this, _, window, cx| {
+                this.try_restore(window, cx);
                 cx.notify();
             }),
             cx.subscribe_in(&model, window, |this, _, ev: &ModelEvent, window, cx| {
@@ -544,6 +573,14 @@ impl AppView {
                 windows::set_active(window, window.is_window_active(), cx);
             }),
         ];
+        // A window that closes leaves the saved session (unless it is the
+        // last one: its tabs reopen next time).
+        let me = cx.entity_id();
+        let closing = workspaces.clone();
+        subs.push(cx.on_release(move |_, cx| {
+            let others = !windows::views(cx).is_empty();
+            closing.update(cx, |w, _| w.window_closed(me, others));
+        }));
         subs.push(cx.subscribe_in(&hosts, window, Self::on_open_request));
         subs.push(cx.subscribe_in(&keychain, window, Self::on_open_request));
         subs.push(cx.subscribe_in(&snippets, window, Self::on_open_request));
@@ -554,6 +591,15 @@ impl AppView {
         subs.push(cx.subscribe_in(&settings, window, Self::on_open_request));
 
         let logged_in = model.read(cx).logged_in();
+        // The first window reopens the last session's tabs (and opens the
+        // other windows it had); those windows take theirs.
+        let restore = if !model.read(cx).settings.reopen_tabs {
+            Restore::Done
+        } else if start_services || workspaces.update(cx, |w, _| w.claim_session_window()) {
+            Restore::Waiting
+        } else {
+            Restore::Done
+        };
         let mut view = Self {
             model,
             updates,
@@ -577,6 +623,10 @@ impl AppView {
             copilots: HashMap::new(),
             cloud_sessions: 0,
             drop_hint: None,
+            workspaces,
+            restore,
+            primary: start_services,
+            running_sessions: None,
             focus: cx.focus_handle(),
             _subs: subs,
         };
@@ -591,6 +641,7 @@ impl AppView {
         if logged_in {
             view.restore_cloud_tabs(first, window, cx);
         }
+        view.try_restore(window, cx);
         // The layout notice may have come before this window existed.
         if start_services {
             let app = cx.entity().downgrade();
@@ -1084,6 +1135,7 @@ impl AppView {
                     })
                     .collect();
                 this.cloud_sessions = running.len();
+                this.running_sessions = Some(running.iter().map(|(id, _, _)| *id).collect());
                 // Sessions that ended lower the count the Home notice was
                 // closed with: a new one shows it again.
                 let dismissed = this.model.read(cx).settings.cloud_notice_dismissed;
@@ -1109,7 +1161,9 @@ impl AppView {
                 for id in ended {
                     this.drop_dormant(id);
                 }
-                if add_tabs {
+                // While the last session's tabs are still to reopen, they
+                // come first; this runs again after them.
+                if add_tabs && this.restore == Restore::Done {
                     let me = cx.entity_id();
                     for (session_id, title, account) in running {
                         let open = this
@@ -3528,6 +3582,533 @@ impl AppView {
             .into_any_element()
     }
 
+    // ----- Workspaces and the last session -----
+
+    /// Reopens the last session's tabs once the hosts and the saved session
+    /// are read.
+    fn try_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restore != Restore::Waiting {
+            return;
+        }
+        if !self.model.read(cx).loaded || !self.workspaces.read(cx).session_ready() {
+            return;
+        }
+        self.restore = Restore::Done;
+        let (layout, more) = self.workspaces.update(cx, |w, _| w.take_session_window());
+        // The other windows the last session had.
+        if self.primary {
+            for _ in 0..more {
+                self.workspaces.update(cx, |w, _| w.expect_session_window());
+                cx.defer(windows::open_new);
+            }
+        }
+        match layout {
+            Some(layout) if !layout.is_empty() => {
+                self.open_layout(layout, Mode::Restore, window, cx)
+            }
+            // Nothing to reopen: the running server sessions, as usual.
+            _ => self.cloud_tabs_after_restore(window, cx),
+        }
+    }
+
+    /// After reopening the last session, the running server sessions that
+    /// are not open yet come as dormant tabs (first window).
+    fn cloud_tabs_after_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model.read(cx).logged_in() {
+            let add = windows::is_first_window(window, cx);
+            self.restore_cloud_tabs(add, window, cx);
+        }
+    }
+
+    /// Opens the tabs of a layout (the last session or a workspace): first
+    /// it finds out which of its hosts still exist on this device (some may
+    /// be in accounts or vaults out of sight).
+    fn open_layout(
+        &mut self,
+        layout: Layout,
+        mode: Mode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (ws, loaded) = {
+            let m = self.model.read(cx);
+            let loaded: HashSet<Id> = m.hosts.iter().map(|h| h.data.id).collect();
+            (m.ws.clone(), loaded)
+        };
+        let unknown: Vec<Id> = layout
+            .host_ids()
+            .into_iter()
+            .filter(|h| !loaded.contains(h))
+            .collect();
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                let mut found = Vec::new();
+                for h in unknown {
+                    if ws.locate(h).await.is_ok() {
+                        found.push(h);
+                    }
+                }
+                Ok::<_, String>(found)
+            },
+            move |this, res, window, cx| {
+                let mut exists = loaded;
+                exists.extend(res.unwrap_or_default());
+                this.apply_layout(&layout, mode, &exists, window, cx);
+            },
+        );
+    }
+
+    /// How a planned terminal opens (`None`: it cannot, already said).
+    fn request_of(
+        &self,
+        pane: PlanPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<OpenRequest> {
+        Some(match pane {
+            PlanPane::Ssh(host_id) => return self.route_local(host_id, window, cx),
+            PlanPane::Attach {
+                session_id,
+                account,
+                title,
+            } => OpenRequest::Attach {
+                session_id,
+                title,
+                account,
+            },
+            PlanPane::NewServer(host_id) => OpenRequest::Server { host_id },
+            PlanPane::Shell => OpenRequest::Shell,
+            PlanPane::Serial { path, baud } => OpenRequest::Serial(SerialParams { path, baud }),
+        })
+    }
+
+    fn apply_layout(
+        &mut self,
+        layout: &Layout,
+        mode: Mode,
+        exists: &HashSet<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open_sessions: Vec<Id> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.server_sessions(cx))
+            .collect();
+        let plan = {
+            let m = self.model.read(cx);
+            let host_exists = |h: Id| exists.contains(&h);
+            let signed_in = |a: Option<Id>| m.api_of(a).is_some();
+            saved::plan(
+                layout,
+                mode,
+                &saved::Env {
+                    host_exists: &host_exists,
+                    signed_in: &signed_in,
+                    running: self.running_sessions.as_deref(),
+                    open_sessions: &open_sessions,
+                },
+            )
+        };
+        // Planned tab → index of the tab opened for it.
+        let mut opened: Vec<Option<usize>> = Vec::with_capacity(plan.tabs.len());
+        for tab in plan.tabs {
+            let content = match tab {
+                PlanTab::Sftp(host_id) => {
+                    let model = self.model.clone();
+                    let view = cx.new(|cx| SftpView::new(model, host_id, None, window, cx));
+                    Some((TabContent::Sftp(view), None))
+                }
+                PlanTab::Dormant {
+                    session_id,
+                    account,
+                    title,
+                } => Some((
+                    TabContent::Dormant {
+                        session_id,
+                        title,
+                        account,
+                    },
+                    None,
+                )),
+                PlanTab::Terminal {
+                    panes,
+                    focused,
+                    maximized,
+                    title,
+                } => {
+                    let reqs: Vec<OpenRequest> = panes
+                        .into_iter()
+                        .filter_map(|p| self.request_of(p, window, cx))
+                        .collect();
+                    let views: Vec<Entity<TerminalView>> = reqs
+                        .iter()
+                        .filter_map(|r| self.make_terminal(r, window, cx))
+                        .collect();
+                    if views.is_empty() {
+                        None
+                    } else {
+                        let items: Vec<Pane> = views
+                            .into_iter()
+                            .map(|v| self.new_pane(v, window, cx))
+                            .collect();
+                        let mut p = Panes::new(items);
+                        p.focused = focused.min(p.items.len() - 1);
+                        p.maximized = maximized && p.is_split();
+                        Some((TabContent::Terminal(p), title))
+                    }
+                }
+            };
+            match content {
+                Some((content, custom_title)) => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.tabs.push(Tab {
+                        id,
+                        content,
+                        custom_title,
+                    });
+                    let ix = self.tabs.len() - 1;
+                    self.sync_panes(ix, cx);
+                    opened.push(Some(ix));
+                }
+                None => opened.push(None),
+            }
+        }
+        if let Some(ix) = plan.active.and_then(|a| opened.get(a).copied().flatten()) {
+            self.activate(Some(ix), window, cx);
+        }
+        if plan.skipped > 0 {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                match mode {
+                    Mode::Restore => tn!("workspaces.restore_skipped", plan.skipped),
+                    Mode::Open => tn!("workspaces.open_skipped", plan.skipped),
+                },
+            );
+        }
+        if mode == Mode::Restore {
+            self.cloud_tabs_after_restore(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The tabs of the window as they would be saved.
+    fn layout_snapshot(&self, cx: &App) -> Layout {
+        let m = self.model.read(cx);
+        let current = m.current_account;
+        let mut tabs = Vec::new();
+        let mut active = None;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let saved = match &tab.content {
+                TabContent::Terminal(p) => {
+                    let mut panes = Vec::new();
+                    let mut focused = 0;
+                    for (j, pane) in p.items.iter().enumerate() {
+                        let v = pane.view.read(cx);
+                        if let Some(sp) = saved::pane_of(v.kind(), v.opened_as(), current) {
+                            if j == p.focused {
+                                focused = panes.len();
+                            }
+                            panes.push(sp);
+                        }
+                    }
+                    (!panes.is_empty()).then(|| SavedTab::Terminal {
+                        panes,
+                        focused,
+                        maximized: p.maximized,
+                        title: tab.custom_title.clone(),
+                    })
+                }
+                TabContent::Sftp(s) => match s.read(cx).duplicate_request() {
+                    OpenRequest::Sftp { host_id, .. } => Some(SavedTab::Sftp { host_id }),
+                    _ => None,
+                },
+                TabContent::Dormant {
+                    session_id,
+                    title,
+                    account,
+                } => Some(SavedTab::Terminal {
+                    panes: vec![SavedPane::Server {
+                        host_id: None,
+                        session_id: Some(*session_id),
+                        account: Some(*account),
+                        title: title.clone(),
+                    }],
+                    focused: 0,
+                    maximized: false,
+                    title: tab.custom_title.clone(),
+                }),
+            };
+            if let Some(t) = saved {
+                if self.active == Some(i) {
+                    active = Some(tabs.len());
+                }
+                tabs.push(t);
+            }
+        }
+        Layout { tabs, active }
+    }
+
+    /// Keeps the saved session up to date with the tabs (when they change).
+    fn persist_session(&self, cx: &mut Context<Self>) {
+        if self.restore != Restore::Done || !self.model.read(cx).settings.reopen_tabs {
+            return;
+        }
+        let layout = self.layout_snapshot(cx);
+        let me = cx.entity_id();
+        self.workspaces
+            .update(cx, |w, _| w.window_changed(me, layout));
+    }
+
+    /// Opens a saved workspace (its tabs are added to the window).
+    pub(crate) fn open_workspace(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = self.workspaces.read(cx).get(id).map(|w| w.layout.clone()) else {
+            return;
+        };
+        if layout.is_empty() {
+            ui::notify(window, cx, ToastKind::Info, t!("workspaces.empty"));
+            return;
+        }
+        self.open_layout(layout, Mode::Open, window, cx);
+    }
+
+    /// "Save tabs as workspace…": asks for a name.
+    fn save_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = self.layout_snapshot(cx);
+        if layout.is_empty() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Info,
+                t!("workspaces.nothing_to_save"),
+            );
+            return;
+        }
+        let default = saved::next_name(
+            &t!("workspaces.default_name"),
+            &self.workspaces.read(cx).list,
+        );
+        let workspaces = self.workspaces.clone();
+        let count = layout.tabs.len();
+        saved::ask_name(
+            window,
+            cx,
+            t!("workspaces.save_title"),
+            default,
+            Some(tn!("workspaces.save_hint", count)),
+            move |name, window, cx| {
+                let w = saved::SavedWorkspace::new(name.clone(), layout.clone());
+                workspaces.update(cx, |list, cx| list.add(w, cx));
+                ui::success(window, cx, t!("workspaces.saved", name = name));
+            },
+        );
+    }
+
+    /// "Replace with the current tabs".
+    fn replace_workspace(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = self.layout_snapshot(cx);
+        if layout.is_empty() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Info,
+                t!("workspaces.nothing_to_save"),
+            );
+            return;
+        }
+        let name = self
+            .workspaces
+            .read(cx)
+            .get(id)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        self.workspaces
+            .update(cx, |w, cx| w.set_layout(id, layout, cx));
+        ui::success(window, cx, t!("workspaces.saved", name = name));
+    }
+
+    fn rename_workspace(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.workspaces.read(cx).get(id).map(|w| w.name.clone()) else {
+            return;
+        };
+        let workspaces = self.workspaces.clone();
+        saved::ask_name(
+            window,
+            cx,
+            t!("workspaces.rename_title"),
+            name,
+            None,
+            move |name, _, cx| workspaces.update(cx, |w, cx| w.rename(id, name, cx)),
+        );
+    }
+
+    fn delete_workspace(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.workspaces.read(cx).get(id).map(|w| w.name.clone()) else {
+            return;
+        };
+        let workspaces = self.workspaces.clone();
+        ui::confirm(
+            window,
+            cx,
+            t!("workspaces.delete_title"),
+            t!("workspaces.delete_message", name = name),
+            t!("common.delete"),
+            true,
+            move |_, cx| workspaces.update(cx, |w, cx| w.remove(id, cx)),
+        );
+    }
+
+    /// Menu of a workspace (right click in the sidebar).
+    fn workspace_menu(
+        menu: PopupMenu,
+        weak: gpui::WeakEntity<Self>,
+        id: Id,
+        has_tabs: bool,
+    ) -> PopupMenu {
+        let act = move |f: fn(&mut AppView, Id, &mut Window, &mut Context<AppView>)| {
+            let weak = weak.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                if let Some(app) = weak.upgrade() {
+                    app.update(cx, |this, cx| f(this, id, window, cx));
+                }
+            }
+        };
+        menu.item(
+            PopupMenuItem::new(t!("workspaces.menu.open"))
+                .icon(ui::icon(IconName::SquareTerminal))
+                .on_click(act(Self::open_workspace)),
+        )
+        .item(
+            PopupMenuItem::new(t!("workspaces.menu.replace"))
+                .icon(ui::icon(IconName::Save))
+                .disabled(!has_tabs)
+                .on_click(act(Self::replace_workspace)),
+        )
+        .item(
+            PopupMenuItem::new(t!("workspaces.menu.rename"))
+                .icon(ui::icon(IconName::Pencil))
+                .on_click(act(Self::rename_workspace)),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new(t!("workspaces.menu.delete"))
+                .icon(ui::icon(IconName::Trash))
+                .on_click(act(Self::delete_workspace)),
+        )
+    }
+
+    /// File → Open workspace…: the saved workspaces in a dialog.
+    fn open_workspace_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let list: Vec<(Id, String, usize)> = self
+            .workspaces
+            .read(cx)
+            .list
+            .iter()
+            .map(|w| (w.id, w.name.clone(), w.layout.tabs.len()))
+            .collect();
+        if list.is_empty() {
+            ui::notify(window, cx, ToastKind::Info, t!("workspaces.none_yet"));
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title(t!("workspaces.open_title"))
+                .w(px(420.))
+                .child(v_flex().gap_1().children(list.iter().enumerate().map(
+                    |(i, (id, name, tabs))| {
+                        let (id, weak) = (*id, weak.clone());
+                        h_flex()
+                            .id(("open-workspace", i))
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .gap_3()
+                            .items_center()
+                            .rounded(cx.theme().radius)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().secondary_hover))
+                            .child(ui::icon(IconName::LayoutPanelLeft).size(px(16.)))
+                            .child(div().flex_1().min_w_0().child(name.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(tn!("workspaces.tab_count", *tabs)),
+                            )
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                if let Some(app) = weak.upgrade() {
+                                    app.update(cx, |this, cx| this.open_workspace(id, window, cx));
+                                }
+                            })
+                    },
+                )))
+        });
+    }
+
+    fn on_save_workspace(
+        &mut self,
+        _: &SaveWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_workspace(window, cx);
+    }
+
+    fn on_open_workspace(
+        &mut self,
+        _: &OpenWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_workspace_picker(window, cx);
+    }
+
+    /// The Workspaces group of the sidebar: one click opens one.
+    fn render_workspaces_group(&self, cx: &mut Context<Self>) -> SidebarGroup<SidebarMenu> {
+        let has_tabs = !self.tabs.is_empty();
+        let weak = cx.entity().downgrade();
+        let mut menu = SidebarMenu::new();
+        for w in &self.workspaces.read(cx).list {
+            let id = w.id;
+            let (w_click, w_menu) = (weak.clone(), weak.clone());
+            menu = menu.child(
+                SidebarMenuItem::new(w.name.clone())
+                    .icon(ui::icon(IconName::LayoutPanelLeft).size(px(18.)))
+                    .min_h(px(34.))
+                    .px_3()
+                    .gap_x_3()
+                    .on_click(move |_, window, cx| {
+                        if let Some(app) = w_click.upgrade() {
+                            app.update(cx, |this, cx| this.open_workspace(id, window, cx));
+                        }
+                    })
+                    .context_menu(move |menu, _, _| {
+                        Self::workspace_menu(menu, w_menu.clone(), id, has_tabs)
+                    }),
+            );
+        }
+        menu = menu.child(
+            SidebarMenuItem::new(t!("workspaces.save_current"))
+                .icon(ui::icon(IconName::BookmarkPlus).size(px(18.)))
+                .min_h(px(34.))
+                .px_3()
+                .gap_x_3()
+                .disable(!has_tabs)
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.save_workspace(window, cx)),
+                ),
+        );
+        SidebarGroup::new(t!("app.group.workspaces")).child(menu)
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let collapsed = self.sidebar_collapsed;
         let model = self.model.read(cx);
@@ -3635,6 +4216,7 @@ impl AppView {
             });
         let switcher = self.render_switcher(collapsed, cx);
         let picker = self.render_vault_picker(collapsed, cx);
+        let workspaces = self.render_workspaces_group(cx);
         let theme = cx.theme();
         Sidebar::new("sidebar")
             .w(px(232.))
@@ -3692,6 +4274,7 @@ impl AppView {
                         .child(item(Section::KnownHosts, cx)),
                 ),
             )
+            .child(workspaces)
             .child(SidebarGroup::new(t!("app.group.server")).child({
                 let menu = SidebarMenu::new()
                     .child(item(Section::Ai, cx))
@@ -4161,6 +4744,7 @@ impl Focusable for AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.persist_session(cx);
         let tab_strip = self.render_tab_strip(cx);
         let copilot = if self.copilot_open {
             self.active_copilot(window, cx)
@@ -4273,6 +4857,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::on_full_screen))
             .on_action(cx.listener(Self::on_minimize))
             .on_action(cx.listener(Self::on_show_shortcuts))
+            .on_action(cx.listener(Self::on_open_workspace))
             // The rest only when they have something to act on: on macOS
             // the menu bar disables the items whose action is not handled.
             .when(state.updates, |this| {
@@ -4280,6 +4865,7 @@ impl Render for AppView {
             })
             .when(state.any_tab, |this| {
                 this.on_action(cx.listener(Self::on_close_tab))
+                    .on_action(cx.listener(Self::on_save_workspace))
             })
             .when(state.active_tab, |this| {
                 this.on_action(cx.listener(Self::on_move_tab_left))
@@ -4322,5 +4908,6 @@ impl Render for AppView {
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
+            .into_any_element()
     }
 }

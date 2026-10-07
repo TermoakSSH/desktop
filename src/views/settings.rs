@@ -1,6 +1,6 @@
 //! Settings: the current account (with two-step verification), appearance,
 //! language, terminal (with autocomplete), copy and paste, the hosts list
-//! (status checks), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
+//! and tabs (status checks, reopening the tabs), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
 //! AI (where it runs, API keys, AI credit) have their own pages.
 
 use gpui::{
@@ -401,7 +401,8 @@ impl SettingsView {
             )
     }
 
-    /// Hosts list: the status check of the hosts.
+    /// Hosts list and tabs: the status check of the hosts and reopening
+    /// the tabs at start.
     fn render_hosts_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let settings = self.model.read(cx).settings.clone();
         let muted = cx.theme().muted_foreground;
@@ -424,6 +425,25 @@ impl SettingsView {
                         })),
                 )
                 .child(hint(t!("settings.hosts_tabs.host_status_hint"))),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    Switch::new("reopen-tabs")
+                        .label(t!("settings.hosts_tabs.reopen_tabs"))
+                        .checked(settings.reopen_tabs)
+                        .on_click(cx.listener(|this, v: &bool, _, cx| {
+                            let v = *v;
+                            this.set_paste(cx, |s| s.reopen_tabs = v);
+                            // Off: what was kept is forgotten.
+                            if !v {
+                                let ws = crate::workspaces::Workspaces::global(&this.model, cx);
+                                ws.update(cx, |w, _| w.clear_session());
+                            }
+                        })),
+                )
+                .child(hint(t!("settings.hosts_tabs.reopen_tabs_hint"))),
         )
     }
 

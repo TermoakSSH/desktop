@@ -46,6 +46,7 @@ mod ui;
 mod update;
 mod views;
 mod windows;
+mod workspaces;
 
 use std::sync::Arc;
 use std::time::Duration;
