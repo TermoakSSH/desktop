@@ -63,6 +63,12 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots", "
 # Public data of a share link (`GET /api/v1/join/{token}`, no account); the
 # same version and features termoak-client already uses.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Import: SecureCRT and ZOC XML exports.
+roxmltree = "0.21"
+
+# Import: PuTTY sessions from the registry (HKCU\Software\SimonTatham\PuTTY).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 # Native GPUI platform (Metal on macOS, DirectX on Windows, Vulkan on Linux).
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]

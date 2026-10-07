@@ -29,6 +29,7 @@ mod accounts;
 mod app;
 mod dock;
 mod drag;
+mod importers;
 mod links;
 mod local_ai;
 mod menus;

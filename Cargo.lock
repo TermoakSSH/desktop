@@ -8395,6 +8395,7 @@ dependencies = [
  "parking_lot",
  "polling",
  "reqwest",
+ "roxmltree 0.21.1",
  "rust-i18n",
  "semver",
  "serde",
@@ -8413,6 +8414,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "winreg 0.55.0",
  "zeroize",
 ]
 
