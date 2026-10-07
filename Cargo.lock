@@ -8293,8 +8293,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.4.0"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.4.0#19e36b0f12cd8d77c5d9e33a5870b3f129cd7df5"
+version = "0.5.0-next.1"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8319,8 +8319,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.4.0"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.4.0#19e36b0f12cd8d77c5d9e33a5870b3f129cd7df5"
+version = "0.5.0-next.1"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8346,8 +8346,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.4.0"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.4.0#19e36b0f12cd8d77c5d9e33a5870b3f129cd7df5"
+version = "0.5.0-next.1"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -8418,8 +8418,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.4.0"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.4.0#19e36b0f12cd8d77c5d9e33a5870b3f129cd7df5"
+version = "0.5.0-next.1"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8440,8 +8440,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.4.0"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.4.0#19e36b0f12cd8d77c5d9e33a5870b3f129cd7df5"
+version = "0.5.0-next.1"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
 dependencies = [
  "base64 0.22.1",
  "chrono",

@@ -1510,6 +1510,8 @@
   "terminal.kind.serial": "Serial",
   "terminal.kind.server": "Server",
   "terminal.kind.shell": "This computer",
+  "terminal.latency.tooltip_host": "Latency to %{host} (round trip)",
+  "terminal.latency.tooltip_server": "Latency to the Termoak server %{server} (round trip). The latency from the server to the host is not included.",
   "terminal.menu.add_pane": "Split view: add terminal…",
   "terminal.menu.broadcast": "Broadcast input",
   "terminal.menu.clear": "Clear",

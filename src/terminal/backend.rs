@@ -34,6 +34,9 @@ pub enum Cmd {
     CloseSession,
     /// Something about the keyboard or the people in a shared session.
     Share(ShareAction),
+    /// Measures the latency (see [`super::latency`]); `None` if there is no
+    /// answer or this kind of terminal has none.
+    Latency(oneshot::Sender<Option<std::time::Duration>>),
 }
 
 /// Actions in a shared session: asking for the keyboard (participants) and
@@ -243,7 +246,7 @@ async fn run_local(
                     cmd = cmd_rx.recv() => match cmd {
                         Some(Cmd::Close) | Some(Cmd::CloseSession) | None => return,
                         Some(Cmd::Resize(c, r)) => size = (c, r),
-                        Some(Cmd::Input(_)) | Some(Cmd::Share(_)) => {}
+                        Some(Cmd::Input(_)) | Some(Cmd::Share(_)) | Some(Cmd::Latency(_)) => {}
                     }
                 }
             }
@@ -308,6 +311,13 @@ async fn run_local(
                 Some(Cmd::Resize(c, r)) => { let _ = term.resize(c, r).await; }
                 // Sharing a local terminal goes through its relay.
                 Some(Cmd::Share(_)) => {}
+                // Measured apart: the output keeps flowing meanwhile.
+                Some(Cmd::Latency(reply)) => {
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(conn.latency(super::latency::TIMEOUT).await.ok());
+                    });
+                }
                 Some(Cmd::Close) | Some(Cmd::CloseSession) | None => {
                     term.close().await;
                     return;
@@ -502,6 +512,12 @@ async fn run_server(
                 Some(Cmd::Resize(c, r)) => remote.resize(c, r).await,
                 Some(Cmd::CloseSession) => remote.close_session().await,
                 Some(Cmd::Share(action)) => share_action(&remote, action).await,
+                Some(Cmd::Latency(reply)) => {
+                    let remote = remote.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(remote.latency(super::latency::TIMEOUT).await);
+                    });
+                }
                 Some(Cmd::Close) | None => {
                     remote.detach().await;
                     return;

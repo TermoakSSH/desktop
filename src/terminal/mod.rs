@@ -7,6 +7,7 @@ pub mod backend;
 pub mod complete;
 mod element;
 pub mod input;
+pub mod latency;
 pub mod model;
 pub mod mouse;
 pub mod paste;
@@ -32,6 +33,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::text::TextView;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, WindowExt, h_flex, v_flex};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -300,6 +302,12 @@ pub struct TerminalView {
     find: Option<FindBar>,
     /// Live sharing: participants, keyboard, requests.
     share: ShareState,
+    /// Latency shown in the toolbar (SSH from here and server sessions).
+    latency: latency::Probe,
+    /// Measurement in progress, then the wait for the next one.
+    latency_task: Option<Task<()>>,
+    /// Termoak server of a server session (for the latency tooltip).
+    latency_server: Option<String>,
     _reader: Option<Task<()>>,
 }
 
@@ -357,6 +365,9 @@ impl TerminalView {
             context_menu: None,
             find: None,
             share: ShareState::default(),
+            latency: latency::Probe::default(),
+            latency_task: None,
+            latency_server: None,
             _reader: None,
         }
     }
@@ -576,9 +587,18 @@ impl TerminalView {
         self.clear_line();
         self.model.reset();
         self.reset_share();
+        self.latency.stop();
+        self.latency_task = None;
         let (cols, rows) = (self.model.cols(), self.model.rows());
         let app = self.app.read(cx);
         let rt = runtime::handle(cx);
+        self.latency_server = match &self.kind {
+            TermKind::Server { link: Some(l), .. } => Some(latency::server_name(l.api.base_url())),
+            TermKind::Server { account, .. } => app
+                .api_of(*account)
+                .map(|a| latency::server_name(a.base_url())),
+            _ => None,
+        };
         let started = match &self.kind {
             TermKind::Local { host_id } => Some(backend::start_local(
                 &rt,
@@ -956,6 +976,70 @@ impl TerminalView {
             self.pane = pane;
             cx.notify();
         }
+    }
+
+    /// Starts a latency measurement if it is due (called when rendering,
+    /// so only terminals on screen measure). Paused while not connected.
+    fn poll_latency(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.kind, TermKind::Local { .. } | TermKind::Server { .. }) {
+            return;
+        }
+        let connected = matches!(self.state, TermState::Running) && self.backend.is_some();
+        if !connected {
+            self.latency.stop();
+            self.latency_task = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        if !self.latency.due(now, connected) {
+            return;
+        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        backend.send(Cmd::Latency(reply));
+        let generation = self.latency.start();
+        self.latency_task = Some(cx.spawn(async move |this, cx| {
+            let rtt = answer.await.ok().flatten();
+            let updated = this.update(cx, |v, cx| {
+                if v.latency.finish(generation, rtt, std::time::Instant::now()) {
+                    cx.notify();
+                }
+            });
+            if updated.is_err() {
+                return;
+            }
+            // Renders again when the next one is due (if still on screen).
+            cx.background_executor().timer(latency::INTERVAL).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+    }
+
+    /// Latency badge: text, color and tooltip (`None`: not shown).
+    fn latency_badge(&self, cx: &App) -> Option<(String, gpui::Hsla, SharedString)> {
+        if !matches!(self.state, TermState::Running) {
+            return None;
+        }
+        let tooltip = match &self.kind {
+            TermKind::Local { .. } => t!("terminal.latency.tooltip_host", host = self.label(cx)),
+            TermKind::Server { .. } => t!(
+                "terminal.latency.tooltip_server",
+                server = self
+                    .latency_server
+                    .clone()
+                    .unwrap_or_else(|| self.label(cx))
+            ),
+            TermKind::Shell | TermKind::Serial { .. } => return None,
+        };
+        let rtt = self.latency.value();
+        let theme = cx.theme();
+        let color = match latency::level(rtt) {
+            latency::Level::Unknown | latency::Level::Good => theme.muted_foreground,
+            latency::Level::Fair => theme.warning,
+            latency::Level::Poor => theme.danger,
+        };
+        Some((latency::format(rtt), color, tooltip.to_string().into()))
     }
 
     /// Repeats user input for the other panes while broadcasting.
@@ -2582,6 +2666,7 @@ impl TerminalView {
         let pane = self.pane;
         let compact = pane.is_some();
         let participants = self.render_participants(cx);
+        let latency_badge = self.latency_badge(cx);
         let theme = cx.theme();
         // You own what this tab shows: sharing and ending it are yours.
         let owner = !is_server || self.is_share_owner();
@@ -2642,6 +2727,16 @@ impl TerminalView {
             )
             .when(!compact, |this| {
                 this.child(ui::pill(kind_label, kind_color))
+            })
+            // Also in a split view: it is short.
+            .when_some(latency_badge, |this, (text, color, tooltip)| {
+                this.child(
+                    ui::pill(text, color)
+                        .id("latency")
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+                )
             })
             .when(
                 self.share_session.is_some() && self.relay.is_some() && !compact,
@@ -2949,6 +3044,7 @@ impl Render for TerminalView {
         let palette = TermPalette::for_mode(self.dark_palette(cx));
         let (font, font_size) = self.terminal_font(cx);
         let _ = window;
+        self.poll_latency(cx);
         let toolbar = self.render_toolbar(cx);
         let banners = self.render_share_banners(cx);
         let overlay = self

@@ -1510,6 +1510,8 @@
   "terminal.kind.serial": "Serie",
   "terminal.kind.server": "Servidor",
   "terminal.kind.shell": "Este equipo",
+  "terminal.latency.tooltip_host": "Latencia con %{host} (ida y vuelta)",
+  "terminal.latency.tooltip_server": "Latencia con el servidor de Termoak %{server} (ida y vuelta). No incluye la latencia del servidor al host.",
   "terminal.menu.add_pane": "Vista dividida: añadir terminal…",
   "terminal.menu.broadcast": "Difundir la escritura",
   "terminal.menu.clear": "Limpiar",

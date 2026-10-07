@@ -165,7 +165,7 @@ pub fn start(params: SerialParams) -> (Backend, mpsc::UnboundedReceiver<Out>) {
                     }
                     // A serial port has no window size; sharing goes
                     // through the relay.
-                    Cmd::Resize(..) | Cmd::Share(_) => {}
+                    Cmd::Resize(..) | Cmd::Share(_) | Cmd::Latency(_) => {}
                     Cmd::Close | Cmd::CloseSession => break,
                 }
             }
