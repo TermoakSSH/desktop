@@ -29,6 +29,7 @@ mod accounts;
 mod app;
 mod dock;
 mod drag;
+mod host_status;
 mod links;
 mod local_ai;
 mod menus;

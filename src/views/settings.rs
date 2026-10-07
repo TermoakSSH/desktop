@@ -1,6 +1,6 @@
 //! Settings: the current account (with two-step verification), appearance,
-//! language, terminal (with autocomplete), copy and paste, notifications and
-//! updates. Accounts (sign in, sign out, the account of each server) and the
+//! language, terminal (with autocomplete), copy and paste, the hosts list
+//! (status checks), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
 //! AI (where it runs, API keys, AI credit) have their own pages.
 
 use gpui::{
@@ -399,6 +399,32 @@ impl SettingsView {
                             .child(hint(t!("settings.notifications.ai_hint"))),
                     ),
             )
+    }
+
+    /// Hosts list: the status check of the hosts.
+    fn render_hosts_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let settings = self.model.read(cx).settings.clone();
+        let muted = cx.theme().muted_foreground;
+        let hint = |text: gpui::SharedString| div().text_xs().text_color(muted).child(text);
+        self.render_card(
+            t!("settings.hosts_tabs.title"),
+            IconName::LayoutPanelLeft,
+            cx,
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    Switch::new("host-status")
+                        .label(t!("settings.hosts_tabs.host_status"))
+                        .checked(settings.host_status)
+                        .on_click(cx.listener(|this, v: &bool, _, cx| {
+                            let v = *v;
+                            this.set_paste(cx, |s| s.host_status = v)
+                        })),
+                )
+                .child(hint(t!("settings.hosts_tabs.host_status_hint"))),
+        )
     }
 
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -878,6 +904,7 @@ impl Render for SettingsView {
         let appearance = self.render_appearance(cx);
         let paste = self.render_paste(cx);
         let notifications = self.render_notifications(cx);
+        let hosts_tabs = self.render_hosts_tabs(cx);
         let updates = self.render_updates(cx);
         let about = self.render_about(cx);
         v_flex().size_full().child(header).child(
@@ -889,6 +916,7 @@ impl Render for SettingsView {
                         .child(account)
                         .child(appearance)
                         .child(paste)
+                        .child(hosts_tabs)
                         .child(notifications)
                         .child(updates)
                         .child(about),

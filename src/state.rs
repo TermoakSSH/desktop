@@ -92,6 +92,11 @@ pub struct Settings {
     /// How many server sessions were running when the Home notice about
     /// them was closed (it comes back when there are more).
     pub cloud_notice_dismissed: usize,
+    /// The hosts list shows whether each host answers (a TCP check of its
+    /// SSH port every minute while the list is on screen).
+    pub host_status: bool,
+    /// Hosts whose status is not checked (on this device).
+    pub host_status_off: Vec<Id>,
 }
 
 impl Default for Settings {
@@ -114,6 +119,8 @@ impl Default for Settings {
             last_vaults: BTreeMap::new(),
             layout_notice_seen: false,
             cloud_notice_dismissed: 0,
+            host_status: true,
+            host_status_off: Vec::new(),
         }
     }
 }

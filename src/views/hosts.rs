@@ -6,7 +6,11 @@
 //! host menu; on a group header, "Connect to all" and "Open all in split
 //! view". Cmd/Ctrl+click and Shift+click select several hosts, with a bar to
 //! connect them in tabs or in a split view, move or delete them.
+//!
+//! Each card shows whether its host answers (a dot and the time, see
+//! `host_status.rs`), checked while the list is on screen.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
@@ -29,6 +33,7 @@ use termoak_core::transfer::TransferMode;
 use super::OpenRequest;
 use super::host_editor::{EditorEvent, HostEditor};
 use crate::accounts::{self as vm, AccountRow, Place};
+use crate::host_status::{self, HostStatus, Probe, Shown, Skip};
 use crate::state::{AppModel, Item};
 use crate::theme;
 use crate::ui::{self, IconName};
@@ -218,6 +223,10 @@ pub struct HostsView {
     focus: FocusHandle,
     /// Menu opened from the keyboard on the focused card.
     kbd_menu: Option<(Id, Entity<PopupMenu>, Subscription)>,
+    /// Whether each host answers (shared by the windows).
+    status: Entity<HostStatus>,
+    /// What each card on screen shows (worked out when rendering).
+    shown: HashMap<Id, Shown>,
 }
 
 impl EventEmitter<OpenRequest> for HostsView {}
@@ -226,8 +235,10 @@ impl HostsView {
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("hosts.search_placeholder")));
+        let status = HostStatus::global(&model, cx);
         let subs = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe(&status, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
@@ -247,7 +258,60 @@ impl HostsView {
             order: Vec::new(),
             focus: cx.focus_handle(),
             kbd_menu: None,
+            status,
+            shown: HashMap::new(),
         }
+    }
+
+    // ----- Status -----
+
+    /// What to check for a host, or why it is not checked.
+    fn probe_of(&self, rec: &Item<Host>, cx: &gpui::App) -> Result<Probe, Skip> {
+        let m = self.model.read(cx);
+        let groups: Vec<&Group> = m.groups.iter().map(|g| &g.data).collect();
+        let settings = host_status::effective_settings(&rec.data, &groups);
+        let strict = m.vault_entry_of(rec).is_some_and(vm::VaultEntry::strict);
+        let off = m.settings.host_status_off.contains(&rec.data.id);
+        let (target, needs_password) = host_status::target_of(
+            &rec.data,
+            &settings,
+            strict,
+            rec.access.can_read_secrets(),
+            off,
+        )?;
+        Ok(Probe {
+            host_id: rec.data.id,
+            target,
+            secret: needs_password.then(|| rec.item_ref()),
+        })
+    }
+
+    /// Hosts to check among `ids` (the ones that can be checked).
+    fn probes(&self, ids: &[Id], cx: &gpui::App) -> Vec<Probe> {
+        let m = self.model.read(cx);
+        ids.iter()
+            .filter_map(|id| m.host_record(*id))
+            .filter_map(|rec| self.probe_of(rec, cx).ok())
+            .collect()
+    }
+
+    /// "Check now" (the header button or the host menu).
+    fn check_now(&mut self, ids: Vec<Id>, cx: &mut Context<Self>) {
+        let probes = self.probes(&ids, cx);
+        self.status.update(cx, |s, cx| s.check_now(probes, cx));
+    }
+
+    /// Turns the check off or on for one host (on this device).
+    fn toggle_status_check(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            if let Some(pos) = s.host_status_off.iter().position(|x| *x == id) {
+                s.host_status_off.remove(pos);
+            } else {
+                s.host_status_off.push(id);
+            }
+            m.save_settings(s, cx);
+        });
     }
 
     /// Opens the editor of a host (or an empty one to create it).
@@ -632,6 +696,13 @@ impl HostsView {
         let Some(this) = view.upgrade() else {
             return menu;
         };
+        let (status_on, status_off) = view
+            .upgrade()
+            .map(|v| {
+                let s = &v.read(cx).model.read(cx).settings;
+                (s.host_status, s.host_status_off.contains(&id))
+            })
+            .unwrap_or((false, false));
         let (targets, rec, groups, server, caps, same_place, all_writable) = {
             let v = this.read(cx);
             let m = v.model.read(cx);
@@ -760,6 +831,13 @@ impl HostsView {
                         .icon(ui::icon(IconName::LayoutGrid))
                         .on_click(act(|v, ids, _, cx| v.open_split(ids, false, cx))),
                 );
+            let menu = menu.when(status_on, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("host_status.check_now"))
+                        .icon(ui::icon(IconName::RefreshCw))
+                        .on_click(act(|v, ids, _, cx| v.check_now(ids, cx))),
+                )
+            });
             let menu = move_menu(menu.separator(), window, cx);
             let menu = transfer_items(menu, all_writable, all_writable);
             return menu.when(all_writable, |menu| {
@@ -805,7 +883,30 @@ impl HostsView {
                             });
                         }
                     })),
-            )
+            );
+        let menu = menu
+            .when(status_on && !status_off, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("host_status.check_now"))
+                        .icon(ui::icon(IconName::RefreshCw))
+                        .on_click(act(|v, ids, _, cx| v.check_now(ids, cx))),
+                )
+            })
+            .when(status_on, |menu| {
+                menu.item(
+                    PopupMenuItem::new(if status_off {
+                        t!("host_status.turn_on")
+                    } else {
+                        t!("host_status.turn_off")
+                    })
+                    .icon(ui::icon(IconName::Activity))
+                    .on_click(act(|v, ids, _, cx| {
+                        if let Some(id) = ids.first() {
+                            v.toggle_status_check(*id, cx);
+                        }
+                    })),
+                )
+            })
             .separator()
             .item(
                 PopupMenuItem::new(if caps.edit {
@@ -1239,6 +1340,10 @@ impl HostsView {
                 m.caps_of(rec).use_only_badge,
             )
         };
+        let status = self
+            .shown
+            .get(&host.id)
+            .map(|s| (*s, self.status.read(cx).is_running(host.id)));
         let theme = cx.theme();
         let selected = self.editor.as_ref().and_then(|e| e.read(cx).host_id()) == Some(host.id);
         let (os_label, os_color) = host
@@ -1413,6 +1518,54 @@ impl HostsView {
                             ui::icon(IconName::SquareCheck)
                                 .size(px(16.))
                                 .text_color(theme.primary),
+                        )
+                    })
+                    .when_some(status, |this, (shown, running)| {
+                        let color = match shown {
+                            Shown::Up { .. } => theme.success,
+                            Shown::Down { .. } => theme.danger,
+                            Shown::Pending | Shown::Skipped(_) => theme.muted_foreground,
+                        };
+                        let tip = if running && shown == Shown::Pending {
+                            t!("host_status.checking")
+                        } else {
+                            host_status::tooltip(shown)
+                        };
+                        this.child(
+                            h_flex()
+                                .id(("host-status", ix))
+                                .flex_shrink_0()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .size(px(8.))
+                                        .rounded_full()
+                                        .bg(color)
+                                        .when(matches!(shown, Shown::Skipped(_)), |d| {
+                                            d.opacity(0.5)
+                                        }),
+                                )
+                                .when_some(
+                                    match shown {
+                                        Shown::Up { rtt, .. } => {
+                                            Some(crate::terminal::latency::format(Some(rtt)))
+                                        }
+                                        _ => None,
+                                    },
+                                    |this, ms| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .whitespace_nowrap()
+                                                .child(ms),
+                                        )
+                                    },
+                                )
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                }),
                         )
                     })
                     .child(
@@ -1806,6 +1959,29 @@ impl Render for HostsView {
             self.cursor = None;
         }
 
+        // Whether the hosts on screen answer: what each card shows, and
+        // the ones that are due are checked (only while this renders).
+        self.shown.clear();
+        let status_on = self.model.read(cx).settings.host_status;
+        if status_on {
+            let checks: Vec<(Id, Result<Probe, Skip>)> = {
+                let m = self.model.read(cx);
+                order
+                    .iter()
+                    .filter_map(|id| m.host_record(*id))
+                    .map(|rec| (rec.data.id, self.probe_of(rec, cx)))
+                    .collect()
+            };
+            let status = self.status.read(cx);
+            for (id, check) in &checks {
+                let target = check.as_ref().map(|p| &p.target).map_err(|s| *s);
+                self.shown.insert(*id, status.shown(*id, target));
+            }
+            let probes: Vec<Probe> = checks.into_iter().filter_map(|(_, c)| c.ok()).collect();
+            let status = self.status.clone();
+            cx.defer(move |cx| status.update(cx, |s, cx| s.tick(probes, cx)));
+        }
+
         let warning = cx.theme().warning;
         let total = hosts.len();
         let mut card_ix = 0usize;
@@ -1922,6 +2098,17 @@ impl Render for HostsView {
                                 .prefix(ui::icon(IconName::Search).size(px(14.))),
                         ),
                     )
+                    .when(status_on, |this| {
+                        this.child(
+                            Button::new("check-status")
+                                .icon(ui::icon(IconName::RefreshCw))
+                                .tooltip(t!("host_status.check_now_tooltip"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    let ids = this.order.clone();
+                                    this.check_now(ids, cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("open-shell")
                             .icon(ui::icon(IconName::Laptop))
