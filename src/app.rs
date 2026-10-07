@@ -1553,6 +1553,11 @@ impl AppView {
                 self.settings
                     .update(cx, |s, cx| s.show_page(SettingsPage::Ai, window, cx));
             }
+            OpenRequest::AiTask { host_ids } => {
+                self.select_section(Section::Ai, window, cx);
+                self.ai
+                    .update(cx, |v, cx| v.start_with_hosts(host_ids, window, cx));
+            }
             OpenRequest::Split { hosts, current } => {
                 let reqs: Vec<OpenRequest> = hosts
                     .into_iter()

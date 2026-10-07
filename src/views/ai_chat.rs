@@ -8,7 +8,7 @@ use gpui::{
     Styled, Subscription, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use gpui::Task;
 use termoak_ai::engine::TaskEvent;
 use termoak_ai::policy::PermissionMode;
+use termoak_ai::{ApprovalDecision, ApprovalPreview, HostRun, RiskLevel, TaskPlan};
 
 use crate::local_ai::RunOn;
 use crate::local_ai::copilot::{LocalAiGlobal, LocalConversation, prepare};
@@ -44,6 +45,14 @@ pub struct TaskSummary {
     pub created_at: i64,
     pub cost_micros: i64,
     pub pending: usize,
+    /// A multi-host task: one conversation per host.
+    pub fan_out: bool,
+    /// Hosts it is limited to.
+    pub hosts: usize,
+    /// The multi-host task this host's conversation belongs to.
+    pub parent_id: Option<Id>,
+    /// "Plan before acting".
+    pub plan_first: bool,
 }
 
 impl TaskSummary {
@@ -67,6 +76,10 @@ impl TaskSummary {
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0),
+            fan_out: v["fan_out"].as_bool().unwrap_or(false),
+            hosts: v["host_ids"].as_array().map(|a| a.len()).unwrap_or(0),
+            parent_id: v["parent_id"].as_str().and_then(|s| s.parse().ok()),
+            plan_first: v["plan_first"].as_bool().unwrap_or(false),
         })
     }
 
@@ -84,6 +97,33 @@ struct Approval {
     tool: String,
     summary: String,
     input: Value,
+    /// What to show (servers before 0.5 send none: no edits then).
+    preview: Option<ApprovalPreview>,
+}
+
+impl Approval {
+    /// From a pending approval (`id_key`: `id`) or an `approval_requested`
+    /// event (`approval_id`).
+    fn from(v: &Value, id_key: &str) -> Option<Self> {
+        Some(Self {
+            id: v[id_key].as_str()?.parse().ok()?,
+            tool: v["tool"].as_str().unwrap_or("").to_string(),
+            summary: v["summary"].as_str().unwrap_or("").to_string(),
+            input: v["input"].clone(),
+            preview: serde_json::from_value(v["preview"].clone()).ok(),
+        })
+    }
+
+    fn is_plan(&self) -> bool {
+        self.tool == "plan"
+    }
+
+    /// The command or plan can be edited before approving it.
+    fn editable(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|p| p.editable && (p.command.is_some() || p.plan.is_some()))
+    }
 }
 
 struct TaskDetail {
@@ -91,6 +131,9 @@ struct TaskDetail {
     messages: Vec<Value>,
     approvals: Vec<Approval>,
     error: Option<String>,
+    /// Per-host table of a multi-host task.
+    hosts: Vec<HostRun>,
+    plan: Option<TaskPlan>,
 }
 
 impl TaskDetail {
@@ -103,18 +146,13 @@ impl TaskDetail {
                 .map(|a| {
                     a.iter()
                         .filter(|x| x["status"].as_str().unwrap_or("pending") == "pending")
-                        .filter_map(|x| {
-                            Some(Approval {
-                                id: x["id"].as_str()?.parse().ok()?,
-                                tool: x["tool"].as_str().unwrap_or("").to_string(),
-                                summary: x["summary"].as_str().unwrap_or("").to_string(),
-                                input: x["input"].clone(),
-                            })
-                        })
+                        .filter_map(|x| Approval::from(x, "id"))
                         .collect()
                 })
                 .unwrap_or_default(),
             error: v["error"].as_str().map(str::to_string),
+            hosts: serde_json::from_value(v["hosts"].clone()).unwrap_or_default(),
+            plan: serde_json::from_value(v["plan"].clone()).ok(),
         })
     }
 
@@ -309,6 +347,10 @@ pub struct AiChat {
     /// Copilot conversation running on this computer ("This computer" in
     /// Settings → AI); `task` is its id.
     local: Option<Arc<LocalConversation>>,
+    /// Approval being edited before approving it (its command or plan).
+    editing: Option<(Id, Entity<TextareaState>)>,
+    /// Approval being denied, with the reason for the AI.
+    denying: Option<(Id, Entity<InputState>)>,
     _local_events: Option<Task<()>>,
     scroll: ScrollHandle,
     /// Terminal context sent with the next message (copilot), removable.
@@ -397,6 +439,8 @@ impl AiChat {
             bound_session: None,
             blocked: None,
             local: None,
+            editing: None,
+            denying: None,
             _local_events: None,
             scroll: ScrollHandle::new(),
             chips: Vec::new(),
@@ -497,6 +541,12 @@ impl AiChat {
         self.detail.as_ref().map(|d| &d.summary)
     }
 
+    /// The task shown (a host's conversation after drilling down into a
+    /// multi-host task).
+    pub fn task_id(&self) -> Option<Id> {
+        self.task
+    }
+
     pub fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |i, cx| i.focus(window, cx));
     }
@@ -508,6 +558,8 @@ impl AiChat {
         }
         self.task = id;
         self.blocked = None;
+        self.editing = None;
+        self.denying = None;
         if id.is_none() {
             self.bound_session = None;
             self.share_failed = false;
@@ -839,16 +891,17 @@ impl AiChat {
     fn decide(
         &mut self,
         approval: Id,
-        approve: bool,
-        always: bool,
+        decision: ApprovalDecision,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.editing = None;
+        self.denying = None;
         if let Some(conv) = self.local_conversation() {
             if let Some(d) = self.detail.as_mut() {
                 d.approvals.retain(|a| a.id != approval);
             }
-            conv.decide(approval, approve, always);
+            conv.decide(approval, decision.approve, decision.always);
             cx.notify();
             return;
         }
@@ -864,7 +917,7 @@ impl AiChat {
             window,
             async move {
                 backend
-                    .decide(id, approval, approve, always)
+                    .decide(id, approval, decision)
                     .await
                     .map_err(|f| f.text)
             },
@@ -875,6 +928,67 @@ impl AiChat {
                 this.load(id, window, cx);
             },
         );
+    }
+
+    /// "Edit and approve": the command (or plan) in an editor.
+    fn start_edit(&mut self, approval: &Approval, window: &mut Window, cx: &mut Context<Self>) {
+        let text = approval
+            .preview
+            .as_ref()
+            .and_then(|p| p.plan.clone().or_else(|| p.command.clone()))
+            .unwrap_or_default();
+        let rows = if approval.is_plan() { (4, 16) } else { (1, 10) };
+        let state = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(rows.0, rows.1)
+                .default_value(text)
+        });
+        ui::focus_later(&state, window, cx);
+        self.editing = Some((approval.id, state));
+        self.denying = None;
+        cx.notify();
+    }
+
+    /// "Deny…": asks for the reason the AI gets.
+    fn start_deny(&mut self, approval: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("ai_chat.approval.reason_placeholder"))
+        });
+        ui::focus_later(&state, window, cx);
+        self.denying = Some((approval, state));
+        self.editing = None;
+        cx.notify();
+    }
+
+    fn approve_edited(&mut self, approval: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, state)) = self.editing.clone().filter(|(id, _)| *id == approval) else {
+            return;
+        };
+        let text = state.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            ui::error(window, cx, t!("ai_chat.approval.edit_empty"));
+            return;
+        }
+        self.decide(
+            id,
+            ApprovalDecision {
+                approve: true,
+                edited: Some(text),
+                ..Default::default()
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn deny_with_reason(&mut self, approval: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let reason = self
+            .denying
+            .as_ref()
+            .filter(|(id, _)| *id == approval)
+            .map(|(_, s)| s.read(cx).value().trim().to_string())
+            .filter(|r| !r.is_empty());
+        self.decide(approval, ApprovalDecision::deny(reason), window, cx);
     }
 
     /// Stop: cancels the task and the AI loses access to the terminal.
@@ -954,10 +1068,24 @@ impl AiChat {
         let Some(task_id) = v["task_id"].as_str().and_then(|s| s.parse::<Id>().ok()) else {
             return;
         };
+        let ev = &v["event"];
         if self.task != Some(task_id) {
+            // A host of the multi-host task shown: refresh its table.
+            let host = self
+                .detail
+                .as_ref()
+                .is_some_and(|d| d.hosts.iter().any(|h| h.task_id == task_id));
+            if host
+                && matches!(
+                    ev["type"].as_str(),
+                    Some("finished" | "approval_requested" | "approval_decided" | "status")
+                )
+                && let Some(id) = self.task
+            {
+                self.load(id, window, cx);
+            }
             return;
         }
-        let ev = &v["event"];
         let s = |k: &str| ev[k].as_str().unwrap_or("").to_string();
         match ev["type"].as_str().unwrap_or("") {
             "text" => self.live_text.push_str(&s("delta")),
@@ -983,19 +1111,11 @@ impl AiChat {
                 }
             }
             "approval_requested" => {
-                if let (Some(d), Some(aid)) = (
-                    self.detail.as_mut(),
-                    ev["approval_id"]
-                        .as_str()
-                        .and_then(|s| s.parse::<Id>().ok()),
-                ) && !d.approvals.iter().any(|a| a.id == aid)
+                if let (Some(d), Some(a)) =
+                    (self.detail.as_mut(), Approval::from(ev, "approval_id"))
+                    && !d.approvals.iter().any(|x| x.id == a.id)
                 {
-                    d.approvals.push(Approval {
-                        id: aid,
-                        tool: s("tool"),
-                        summary: s("summary"),
-                        input: ev["input"].clone(),
-                    });
+                    d.approvals.push(a);
                 }
             }
             "approval_decided" => {
@@ -1205,91 +1325,32 @@ impl AiChat {
         }
 
         let approvals = detail.approvals.clone();
-        let approvals_el = v_flex()
-            .gap_2()
-            .children(approvals.into_iter().enumerate().map(|(i, a)| {
-                let id = a.id;
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.warning)
-                    .bg(theme.secondary)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                ui::icon(IconName::ShieldAlert)
-                                    .size(px(16.))
-                                    .text_color(theme.warning),
-                            )
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .text_sm()
-                                    .child(t!("ai_chat.approval.title")),
-                            )
-                            .child(ui::pill(a.tool.clone(), theme.info)),
-                    )
-                    .child(div().text_sm().child(a.summary.clone()))
-                    .child(
-                        div()
-                            .p_2()
-                            .rounded(theme.radius)
-                            .bg(theme.muted)
-                            .font_family(ui::mono_family(cx))
-                            .text_xs()
-                            .child(truncate(
-                                &a.input
-                                    .get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| a.input.to_string()),
-                                800,
-                            )),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(
-                                Button::new(("approve", i))
-                                    .small()
-                                    .primary()
-                                    .label(t!("ai_chat.approval.approve"))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.decide(id, true, false, window, cx)
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new(("deny", i))
-                                    .small()
-                                    .danger()
-                                    .label(t!("ai_chat.approval.deny"))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.decide(id, false, false, window, cx)
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new(("always", i))
-                                    .small()
-                                    .ghost()
-                                    .label(t!("ai_chat.approval.always"))
-                                    .tooltip(t!("ai_chat.approval.always_hint"))
-                                    .on_click(cx.listener(
-                                        move |this, _: &ClickEvent, window, cx| {
-                                            this.decide(id, true, true, window, cx)
-                                        },
-                                    )),
-                            ),
-                    )
-            }));
+        let approvals_el = v_flex().gap_2().children(
+            approvals
+                .iter()
+                .enumerate()
+                .map(|(i, a)| self.render_approval(i, a, cx)),
+        );
+        let hosts_el = (!detail.hosts.is_empty()).then(|| self.render_hosts(&detail.hosts, cx));
+        let back = detail.summary.parent_id.map(|parent| {
+            Button::new("ai-back-to-hosts")
+                .xsmall()
+                .ghost()
+                .icon(ui::icon(IconName::ArrowLeft))
+                .label(t!("ai_chat.hosts.back"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_task(Some(parent), window, cx)
+                }))
+        });
+        let plan_chip = detail
+            .summary
+            .plan_first
+            .then(|| match &detail.plan {
+                Some(p) if p.approved && p.edited => t!("ai_chat.plan.approved_edited"),
+                Some(p) if p.approved => t!("ai_chat.plan.approved"),
+                _ => t!("ai_chat.plan.pending"),
+            })
+            .map(|text| h_flex().child(ui::pill(text, cx.theme().info)));
 
         let pad = if self.terminal.is_some() { 3. } else { 6. };
         div()
@@ -1305,11 +1366,443 @@ impl AiChat {
                             .p(gpui::rems(pad * 0.25))
                             .gap_4()
                             .max_w(px(900.))
+                            .children(back)
+                            .children(plan_chip)
                             .child(conversation)
+                            .children(hosts_el)
                             .child(approvals_el),
                     ),
             )
             .vertical_scrollbar(&self.scroll)
+            .into_any_element()
+    }
+
+    /// An approval: what it is about (the command with its risk and the
+    /// classifier's reasons, the diff of a file, the plan) and the answers
+    /// (approve, edit and approve, deny with a reason, approve all).
+    fn render_approval(&self, i: usize, a: &Approval, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let id = a.id;
+        let plan = a.is_plan();
+        let preview = a.preview.clone();
+        let risk = preview.as_ref().map(|p| p.risk);
+        let border = match (plan, risk) {
+            (true, _) => theme.primary,
+            (_, Some(RiskLevel::High)) => theme.danger,
+            (_, Some(RiskLevel::Low)) => theme.info,
+            _ => theme.warning,
+        };
+        let mono = ui::mono_family(cx);
+        let header = h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .child(
+                ui::icon(if plan {
+                    IconName::ListChecks
+                } else {
+                    IconName::ShieldAlert
+                })
+                .size(px(16.))
+                .text_color(border),
+            )
+            .child(div().font_semibold().text_sm().child(if plan {
+                t!("ai_chat.approval.plan_title")
+            } else {
+                t!("ai_chat.approval.title")
+            }))
+            .when(!plan, |this| {
+                this.child(ui::pill(a.tool.clone(), theme.info))
+            })
+            .when_some(risk.filter(|_| !plan), |this, r| {
+                this.child(ui::pill(risk_label(r), risk_color(r, cx)))
+            })
+            .when_some(
+                preview.as_ref().and_then(|p| p.host.clone()),
+                |this, host| {
+                    this.child(ui::pill(
+                        t!("ai_chat.approval.on_host", host = host),
+                        theme.muted_foreground,
+                    ))
+                },
+            );
+        let mut body = v_flex().gap_2();
+        if let Some(e) = preview.as_ref().and_then(|p| p.explanation.clone()) {
+            body = body.child(div().text_sm().text_color(theme.muted_foreground).child(e));
+        }
+        match &preview {
+            Some(p) if p.kind == "plan" => {
+                body = body.child(
+                    div().text_sm().child(
+                        TextView::markdown(
+                            SharedString::from(format!("ai-plan-{id}")),
+                            p.plan.clone().unwrap_or_default(),
+                        )
+                        .selectable(true),
+                    ),
+                );
+            }
+            Some(p) if p.kind == "file" => {
+                body = body.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_sm()
+                                .child(p.path.clone().unwrap_or_default()),
+                        )
+                        .when(p.new_file, |this| {
+                            this.child(ui::pill(t!("ai_chat.approval.new_file"), theme.info))
+                        })
+                        .when_some(p.added, |this, n| {
+                            this.child(ui::pill(format!("+{n}"), theme.success))
+                        })
+                        .when_some(p.removed, |this, n| {
+                            this.child(ui::pill(format!("−{n}"), theme.danger))
+                        }),
+                );
+                match (&p.diff, &p.diff_error) {
+                    (Some(d), _) if !d.is_empty() => {
+                        body = body.child(diff_block(i, d, cx));
+                        if p.diff_truncated {
+                            body = body.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(t!("ai_chat.approval.diff_truncated")),
+                            );
+                        }
+                    }
+                    (Some(_), _) => {
+                        body = body.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("ai_chat.approval.no_changes")),
+                        );
+                    }
+                    (None, Some(e)) => {
+                        body = body.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.warning)
+                                .child(t!("ai_chat.approval.no_diff", error = e.clone())),
+                        );
+                    }
+                    (None, None) => {}
+                }
+            }
+            Some(p) if p.command.is_some() => {
+                body = body.child(
+                    div()
+                        .p_2()
+                        .rounded(theme.radius)
+                        .bg(theme.muted)
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .child(truncate(p.command.as_deref().unwrap_or(""), 4000)),
+                );
+            }
+            _ => {
+                body = body.child(div().text_sm().child(a.summary.clone())).child(
+                    div()
+                        .p_2()
+                        .rounded(theme.radius)
+                        .bg(theme.muted)
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .child(truncate(
+                            &a.input
+                                .get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| a.input.to_string()),
+                            800,
+                        )),
+                );
+            }
+        }
+        if let Some(p) = preview.as_ref().filter(|p| !p.reasons.is_empty()) {
+            body = body.child(
+                h_flex().gap_1().flex_wrap().children(
+                    p.reasons
+                        .iter()
+                        .map(|r| ui::pill(reason_label(&r.code, &r.text), theme.muted_foreground)),
+                ),
+            );
+        }
+
+        let editing = self.editing.clone().filter(|(e, _)| *e == id);
+        let denying = self.denying.clone().filter(|(e, _)| *e == id);
+        let actions = if let Some((_, state)) = editing {
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if plan {
+                            t!("ai_chat.approval.edit_plan_hint")
+                        } else {
+                            t!("ai_chat.approval.edit_hint")
+                        }),
+                )
+                .child(div().font_family(mono.clone()).child(Textarea::new(&state)))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(("approve-edited", i))
+                                .small()
+                                .primary()
+                                .label(t!("ai_chat.approval.approve_edited"))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.approve_edited(id, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("edit-cancel", i))
+                                .small()
+                                .ghost()
+                                .label(t!("common.cancel"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.editing = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else if let Some((_, state)) = denying {
+            v_flex()
+                .gap_2()
+                .child(Input::new(&state))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(("deny-send", i))
+                                .small()
+                                .danger()
+                                .label(t!("ai_chat.approval.deny"))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.deny_with_reason(id, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("deny-cancel", i))
+                                .small()
+                                .ghost()
+                                .label(t!("common.cancel"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.denying = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            let approval = a.clone();
+            let editable = a.editable() && self.local_conversation().is_none();
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new(("approve", i))
+                        .small()
+                        .primary()
+                        .label(if plan {
+                            t!("ai_chat.approval.approve_plan")
+                        } else {
+                            t!("ai_chat.approval.approve")
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.decide(id, ApprovalDecision::approve(), window, cx)
+                        })),
+                )
+                .when(editable, |this| {
+                    this.child(
+                        Button::new(("edit", i))
+                            .small()
+                            .icon(ui::icon(IconName::Pencil))
+                            .label(if plan {
+                                t!("ai_chat.approval.edit_plan")
+                            } else {
+                                t!("ai_chat.approval.edit")
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.start_edit(&approval, window, cx)
+                            })),
+                    )
+                })
+                .child(
+                    Button::new(("deny", i))
+                        .small()
+                        .danger()
+                        .label(t!("ai_chat.approval.deny_with_reason"))
+                        .tooltip(t!("ai_chat.approval.deny_hint"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            if this.local_conversation().is_some() {
+                                this.decide(id, ApprovalDecision::deny(None), window, cx)
+                            } else {
+                                this.start_deny(id, window, cx)
+                            }
+                        })),
+                )
+                .when(!plan, |this| {
+                    this.child(
+                        Button::new(("always", i))
+                            .small()
+                            .ghost()
+                            .label(t!("ai_chat.approval.always"))
+                            .tooltip(t!("ai_chat.approval.always_hint"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.decide(
+                                    id,
+                                    ApprovalDecision {
+                                        approve: true,
+                                        always: true,
+                                        ..Default::default()
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })),
+                    )
+                })
+                .into_any_element()
+        };
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(border)
+            .bg(theme.secondary)
+            .child(header)
+            .child(body)
+            .child(actions)
+            .into_any_element()
+    }
+
+    /// Per-host table of a multi-host task; a row opens that host's
+    /// conversation.
+    fn render_hosts(&self, hosts: &[HostRun], cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let cell = |w: f32| {
+            div()
+                .w(px(w))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+        };
+        let head = h_flex()
+            .px_2()
+            .gap_2()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(cell(140.).child(t!("ai_chat.hosts.host")))
+            .child(cell(130.).child(t!("ai_chat.hosts.status")))
+            .child(div().flex_1().min_w_0().child(t!("ai_chat.hosts.summary")))
+            .child(cell(70.).child(t!("ai_chat.hosts.duration")))
+            .child(cell(70.).child(t!("ai_chat.hosts.cost")));
+        let rows = hosts.iter().enumerate().map(|(i, h)| {
+            let task = h.task_id;
+            let status = h.status.as_str();
+            let color = match status {
+                "completed" => theme.success,
+                "failed" => theme.danger,
+                "waiting_approval" => theme.warning,
+                "running" | "queued" => theme.info,
+                _ => theme.muted_foreground,
+            };
+            let detail = h
+                .summary
+                .clone()
+                .or_else(|| h.error.clone())
+                .unwrap_or_default();
+            h_flex()
+                .id(("ai-host-row", i))
+                .px_2()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .text_sm()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|st| st.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_task(Some(task), window, cx)
+                }))
+                .child(cell(140.).font_medium().child(h.label.clone()))
+                .child(
+                    cell(130.).child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(div().size(px(6.)).rounded_full().bg(color))
+                            .child(div().text_xs().child(status_label(status)))
+                            .when(h.pending_approvals > 0, |this| {
+                                this.child(ui::pill(
+                                    tn!("ai.pending_approvals", h.pending_approvals),
+                                    theme.warning,
+                                ))
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .text_color(if h.status.as_str() == "failed" {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(truncate(&detail, 200)),
+                )
+                .child(
+                    cell(70.)
+                        .text_xs()
+                        .child(h.duration_ms.map(format_duration).unwrap_or_default()),
+                )
+                .child(cell(70.).text_xs().child(if h.cost_micros > 0 {
+                    format!("{:.4} $", h.cost_micros as f64 / 1_000_000.0)
+                } else {
+                    "—".to_string()
+                }))
+        });
+        v_flex()
+            .p_2()
+            .gap_1()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_sm()
+                    .font_semibold()
+                    .child(tn!("ai_chat.hosts.title", hosts.len())),
+            )
+            .child(head)
+            .children(rows)
+            .child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("ai_chat.hosts.hint")),
+            )
             .into_any_element()
     }
 
@@ -1715,6 +2208,111 @@ fn output_block(text: &str, ok: bool, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+fn risk_label(risk: RiskLevel) -> SharedString {
+    match risk {
+        RiskLevel::Low => t!("ai_chat.risk.low"),
+        RiskLevel::Medium => t!("ai_chat.risk.medium"),
+        RiskLevel::High => t!("ai_chat.risk.high"),
+    }
+}
+
+fn risk_color(risk: RiskLevel, cx: &App) -> gpui::Hsla {
+    let theme = cx.theme();
+    match risk {
+        RiskLevel::Low => theme.success,
+        RiskLevel::Medium => theme.warning,
+        RiskLevel::High => theme.danger,
+    }
+}
+
+/// A reason of the risk classifier, in the user's language (its English
+/// text for codes this version does not know).
+fn reason_label(code: &str, text: &str) -> SharedString {
+    match code {
+        "pipe" => t!("ai_chat.reason.pipe"),
+        "chain" => t!("ai_chat.reason.chain"),
+        "redirect" => t!("ai_chat.reason.redirect"),
+        "substitution" => t!("ai_chat.reason.substitution"),
+        "sudo" => t!("ai_chat.reason.sudo"),
+        "rm_rf" => t!("ai_chat.reason.rm_rf"),
+        "delete" => t!("ai_chat.reason.delete"),
+        "disk" => t!("ai_chat.reason.disk"),
+        "reboot" => t!("ai_chat.reason.reboot"),
+        "service" => t!("ai_chat.reason.service"),
+        "packages" => t!("ai_chat.reason.packages"),
+        "firewall" => t!("ai_chat.reason.firewall"),
+        "permissions" => t!("ai_chat.reason.permissions"),
+        "kill" => t!("ai_chat.reason.kill"),
+        "users" => t!("ai_chat.reason.users"),
+        "remote_script" => t!("ai_chat.reason.remote_script"),
+        "containers" => t!("ai_chat.reason.containers"),
+        "cron" => t!("ai_chat.reason.cron"),
+        "git_history" => t!("ai_chat.reason.git_history"),
+        "system_path" => t!(
+            "ai_chat.reason.system_path",
+            path = text.strip_prefix("writes to ").unwrap_or(text)
+        ),
+        "critical_file" => t!("ai_chat.reason.critical_file"),
+        "redacted" => t!("ai_chat.reason.redacted"),
+        "changes" => t!("ai_chat.reason.changes"),
+        _ => SharedString::from(text.to_string()),
+    }
+}
+
+/// `12 s`, `3 min 4 s`, `1 h 2 min`.
+fn format_duration(ms: i64) -> String {
+    let secs = (ms / 1000).max(0);
+    match secs {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min {} s", s / 60, s % 60),
+        s => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// A unified diff with its lines colored: added in green, removed in red,
+/// hunk headers in blue.
+fn diff_block(i: usize, diff: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let tint = |mut c: gpui::Hsla| {
+        c.a = 0.12;
+        c
+    };
+    let lines = diff.lines().take(1500).map(|line| {
+        let (color, bg) = if line.starts_with("+++") || line.starts_with("---") {
+            (theme.muted_foreground, None)
+        } else if line.starts_with('+') {
+            (theme.success, Some(tint(theme.success)))
+        } else if line.starts_with('-') {
+            (theme.danger, Some(tint(theme.danger)))
+        } else if line.starts_with("@@") {
+            (theme.info, None)
+        } else {
+            (theme.foreground, None)
+        };
+        div()
+            .px_2()
+            .whitespace_nowrap()
+            .text_color(color)
+            .when_some(bg, |d, bg| d.bg(bg))
+            .child(if line.is_empty() {
+                " ".to_string()
+            } else {
+                line.to_string()
+            })
+    });
+    div()
+        .id(("ai-diff", i))
+        .max_h(px(360.))
+        .overflow_scroll()
+        .py_1()
+        .rounded(theme.radius)
+        .bg(theme.muted)
+        .font_family(ui::mono_family(cx))
+        .text_xs()
+        .child(v_flex().min_w_full().children(lines))
+        .into_any_element()
+}
+
 impl Render for AiChat {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let copilot = self.terminal.is_some();
@@ -1797,6 +2395,41 @@ impl Render for AiChat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(format_duration(12_400), "12 s");
+        assert_eq!(format_duration(184_000), "3 min 4 s");
+        assert_eq!(format_duration(3_720_000), "1 h 2 min");
+    }
+
+    #[test]
+    fn approvals_read_their_preview() {
+        let v = json!({
+            "id": "0192a8c4-7b6e-7c1a-9f3e-123456789abc",
+            "tool": "run_command",
+            "summary": "Run on web1: rm -rf /tmp/x",
+            "input": {"host": "web1", "command": "rm -rf /tmp/x"},
+            "preview": {"kind": "command", "command": "rm -rf /tmp/x", "risk": "high",
+                        "reasons": [{"code": "rm_rf", "text": "deletes files recursively (rm -rf)"}],
+                        "editable": true}
+        });
+        let a = Approval::from(&v, "id").unwrap();
+        assert!(a.editable());
+        assert_eq!(a.preview.as_ref().unwrap().risk, RiskLevel::High);
+        // An older server sends no preview: no edits.
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("preview");
+        assert!(!Approval::from(&old, "id").unwrap().editable());
+        assert_eq!(
+            reason_label("system_path", "writes to /etc"),
+            t!("ai_chat.reason.system_path", path = "/etc")
+        );
+        assert_eq!(
+            reason_label("future_code", "something new"),
+            "something new"
+        );
+    }
 
     #[test]
     fn user_messages_hide_every_context_block() {

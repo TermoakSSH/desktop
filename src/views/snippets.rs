@@ -61,99 +61,8 @@ impl SnippetsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let data = rec.map(|r| r.rec.data);
-        let name = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("snippets.form.name_placeholder"))
-                .default_value(data.as_ref().map(|d| d.name.clone()).unwrap_or_default())
-        });
-        let description = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("snippets.form.optional"))
-                .default_value(
-                    data.as_ref()
-                        .map(|d| d.description.clone())
-                        .unwrap_or_default(),
-                )
-        });
-        let script = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(8, 14)
-                .placeholder(t!("snippets.form.script_placeholder"))
-                .default_value(data.as_ref().map(|d| d.script.clone()).unwrap_or_default())
-        });
-        let tags = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t!("snippets.form.tags_placeholder"))
-                .default_value(data.as_ref().map(|d| d.tags.join(", ")).unwrap_or_default())
-        });
-        ui::focus_later(&name, window, cx);
-        let model = self.model.clone();
-        let (n2, d2, s2, t2) = (
-            name.clone(),
-            description.clone(),
-            script.clone(),
-            tags.clone(),
-        );
-        ui::open_form_dialog(
-            window,
-            cx,
-            if data.is_some() {
-                t!("snippets.form.edit_title")
-            } else {
-                t!("snippets.form.new_title")
-            },
-            t!("common.save"),
-            560.,
-            move |_, cx| {
-                v_flex()
-                    .gap_3()
-                    .child(ui::field(t!("common.name"), Input::new(&name), cx))
-                    .child(ui::field(
-                        t!("snippets.form.description"),
-                        Input::new(&description),
-                        cx,
-                    ))
-                    .child(ui::field_with_hint(
-                        t!("snippets.form.script"),
-                        Textarea::new(&script),
-                        t!("snippets.form.script_hint"),
-                        cx,
-                    ))
-                    .child(ui::field(t!("snippets.form.tags"), Input::new(&tags), cx))
-                    .into_any_element()
-            },
-            move |window, cx| {
-                let snippet = Snippet {
-                    id: data.as_ref().map(|d| d.id).unwrap_or(Id::nil()),
-                    name: n2.read(cx).value().trim().to_string(),
-                    script: s2.read(cx).value().to_string(),
-                    description: d2.read(cx).value().trim().to_string(),
-                    tags: t2
-                        .read(cx)
-                        .value()
-                        .split(',')
-                        .map(|t| t.trim().to_string())
-                        .filter(|t| !t.is_empty())
-                        .collect(),
-                };
-                if snippet.name.is_empty() || snippet.script.trim().is_empty() {
-                    ui::error(window, cx, t!("snippets.error.name_and_script"));
-                    return false;
-                }
-                let task = model.update(cx, |m, cx| m.save(snippet, SecretUpdate::Keep, None, cx));
-                window
-                    .spawn(cx, async move |cx| {
-                        if let Err(e) = task.await {
-                            let _ = cx.update(|window, cx| ui::error(window, cx, e));
-                        }
-                    })
-                    .detach();
-                true
-            },
-        );
+        open_snippet_form(self.model.clone(), rec.map(|r| r.rec.data), window, cx);
     }
-
     fn delete(&mut self, rec: Item<Snippet>, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model.clone();
         ui::confirm(
@@ -1039,6 +948,107 @@ impl Render for SendDialog {
                 )
             })
     }
+}
+
+/// The snippet form: a new snippet (`data` with a nil id, maybe filled in,
+/// as "Save as runbook" of an AI task does) or an existing one.
+pub(crate) fn open_snippet_form(
+    model: Entity<AppModel>,
+    data: Option<Snippet>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let editing = data.as_ref().is_some_and(|d| !d.id.is_nil());
+    let name = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(t!("snippets.form.name_placeholder"))
+            .default_value(data.as_ref().map(|d| d.name.clone()).unwrap_or_default())
+    });
+    let description = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(t!("snippets.form.optional"))
+            .default_value(
+                data.as_ref()
+                    .map(|d| d.description.clone())
+                    .unwrap_or_default(),
+            )
+    });
+    let script = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .auto_grow(8, 14)
+            .placeholder(t!("snippets.form.script_placeholder"))
+            .default_value(data.as_ref().map(|d| d.script.clone()).unwrap_or_default())
+    });
+    let tags = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(t!("snippets.form.tags_placeholder"))
+            .default_value(data.as_ref().map(|d| d.tags.join(", ")).unwrap_or_default())
+    });
+    ui::focus_later(&name, window, cx);
+    let model = model.clone();
+    let (n2, d2, s2, t2) = (
+        name.clone(),
+        description.clone(),
+        script.clone(),
+        tags.clone(),
+    );
+    ui::open_form_dialog(
+        window,
+        cx,
+        if editing {
+            t!("snippets.form.edit_title")
+        } else {
+            t!("snippets.form.new_title")
+        },
+        t!("common.save"),
+        560.,
+        move |_, cx| {
+            v_flex()
+                .gap_3()
+                .child(ui::field(t!("common.name"), Input::new(&name), cx))
+                .child(ui::field(
+                    t!("snippets.form.description"),
+                    Input::new(&description),
+                    cx,
+                ))
+                .child(ui::field_with_hint(
+                    t!("snippets.form.script"),
+                    Textarea::new(&script),
+                    t!("snippets.form.script_hint"),
+                    cx,
+                ))
+                .child(ui::field(t!("snippets.form.tags"), Input::new(&tags), cx))
+                .into_any_element()
+        },
+        move |window, cx| {
+            let snippet = Snippet {
+                id: data.as_ref().map(|d| d.id).unwrap_or(Id::nil()),
+                name: n2.read(cx).value().trim().to_string(),
+                script: s2.read(cx).value().to_string(),
+                description: d2.read(cx).value().trim().to_string(),
+                tags: t2
+                    .read(cx)
+                    .value()
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect(),
+            };
+            if snippet.name.is_empty() || snippet.script.trim().is_empty() {
+                ui::error(window, cx, t!("snippets.error.name_and_script"));
+                return false;
+            }
+            let task = model.update(cx, |m, cx| m.save(snippet, SecretUpdate::Keep, None, cx));
+            window
+                .spawn(cx, async move |cx| {
+                    if let Err(e) = task.await {
+                        let _ = cx.update(|window, cx| ui::error(window, cx, e));
+                    }
+                })
+                .detach();
+            true
+        },
+    );
 }
 
 #[cfg(test)]

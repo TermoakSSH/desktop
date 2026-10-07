@@ -688,6 +688,13 @@ impl HostsView {
         }
     }
 
+    /// "Ask AI": a new AI task on these hosts (one conversation per host).
+    fn ask_ai(&mut self, ids: Vec<Id>, cx: &mut Context<Self>) {
+        if !ids.is_empty() {
+            cx.emit(OpenRequest::AiTask { host_ids: ids });
+        }
+    }
+
     fn duplicate_host(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let task = self.model.update(cx, |m, cx| m.duplicate_host(id, cx));
         cx.spawn_in(window, async move |this, cx| {
@@ -982,6 +989,11 @@ impl HostsView {
                     PopupMenuItem::new(t!("hosts.bulk.split"))
                         .icon(ui::icon(IconName::LayoutGrid))
                         .on_click(act(|v, ids, _, cx| v.open_split(ids, false, cx))),
+                )
+                .item(
+                    PopupMenuItem::new(tn!("hosts.ask_ai", n))
+                        .icon(ui::icon(IconName::Sparkles))
+                        .on_click(act(|v, ids, _, cx| v.ask_ai(ids, cx))),
                 );
             let menu = Self::workspace_submenu(menu, view.clone(), ws_ids, window, cx);
             let menu = menu.when(status_on, |menu| {
@@ -1161,8 +1173,8 @@ impl HostsView {
         group: Option<Group>,
         hosts: Vec<Id>,
     ) -> PopupMenu {
-        let (w1, w2, w3, w4) = (view.clone(), view.clone(), view.clone(), view);
-        let (h1, h2) = (hosts.clone(), hosts.clone());
+        let (w1, w2, w3, w4, w5) = (view.clone(), view.clone(), view.clone(), view.clone(), view);
+        let (h1, h2, h3) = (hosts.clone(), hosts.clone(), hosts.clone());
         let empty = hosts.is_empty();
         let menu = menu
             .item(
@@ -1183,6 +1195,17 @@ impl HostsView {
                         if let Some(v) = w2.upgrade() {
                             let ids = h2.clone();
                             v.update(cx, |v, cx| v.open_split(ids, false, cx));
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(tn!("hosts.ask_ai", hosts.len()))
+                    .icon(ui::icon(IconName::Sparkles))
+                    .disabled(empty)
+                    .on_click(move |_, _, cx| {
+                        if let Some(v) = w5.upgrade() {
+                            let ids = h3.clone();
+                            v.update(cx, |v, cx| v.ask_ai(ids, cx));
                         }
                     }),
             );
@@ -1346,6 +1369,17 @@ impl HostsView {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         let ids = this.selection.ids().to_vec();
                         this.open_split(ids, false, cx);
+                    })),
+            )
+            .child(
+                Button::new("bulk-ask-ai")
+                    .small()
+                    .icon(ui::icon(IconName::Sparkles))
+                    .label(t!("hosts.ask_ai_short"))
+                    .tooltip(tn!("hosts.ask_ai", n))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let ids = this.selection.ids().to_vec();
+                        this.ask_ai(ids, cx);
                     })),
             )
             .when(has_groups, |this| {

@@ -67,4 +67,6 @@ pub enum OpenRequest {
     Serial(crate::terminal::serial::SerialParams),
     /// Settings → AI (where the AI runs, API keys, AI credit).
     AiSettings,
+    /// A new AI task on these hosts ("Ask AI" on a group or a selection).
+    AiTask { host_ids: Vec<Id> },
 }

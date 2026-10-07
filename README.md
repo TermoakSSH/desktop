@@ -170,10 +170,18 @@ to every pane with the antenna lit (here, all but the log tail on
 - **Port forwarding**: local (-L), remote (-R) and dynamic SOCKS5 (-D), with
   start/stop, statistics and automatic start when connecting to the host.
 - **Known hosts**: trusted fingerprints, and deleting them.
-- **AI** (needs a server): agent tasks in *Read only*, *Ask* or
-  *Autonomous* mode, provider picker, live conversation (text, reasoning and
-  tools), approval cards (*Approve*, *Deny*, *Always approve*) and follow-up
-  messages. Next to each terminal, the **copilot** panel (Ctrl+Shift+I,
+- **AI** (on your account's server or on this computer): agent tasks in
+  *Read only*, *Ask* or *Autonomous* mode, provider picker, live conversation
+  (text, reasoning and tools) and follow-up messages. Approval cards show
+  what will run: the exact command with its risk and the reasons (pipe,
+  `rm -rf`, writes to `/etc`…) or a colored diff of the file it writes, and
+  offer *Approve*, *Edit and approve* (what you approve is what runs), *Deny…*
+  (with a reason for the AI) and *Approve all in this task*. *Plan before
+  acting* (approve or edit a numbered plan first), tasks on a group, a tag or
+  several hosts (*Ask AI* in the hosts list; one conversation per host with a
+  per-host table), *Stop* and continue, and *Save as runbook* (the commands a
+  task ran as a snippet with `{{host}}`). Secrets in what the tools return
+  are hidden from the AI provider. Next to each terminal, the **copilot** panel (Ctrl+Shift+I,
   Cmd+I on macOS) chats about that terminal, explains the selection or the
   screen, and suggests commands that are typed into the terminal without
   pressing Enter. It opens with the terminal's context as chips you can

@@ -351,6 +351,7 @@ struct Pending {
     tool: String,
     summary: String,
     input: Value,
+    preview: Option<termoak_ai::ApprovalPreview>,
 }
 
 struct State {
@@ -439,6 +440,7 @@ impl LocalConversation {
                 "tool": p.tool,
                 "summary": p.summary,
                 "input": p.input,
+                "preview": p.preview,
                 "status": "pending",
             })).collect::<Vec<_>>(),
         })
@@ -652,11 +654,21 @@ impl LocalConversation {
         let approval_id = new_id();
         let (tx, rx) = oneshot::channel();
         self.approvals.lock().insert(approval_id, tx);
+        // What the approval shows (the command with its risk, the diff of
+        // a file). The copilot only approves or denies: no edits here.
+        let ctx = ToolContext {
+            owner: LOCAL_OWNER,
+            task_id: Some(self.id),
+            host_scope: None,
+        };
+        let mut preview = self.services.tools.preview(&ctx, name, input).await;
+        preview.editable = false;
         self.state.lock().pending.push(Pending {
             id: approval_id,
             tool: name.to_string(),
             summary: summary.to_string(),
             input: input.clone(),
+            preview: Some(preview.clone()),
         });
         self.emit(TaskEvent::ApprovalRequested {
             approval_id,
@@ -664,6 +676,7 @@ impl LocalConversation {
             tool: name.to_string(),
             summary: summary.to_string(),
             input: input.clone(),
+            preview: Some(preview),
         });
         self.set_status(TaskStatus::WaitingApproval);
         let cancel = self.cancel.lock().clone();
@@ -686,6 +699,8 @@ impl LocalConversation {
             approval_id,
             approved,
             by: by.into(),
+            edited: None,
+            reason: None,
         });
         if !cancel.is_cancelled() {
             self.set_status(TaskStatus::Running);
