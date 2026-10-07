@@ -12,6 +12,7 @@ pub mod host_editor;
 pub mod host_picker;
 pub mod hosts;
 pub mod import;
+pub mod import_export;
 pub mod join;
 pub mod keychain;
 pub mod known_hosts;

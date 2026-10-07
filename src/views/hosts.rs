@@ -1,6 +1,7 @@
 //! Hosts: cards arranged by group, search, favorites, tags and detected
 //! system (with its version). A click opens the editor; a double click
-//! connects. `~/.ssh/config` is also imported from here.
+//! connects. The "Import/Export" menu of the header imports hosts from
+//! files of other apps and exports them.
 //!
 //! Right click (or Shift+F10 / the menu key on the focused card) opens the
 //! host menu; on a group header, "Connect to all" and "Open all in split
@@ -1943,15 +1944,15 @@ impl Render for HostsView {
                                 });
                             })),
                     )
-                    .child(
-                        Button::new("import-ssh-config")
-                            .icon(ui::icon(IconName::Import))
-                            .label(t!("hosts.import"))
-                            .tooltip(t!("hosts.import_tooltip"))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                super::import::open(this.model.clone(), window, cx);
-                            })),
-                    )
+                    .child({
+                        let model = self.model.clone();
+                        Button::new("import-export")
+                            .icon(ui::icon(IconName::ArrowUpDown))
+                            .label(t!("hosts.import_export"))
+                            .dropdown_menu(move |menu, _, _| {
+                                super::import_export::menu(menu, model.clone())
+                            })
+                    })
                     .child(
                         Button::new("new-group")
                             .icon(ui::icon(IconName::FolderPlus))
