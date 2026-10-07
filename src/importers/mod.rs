@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use termoak_core::Id;
-use termoak_core::model::{HostSettings, ProxySettings};
+use termoak_core::model::{HostProtocol, HostSettings, ProxySettings};
 
 /// Where a set comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,18 +152,26 @@ pub struct ImportHost {
     pub settings: Option<HostSettings>,
     pub os: Option<String>,
     pub os_version: Option<String>,
+    /// SSH, or Telnet for the Telnet sessions of other apps.
+    pub protocol: HostProtocol,
+    /// Logo (Termoak JSON).
+    pub icon: Option<String>,
 }
 
 impl ImportHost {
-    /// `user@host:port` as shown in the preview.
+    /// `user@host:port` as shown in the preview (`telnet://` in front for
+    /// Telnet).
     pub fn target(&self) -> String {
         let mut s = String::new();
+        if self.protocol.is_telnet() {
+            s.push_str("telnet://");
+        }
         if let Some(u) = &self.username {
             s.push_str(u);
             s.push('@');
         }
         s.push_str(&self.address);
-        if let Some(p) = self.port.filter(|p| *p != 22) {
+        if let Some(p) = self.port.filter(|p| *p != self.protocol.default_port()) {
             s.push_str(&format!(":{p}"));
         }
         s
@@ -173,7 +181,7 @@ impl ImportHost {
     pub fn effective_port(&self) -> u16 {
         self.port
             .or(self.settings.as_ref().and_then(|s| s.port))
-            .unwrap_or(22)
+            .unwrap_or(self.protocol.default_port())
     }
 }
 
@@ -354,7 +362,20 @@ pub fn split_tags(text: &str) -> Vec<String> {
     clean_tags(text.split([',', ';', '|']).map(str::to_string).collect())
 }
 
-/// Protocols that mean SSH (other sessions are skipped).
+/// What a session of another app becomes: an SSH host, a Telnet host, or
+/// nothing (`None`: skipped with a warning).
+pub fn protocol_of(p: &str) -> Option<HostProtocol> {
+    if is_ssh_protocol(p) {
+        Some(HostProtocol::Ssh)
+    } else {
+        // Telnet over TLS (SecureCRT's `Telnet/SSL`) is not supported.
+        p.trim()
+            .eq_ignore_ascii_case("telnet")
+            .then_some(HostProtocol::Telnet)
+    }
+}
+
+/// Protocols that mean SSH.
 pub fn is_ssh_protocol(p: &str) -> bool {
     let p = p.trim().to_ascii_lowercase();
     p.is_empty()
@@ -604,6 +625,18 @@ mod tests {
         assert!(is_ssh_protocol("SSH2"));
         assert!(is_ssh_protocol(""));
         assert!(!is_ssh_protocol("telnet"));
+        assert_eq!(protocol_of("Telnet"), Some(HostProtocol::Telnet));
+        assert_eq!(protocol_of("ssh2"), Some(HostProtocol::Ssh));
+        assert_eq!(protocol_of("Telnet/SSL"), None);
+        assert_eq!(protocol_of("rlogin"), None);
+        let telnet = ImportHost {
+            address: "10.0.0.1".into(),
+            port: Some(23),
+            protocol: HostProtocol::Telnet,
+            ..Default::default()
+        };
+        assert_eq!(telnet.target(), "telnet://10.0.0.1");
+        assert_eq!(telnet.effective_port(), 23);
     }
 
     #[test]

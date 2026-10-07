@@ -1387,6 +1387,12 @@ impl AppView {
                 let host_id = *host_id;
                 cx.new(|cx| TerminalView::local(model, host_id, window, cx))
             }
+            // Telnet hosts only open from this computer (a saved workspace
+            // may still ask for a server session).
+            OpenRequest::Server { host_id } if self.model.read(cx).is_telnet(*host_id) => {
+                let host_id = *host_id;
+                cx.new(|cx| TerminalView::local(model, host_id, window, cx))
+            }
             OpenRequest::Server { host_id } => {
                 let host_id = *host_id;
                 let title = self.model.read(cx).host_label(host_id);
@@ -1433,8 +1439,14 @@ impl AppView {
         let m = self.model.read(cx);
         let caps = m.host_caps(host_id);
         let signed_in = m.api_for_host(host_id).is_some();
+        let telnet = m.is_telnet(host_id);
         match accounts::connect_route(caps.connect, signed_in) {
             Ok(false) => Some(OpenRequest::Local { host_id }),
+            // The server has no Telnet sessions.
+            Ok(true) if telnet => {
+                ui::error(window, cx, t!("telnet.strict_vault"));
+                None
+            }
             Ok(true) => {
                 ui::notify(window, cx, ToastKind::Info, t!("vaults.strict_connect"));
                 Some(OpenRequest::Server { host_id })
@@ -1474,6 +1486,9 @@ impl AppView {
             {
                 // Already open: activate it.
                 self.activate(Some(ix), window, cx);
+            }
+            OpenRequest::Sftp { host_id, .. } if self.model.read(cx).is_telnet(host_id) => {
+                ui::notify(window, cx, ToastKind::Info, t!("telnet.no_sftp"));
             }
             OpenRequest::Sftp { host_id, conn } => self.open_sftp(host_id, conn, window, cx),
             OpenRequest::AiSettings => {
@@ -3100,9 +3115,14 @@ impl AppView {
         for (ix, tab) in self.tabs.iter().enumerate() {
             let active = self.active == Some(ix);
             let title = tab.title(cx);
+            let mut logo = None;
             let (icon, dot, count) = match &tab.content {
                 TabContent::Terminal(p) => {
                     let t = p.focused().read(cx);
+                    // A single host terminal shows the host's logo.
+                    if !p.is_split() {
+                        logo = t.host_logo(cx);
+                    }
                     (
                         if p.is_split() {
                             IconName::LayoutGrid
@@ -3194,7 +3214,7 @@ impl AppView {
                             }
                         }),
                     )
-                    .child(ui::icon(icon).size(px(14.)))
+                    .child(logo.unwrap_or_else(|| ui::icon(icon)).size(px(14.)))
                     .when_some(dot, |this, c| {
                         this.child(div().size(px(6.)).rounded_full().bg(c))
                     })

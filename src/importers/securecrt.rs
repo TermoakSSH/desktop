@@ -8,23 +8,25 @@
 //! (a count followed by indented lines); the folders of the files are the
 //! groups and `__FolderData__.ini` / `Default.ini` are not sessions.
 //!
-//! Used: `Hostname`, `[SSH2] Port` (or `Port`), `Username`, `Protocol
-//! Name` (only SSH1/SSH2), `Identity Filename V2` (the key file, imported
+//! Used: `Hostname`, `[SSH2] Port` (or `Port`; Telnet: `Port`),
+//! `Username`, `Protocol Name` (SSH1/SSH2, and Telnet as a Telnet host;
+//! others are skipped), `Identity Filename V2` (the key file, imported
 //! if readable here), `Description` (notes) and `Firewall Name` (a named
 //! firewall/proxy cannot be imported: noted). Passwords are encrypted by
 //! SecureCRT and are not imported.
 
 use std::collections::HashMap;
 
-use super::{ImportHost, ImportSet, is_ssh_protocol};
+use super::{ImportHost, ImportSet, protocol_of};
 
 /// Values of one session (names lowercased).
 type Values = HashMap<String, String>;
 
 fn host_of(set: &mut ImportSet, name: &str, folder: &str, v: &Values) {
     let get = |k: &str| v.get(k).map(|s| s.trim().to_string()).unwrap_or_default();
-    let protocol = get("protocol name");
-    if !protocol.is_empty() && !is_ssh_protocol(&protocol) {
+    let protocol_name = get("protocol name");
+    let Some(protocol) = protocol_of(&protocol_name) else {
+        let protocol = protocol_name;
         set.warnings.push(
             t!(
                 "import_export.warn.not_ssh",
@@ -34,7 +36,7 @@ fn host_of(set: &mut ImportSet, name: &str, folder: &str, v: &Values) {
             .to_string(),
         );
         return;
-    }
+    };
     let mut notes = vec![get("description")];
     let firewall = get("firewall name");
     if !firewall.is_empty() && !firewall.eq_ignore_ascii_case("none") {
@@ -48,9 +50,13 @@ fn host_of(set: &mut ImportSet, name: &str, folder: &str, v: &Values) {
     };
     // `C:\key.pub::rawkey` (V2 adds the kind after `::`).
     let key = key.split("::").next().unwrap_or("").trim().to_string();
-    let port = [get("[ssh2] port"), get("[ssh1] port"), get("port")]
-        .into_iter()
-        .find_map(|p| p.parse::<u16>().ok());
+    // Sessions keep the SSH ports even when they are Telnet.
+    let ports = if protocol.is_telnet() {
+        vec![get("port")]
+    } else {
+        vec![get("[ssh2] port"), get("[ssh1] port"), get("port")]
+    };
+    let port = ports.into_iter().find_map(|p| p.parse::<u16>().ok());
     let group = set.group_path(folder);
     set.push_host(ImportHost {
         label: name.to_string(),
@@ -63,7 +69,8 @@ fn host_of(set: &mut ImportSet, name: &str, folder: &str, v: &Values) {
             .filter(|n| !n.trim().is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        key_file: Some(key).filter(|k| !k.is_empty()),
+        key_file: Some(key).filter(|k| !k.is_empty() && protocol.is_ssh()),
+        protocol,
         ..Default::default()
     });
 }
@@ -262,6 +269,8 @@ mod tests {
       <key name="router">
         <string name="Hostname">10.0.0.1</string>
         <string name="Protocol Name">Telnet</string>
+        <dword name="[SSH2] Port">22</dword>
+        <dword name="Port">2323</dword>
       </key>
     </key>
     <key name="lab">
@@ -275,7 +284,7 @@ mod tests {
     #[test]
     fn reads_xml_exports() {
         let set = parse_xml(XML).unwrap();
-        assert_eq!(set.hosts.len(), 2, "{:?}", set.warnings);
+        assert_eq!(set.hosts.len(), 3, "{:?}", set.warnings);
         let web = &set.hosts[0];
         assert_eq!(web.target(), "deploy@10.0.0.11:2222");
         assert_eq!(
@@ -287,10 +296,14 @@ mod tests {
             web.key_file.as_deref(),
             Some(r"C:\Users\ana\.ssh\id_rsa.pub")
         );
-        let lab = &set.hosts[1];
+        // Telnet sessions are Telnet hosts (with the Telnet port).
+        let router = &set.hosts[1];
+        assert!(router.protocol.is_telnet());
+        assert_eq!(router.port, Some(2323));
+        let lab = &set.hosts[2];
         assert_eq!(lab.group, None);
         assert!(lab.notes.contains("Corp SOCKS"));
-        assert_eq!(set.warnings.len(), 1);
+        assert_eq!(set.warnings.len(), 0);
         assert!(parse_xml("<VanDyke/>").is_err());
     }
 

@@ -170,7 +170,7 @@ pub fn target_of(
     Ok((
         Target {
             address,
-            port: settings.port.unwrap_or(22),
+            port: settings.port.unwrap_or(host.protocol.default_port()),
             proxy,
         },
         needs_password,
@@ -640,6 +640,8 @@ mod tests {
             os: None,
             os_version: None,
             favorite: false,
+            protocol: Default::default(),
+            icon: None,
         }
     }
 

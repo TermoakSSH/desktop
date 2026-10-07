@@ -5,8 +5,8 @@
 //! root), `ImgNum=` and one line per session:
 //! `Name=#<icon>#<type>%<host>%<port>%<user>%…#<terminal settings>#…`.
 //! Assumptions about the `%` fields (MobaXterm does not document them):
-//! type `0` is SSH (`7` SFTP is imported as an SSH host too, the rest
-//! are skipped); fields 1–3 are host, port and user; field 8–10 an SSH
+//! type `0` is SSH (`7` SFTP is imported as an SSH host too), `1` is
+//! Telnet (a Telnet host), the rest are skipped; fields 1–3 are host, port and user; field 8–10 an SSH
 //! gateway (host, port, user), written in the notes; the private key path
 //! is the first field after the 10th that looks like a key file
 //! (`_ProfileDir_` is the user's home). Saved passwords are encrypted by
@@ -14,10 +14,15 @@
 
 use super::text::parse_ini;
 use super::{ImportHost, ImportSet};
+use termoak_core::model::HostProtocol;
 
-/// Session types of MobaXterm that are SSH servers.
-fn is_ssh_type(t: &str) -> bool {
-    matches!(t.trim(), "0" | "7")
+/// What a MobaXterm session type becomes (`None`: skipped).
+fn protocol_of_type(t: &str) -> Option<HostProtocol> {
+    match t.trim() {
+        "0" | "7" => Some(HostProtocol::Ssh),
+        "1" => Some(HostProtocol::Telnet),
+        _ => None,
+    }
 }
 
 /// Name of a MobaXterm session type (for the warnings).
@@ -84,7 +89,7 @@ pub fn parse(text: &str) -> ImportSet {
             let Some(params) = parts.next() else { continue };
             let f: Vec<&str> = params.split('%').collect();
             let kind = f.first().copied().unwrap_or("");
-            if !is_ssh_type(kind) {
+            let Some(protocol) = protocol_of_type(kind) else {
                 set.warnings.push(
                     t!(
                         "import_export.warn.not_ssh",
@@ -94,11 +99,11 @@ pub fn parse(text: &str) -> ImportSet {
                     .to_string(),
                 );
                 continue;
-            }
+            };
             let field = |i: usize| f.get(i).map(|s| s.trim()).unwrap_or("");
             let mut notes = Vec::new();
             let gateway = field(8);
-            if !gateway.is_empty() && gateway != "-1" && gateway != "0" {
+            if protocol.is_ssh() && !gateway.is_empty() && gateway != "-1" && gateway != "0" {
                 let mut g = String::new();
                 if !field(10).is_empty() {
                     g.push_str(field(10));
@@ -115,7 +120,8 @@ pub fn parse(text: &str) -> ImportSet {
                 .iter()
                 .skip(11)
                 .find(|v| looks_like_key(v))
-                .map(|v| key_path(v));
+                .map(|v| key_path(v))
+                .filter(|_| protocol.is_ssh());
             let empty_group = group.is_none() && folder.trim().is_empty();
             set.push_host(ImportHost {
                 label: name.trim().to_string(),
@@ -125,6 +131,7 @@ pub fn parse(text: &str) -> ImportSet {
                 group: if empty_group { None } else { group.clone() },
                 notes: notes.join("\n"),
                 key_file,
+                protocol,
                 ..Default::default()
             });
         }
@@ -149,12 +156,13 @@ SubRep=Production\\Web\r\n\
 ImgNum=41\r\n\
 web-1=#109#0%10.0.0.11%2222%deploy%%-1%-1%%bastion.example.com%22%jump%0%0%0%_ProfileDir_\\.ssh\\id_ed25519%%-1%0%0%0%%1080%%0%0%1#MobaFont%10%0%0%-1%15%236,236,236%30,30,30%180,180,180%0%-1%0%%xterm%-1%-1%_Std_Colors_0_%80%24%0%1%-1%<none>%%0%0%-1#0# #-1\r\n\
 files=#140#7%10.0.0.12%22%deploy%%-1%-1%%%%%0%0%0%C:\\keys\\deploy.ppk%%-1%0%0%0%%1080%%0%0%1#MobaFont%10%0%0%-1%15%236,236,236%30,30,30%180,180,180%0%-1%0%%xterm%-1%-1%_Std_Colors_0_%80%24%0%1%-1%<none>%%0%0%-1#0# #-1\r\n\
+router=#98#1%192.168.1.1%23%admin%%2%%%%%0%0%%1080%#MobaFont%10%0%0%-1%15%236,236,236%30,30,30%180,180,180%0%-1%0%%xterm%-1%-1%_Std_Colors_0_%80%24%0%1%-1%<none>%%0%0%-1#0# #-1\r\n\
 desktop=#91#4%10.0.0.50%3389%%-1%-1%0%0%-1#MobaFont%10%0%0%-1%15%236,236,236%30,30,30%180,180,180%0%-1%0%%xterm%-1%-1%_Std_Colors_0_%80%24%0%1%-1%<none>%%0%0%-1#0# #-1\r\n";
 
     #[test]
     fn reads_bookmarks() {
         let set = parse(SAMPLE);
-        assert_eq!(set.hosts.len(), 3, "{:?}", set.warnings);
+        assert_eq!(set.hosts.len(), 4, "{:?}", set.warnings);
         let home = &set.hosts[0];
         assert_eq!(home.label, "Home server");
         assert_eq!(home.target(), "ana@192.168.1.10");
@@ -174,6 +182,11 @@ desktop=#91#4%10.0.0.50%3389%%-1%-1%0%0%-1#MobaFont%10%0%0%-1%15%236,236,236%30,
         );
         let files = &set.hosts[2];
         assert_eq!(files.key_file.as_deref(), Some("C:\\keys\\deploy.ppk"));
+        // Telnet sessions are Telnet hosts.
+        let router = &set.hosts[3];
+        assert!(router.protocol.is_telnet() && home.protocol.is_ssh());
+        assert_eq!(router.target(), "telnet://admin@192.168.1.1");
+        assert!(router.notes.is_empty() && router.key_file.is_none());
         assert_eq!(set.warnings.len(), 1);
         assert!(set.warnings[0].contains("RDP"));
     }

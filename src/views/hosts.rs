@@ -709,11 +709,15 @@ impl HostsView {
         let Some(host) = m.host(id) else {
             return;
         };
-        let text = ssh_address(
+        let mut text = ssh_address(
             m.effective_user(host).as_deref(),
             &host.address,
             m.effective_port(host),
         );
+        // What quick connect reads back.
+        if host.protocol.is_telnet() {
+            text.insert_str(0, "telnet://");
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
         ui::notify(
             window,
@@ -999,6 +1003,8 @@ impl HostsView {
         }
 
         let favorite = rec.data.favorite;
+        // Telnet: no server sessions or SFTP.
+        let ssh = rec.data.protocol.is_ssh();
         let menu = menu
             .item(
                 PopupMenuItem::new(t!("hosts.menu.connect"))
@@ -1010,7 +1016,7 @@ impl HostsView {
                     .icon(ui::icon(IconName::LayoutGrid))
                     .on_click(act(|v, ids, _, cx| v.open_split(ids, true, cx))),
             )
-            .when(server, |menu| {
+            .when(server && ssh, |menu| {
                 menu.item(
                     PopupMenuItem::new(t!("hosts.menu.connect_server"))
                         .icon(ui::icon(IconName::Cloud))
@@ -1021,18 +1027,20 @@ impl HostsView {
                         })),
                 )
             })
-            .item(
-                PopupMenuItem::new(t!("hosts.menu.open_sftp"))
-                    .icon(ui::icon(IconName::FolderOpen))
-                    .on_click(act(|_, ids, _, cx| {
-                        for host_id in ids {
-                            cx.emit(OpenRequest::Sftp {
-                                host_id,
-                                conn: None,
-                            });
-                        }
-                    })),
-            );
+            .when(ssh, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("hosts.menu.open_sftp"))
+                        .icon(ui::icon(IconName::FolderOpen))
+                        .on_click(act(|_, ids, _, cx| {
+                            for host_id in ids {
+                                cx.emit(OpenRequest::Sftp {
+                                    host_id,
+                                    conn: None,
+                                });
+                            }
+                        })),
+                )
+            });
         let menu = Self::workspace_submenu(menu, view.clone(), ws_ids, window, cx);
         let menu = menu
             .when(status_on && !status_off, |menu| {
@@ -1507,6 +1515,10 @@ impl HostsView {
             .map(|s| (*s, self.status.read(cx).is_running(host.id)));
         let theme = cx.theme();
         let selected = self.editor.as_ref().and_then(|e| e.read(cx).host_id()) == Some(host.id);
+        let telnet = host.protocol.is_telnet();
+        // Without a detected system an SSH host says "SSH" (Telnet ones get
+        // their own badge).
+        let os_known = host.os.is_some();
         let (os_label, os_color) = host
             .os
             .as_deref()
@@ -1518,17 +1530,12 @@ impl HostsView {
             .as_ref()
             .and(host.os_version.clone())
             .filter(|v| !v.trim().is_empty());
-        let avatar_color = host
-            .color
-            .as_deref()
-            .and_then(theme::parse_color)
-            .unwrap_or(os_color);
         let port = host.settings.port;
         let subtitle = format!(
             "{}{}{}",
             user.map(|u| format!("{u}@")).unwrap_or_default(),
             host.address,
-            port.filter(|p| *p != 22)
+            port.filter(|p| *p != host.protocol.default_port())
                 .map(|p| format!(":{p}"))
                 .unwrap_or_default()
         );
@@ -1542,13 +1549,6 @@ impl HostsView {
             .as_ref()
             .filter(|(m, _, _)| *m == id)
             .map(|(_, menu, _)| menu.clone());
-        let initials: String = host
-            .label
-            .split_whitespace()
-            .filter_map(|w| w.chars().next())
-            .take(2)
-            .collect::<String>()
-            .to_uppercase();
 
         v_flex()
             .id(("host-card", ix))
@@ -1610,24 +1610,7 @@ impl HostsView {
                 h_flex()
                     .gap_3()
                     .items_center()
-                    .child(
-                        div()
-                            .size(px(40.))
-                            .flex_shrink_0()
-                            .rounded(theme.radius)
-                            .bg(avatar_color)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(gpui::white())
-                            .font_semibold()
-                            .text_sm()
-                            .child(if initials.is_empty() {
-                                "?".to_string()
-                            } else {
-                                initials
-                            }),
-                    )
+                    .child(crate::logos::avatar(host, 40., theme.radius))
                     .child(
                         v_flex()
                             .flex_1()
@@ -1770,7 +1753,18 @@ impl HostsView {
                                     }),
                             )
                         }
+                        None if telnet && !os_known => this,
                         None => this.child(ui::pill(os_label, os_color)),
+                    })
+                    .when(telnet, |this| {
+                        this.child(
+                            h_flex()
+                                .id(("host-telnet", ix))
+                                .child(ui::pill("Telnet", theme.warning))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(t!("hosts.telnet_tooltip")).build(window, cx)
+                                }),
+                        )
                     })
                     .children(
                         host.tags

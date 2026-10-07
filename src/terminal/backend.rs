@@ -1,5 +1,6 @@
 //! Connection of a terminal with its source, in tokio:
-//! - **Local**: SSH from this computer (`Workspace::connect` + `open_terminal`).
+//! - **Local**: SSH from this computer (`Workspace::connect` + `open_terminal`),
+//!   or Telnet for the hosts whose protocol is Telnet (`open_telnet`).
 //! - **Server**: a session that lives on the Termoak server and survives the
 //!   app being closed (`POST /api/v1/sessions` + WebSocket).
 //! - **Shell**: a shell of this computer in a PTY (see [`super::shell`]).
@@ -15,7 +16,7 @@ use termoak_client::{ApiClient, Workspace};
 use termoak_core::Id;
 use termoak_core::model::Host;
 use termoak_ssh::prompt::Prompt;
-use termoak_ssh::{Connection, TerminalSession};
+use termoak_ssh::{Connection, Terminal};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -102,8 +103,8 @@ pub struct RemoteSeat {
 pub enum Out {
     /// Status text while connecting.
     Status(String),
-    /// Local terminal ready.
-    Local(Arc<TerminalSession>),
+    /// Local terminal ready (SSH or Telnet).
+    Local(Terminal),
     /// Local shell running.
     Shell,
     /// Attached to a server session.
@@ -199,6 +200,9 @@ pub struct LocalParams {
     pub rows: u16,
     /// Already open connection to reuse (not used when reconnecting, for example).
     pub conn: Option<Arc<Connection>>,
+    /// Telnet hosts: answer their first login prompts with the host's
+    /// username and password.
+    pub telnet_auto_login: bool,
 }
 
 /// Starts a local terminal.
@@ -217,60 +221,91 @@ async fn run_local(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     out: mpsc::UnboundedSender<Out>,
 ) {
-    let label =
-        p.ws.find_item::<Host>(p.host_id)
-            .await
-            .map(|h| h.record.data.label)
-            .unwrap_or_else(|_| "host".into());
+    let host = p.ws.find_item::<Host>(p.host_id).await.ok();
+    let label = host
+        .as_ref()
+        .map(|h| h.record.data.label.clone())
+        .unwrap_or_else(|| "host".into());
+    let telnet = host
+        .as_ref()
+        .is_some_and(|h| h.record.data.protocol.is_telnet());
     // Latest size (the window adjusts while connecting).
     let mut size = (p.cols, p.rows);
-    let conn = match p.conn {
-        Some(c) if !c.is_closed() => c,
-        _ => {
-            let _ = out.send(Out::Status(
-                t!("terminal.status.connecting_to", host = label).to_string(),
-            ));
-            // While connecting, close requests are handled (e.g. the tab is closed).
-            let connect = p.ws.connect(p.host_id, p.prompter.clone(), p.use_agent);
-            tokio::pin!(connect);
-            loop {
-                tokio::select! {
-                    res = &mut connect => match res {
-                        Ok(c) => break c,
-                        Err(e) => {
-                            // Vault rules (Use only, Strict...) are translated.
-                            let _ = out.send(Out::Failed(crate::state::api_error(e)));
-                            return;
+    let term: Terminal = if telnet {
+        let _ = out.send(Out::Status(
+            t!("terminal.status.connecting_to", host = label).to_string(),
+        ));
+        let open =
+            p.ws.open_telnet(p.host_id, size.0, size.1, false, p.telnet_auto_login);
+        tokio::pin!(open);
+        let term = loop {
+            tokio::select! {
+                res = &mut open => match res {
+                    Ok(t) => break t,
+                    Err(e) => {
+                        let _ = out.send(Out::Failed(crate::state::api_error(e)));
+                        return;
+                    }
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(Cmd::Close) | Some(Cmd::CloseSession) | None => return,
+                    Some(Cmd::Resize(c, r)) => size = (c, r),
+                    Some(Cmd::Input(_)) | Some(Cmd::Share(_)) | Some(Cmd::Latency(_)) => {}
+                }
+            }
+        };
+        // The window may have changed while connecting.
+        let _ = term.resize(size.0, size.1).await;
+        Terminal::Telnet(term)
+    } else {
+        let conn = match p.conn {
+            Some(c) if !c.is_closed() => c,
+            _ => {
+                let _ = out.send(Out::Status(
+                    t!("terminal.status.connecting_to", host = label).to_string(),
+                ));
+                // While connecting, close requests are handled (e.g. the tab is closed).
+                let connect = p.ws.connect(p.host_id, p.prompter.clone(), p.use_agent);
+                tokio::pin!(connect);
+                loop {
+                    tokio::select! {
+                        res = &mut connect => match res {
+                            Ok(c) => break c,
+                            Err(e) => {
+                                // Vault rules (Use only, Strict...) are translated.
+                                let _ = out.send(Out::Failed(crate::state::api_error(e)));
+                                return;
+                            }
+                        },
+                        cmd = cmd_rx.recv() => match cmd {
+                            Some(Cmd::Close) | Some(Cmd::CloseSession) | None => return,
+                            Some(Cmd::Resize(c, r)) => size = (c, r),
+                            Some(Cmd::Input(_)) | Some(Cmd::Share(_)) | Some(Cmd::Latency(_)) => {}
                         }
-                    },
-                    cmd = cmd_rx.recv() => match cmd {
-                        Some(Cmd::Close) | Some(Cmd::CloseSession) | None => return,
-                        Some(Cmd::Resize(c, r)) => size = (c, r),
-                        Some(Cmd::Input(_)) | Some(Cmd::Share(_)) | Some(Cmd::Latency(_)) => {}
                     }
                 }
             }
-        }
-    };
-    let _ = out.send(Out::Status(t!("terminal.status.opening").to_string()));
-    let term = match p
-        .ws
-        .open_terminal(p.host_id, conn.clone(), size.0, size.1, false)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = out.send(Out::Failed(e.to_string()));
-            return;
+        };
+        let _ = out.send(Out::Status(t!("terminal.status.opening").to_string()));
+        match p
+            .ws
+            .open_terminal(p.host_id, conn, size.0, size.1, false)
+            .await
+        {
+            Ok(t) => Terminal::Ssh(t),
+            Err(e) => {
+                let _ = out.send(Out::Failed(e.to_string()));
+                return;
+            }
         }
     };
     let _ = out.send(Out::Local(term.clone()));
 
-    // Detects the operating system to show it on the host card.
-    {
+    // Detects the operating system to show it on the host card (SSH only:
+    // it runs a command on its own channel).
+    if let Some(conn) = term.connection().cloned() {
         let ws = p.ws.clone();
         let host_id = p.host_id;
-        let conn = conn.clone();
         tokio::spawn(async move {
             // Saved where the host is, if the user can change it (Use-only
             // members skip it: it is only metadata).
@@ -313,9 +348,9 @@ async fn run_local(
                 Some(Cmd::Share(_)) => {}
                 // Measured apart: the output keeps flowing meanwhile.
                 Some(Cmd::Latency(reply)) => {
-                    let conn = conn.clone();
+                    let term = term.clone();
                     tokio::spawn(async move {
-                        let _ = reply.send(conn.latency(super::latency::TIMEOUT).await.ok());
+                        let _ = reply.send(term.latency(super::latency::TIMEOUT).await.ok());
                     });
                 }
                 Some(Cmd::Close) | Some(Cmd::CloseSession) | None => {

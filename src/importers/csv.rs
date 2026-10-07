@@ -8,7 +8,7 @@
 //! user/username/login, group/groups/folder/path, tags, notes/description,
 //! password, protocol/type/device. A `user@host:port` address is split.
 
-use super::{ImportHost, ImportSet, is_ssh_protocol, split_tags};
+use super::{ImportHost, ImportSet, protocol_of, split_tags};
 
 /// A CSV file split into rows and cells.
 #[derive(Debug, Clone, PartialEq)]
@@ -243,8 +243,9 @@ pub fn to_set(table: &CsvTable, mapping: &Mapping) -> ImportSet {
                 .map(|v| v.trim().to_string())
                 .unwrap_or_default()
         };
-        let protocol = get(Field::Protocol);
-        if !is_ssh_protocol(&protocol) {
+        let protocol_text = get(Field::Protocol);
+        let Some(protocol) = protocol_of(&protocol_text) else {
+            let protocol = protocol_text;
             set.warnings.push(
                 t!(
                     "import_export.warn.not_ssh",
@@ -254,7 +255,7 @@ pub fn to_set(table: &CsvTable, mapping: &Mapping) -> ImportSet {
                 .to_string(),
             );
             continue;
-        }
+        };
         let port_text = get(Field::Port);
         let port = match port_text.parse::<u16>() {
             Ok(p) => Some(p),
@@ -283,6 +284,7 @@ pub fn to_set(table: &CsvTable, mapping: &Mapping) -> ImportSet {
             tags: split_tags(&get(Field::Tags)),
             notes: get(Field::Notes),
             password: Some(get(Field::Password)).filter(|p| !p.is_empty()),
+            protocol,
             ..Default::default()
         });
     }
@@ -315,10 +317,14 @@ pub struct ExportRow {
     pub group: String,
     pub tags: Vec<String>,
     pub notes: String,
+    /// `ssh` or `telnet`.
+    pub protocol: String,
 }
 
 /// Header of the export (also what [`guess_mapping`] reads back).
-pub const EXPORT_HEADER: [&str; 7] = ["label", "host", "port", "user", "group", "tags", "notes"];
+pub const EXPORT_HEADER: [&str; 8] = [
+    "label", "host", "port", "user", "group", "tags", "notes", "protocol",
+];
 
 /// Writes the export CSV (comma, CRLF as RFC 4180 says; groups as
 /// `Parent/Child`, tags separated by `, `).
@@ -334,6 +340,7 @@ pub fn write(rows: &[ExportRow]) -> String {
             r.group.clone(),
             r.tags.join(", "),
             r.notes.clone(),
+            r.protocol.clone(),
         ];
         let line: Vec<String> = cells.iter().map(|c| escape(c, ',')).collect();
         out.push_str(&line.join(","));
@@ -399,10 +406,15 @@ mod tests {
 
     #[test]
     fn tabs_and_protocols() {
-        let t = read("label\taddress\tprotocol\nsw\t10.1.1.1\ttelnet\nbox\t10.1.1.2\tssh\n");
+        let t = read(
+            "label\taddress\tprotocol\nsw\t10.1.1.1\ttelnet\nbox\t10.1.1.2\tssh\nold\t10.1.1.3\trlogin\n",
+        );
         assert_eq!(t.delimiter, '\t');
         let set = to_set(&t, &guess_mapping(&t));
-        assert_eq!(set.hosts.len(), 1);
+        // Telnet rows are Telnet hosts; rlogin is skipped.
+        assert_eq!(set.hosts.len(), 2);
+        assert!(set.hosts[0].protocol.is_telnet());
+        assert!(set.hosts[1].protocol.is_ssh());
         assert_eq!(set.warnings.len(), 1);
     }
 
@@ -416,9 +428,10 @@ mod tests {
             group: "Prod/Web".into(),
             tags: vec!["a".into(), "b".into()],
             notes: "line 1\nline 2".into(),
+            protocol: "telnet".into(),
         }];
         let text = write(&rows);
-        assert!(text.starts_with("label,host,port,user,group,tags,notes\r\n"));
+        assert!(text.starts_with("label,host,port,user,group,tags,notes,protocol\r\n"));
         let t = read(&text);
         let set = to_set(&t, &guess_mapping(&t));
         let h = &set.hosts[0];

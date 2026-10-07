@@ -34,6 +34,7 @@ mod host_status;
 mod importers;
 mod links;
 mod local_ai;
+mod logos;
 mod menus;
 mod notifications;
 mod palette;
@@ -115,7 +116,7 @@ fn main() {
     i18n::apply(settings.language.as_deref());
     links::listen(&data_dir);
     links::register_scheme(&data_dir);
-    let application = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
+    let application = gpui_platform::application().with_assets(logos::Assets);
     application.on_open_urls(|urls| urls.into_iter().for_each(links::deliver));
     // macOS: the Dock icon clicked with no window on screen (closed or
     // hidden): the window comes back, with its tabs.

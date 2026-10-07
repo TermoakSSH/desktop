@@ -205,6 +205,14 @@ impl SettingsView {
         });
     }
 
+    fn set_telnet_auto_login(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            s.telnet_auto_login = on;
+            m.save_settings(s, cx);
+        });
+    }
+
     fn set_autocomplete(&mut self, on: bool, cx: &mut Context<Self>) {
         self.model.update(cx, |m, cx| {
             let mut s = m.settings.clone();
@@ -728,6 +736,24 @@ impl SettingsView {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(t!("settings.agent.hint")),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("telnet-auto-login")
+                            .label(t!("settings.telnet_auto_login.label"))
+                            .checked(settings.telnet_auto_login)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                this.set_telnet_auto_login(*v, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("settings.telnet_auto_login.hint")),
                     ),
             )
             .child(

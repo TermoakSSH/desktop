@@ -57,6 +57,9 @@ pub struct Settings {
     pub dark: bool,
     /// Try the keys of the system SSH agent.
     pub use_agent: bool,
+    /// Telnet hosts with a username or password answer the host's first
+    /// `login:` / `Password:` prompts with them.
+    pub telnet_auto_login: bool,
     /// Terminal font size.
     pub font_size: f32,
     /// Terminal font family (empty = the system monospace font).
@@ -124,6 +127,7 @@ impl Default for Settings {
         Self {
             dark: true,
             use_agent: true,
+            telnet_auto_login: true,
             font_size: 14.0,
             font_family: String::new(),
             scrollback: 10_000,
@@ -1595,7 +1599,8 @@ impl AppModel {
             })
     }
 
-    /// Effective SSH port of a host: its own, its group's or 22.
+    /// Effective port of a host: its own, its group's or the protocol's
+    /// (22 for SSH, 23 for Telnet).
     pub fn effective_port(&self, host: &Host) -> u16 {
         host.settings
             .port
@@ -1604,7 +1609,7 @@ impl AppModel {
                     .and_then(|g| self.groups.iter().find(|x| x.data.id == g))
                     .and_then(|g| g.data.settings.port)
             })
-            .unwrap_or(22)
+            .unwrap_or(host.protocol.default_port())
     }
 
     /// Name of the current account as shown (its alias, or its email;
@@ -1710,6 +1715,12 @@ impl AppModel {
 
     pub fn host(&self, id: Id) -> Option<&Host> {
         self.hosts.iter().find(|h| h.data.id == id).map(|h| &h.data)
+    }
+
+    /// The host is reached over Telnet (no server sessions, SFTP, tunnels
+    /// or jump hosts).
+    pub fn is_telnet(&self, id: Id) -> bool {
+        self.host(id).is_some_and(|h| h.protocol.is_telnet())
     }
 
     pub fn host_record(&self, id: Id) -> Option<&Item<Host>> {
@@ -2631,6 +2642,8 @@ mod tests {
             os: None,
             os_version: None,
             favorite: false,
+            protocol: Default::default(),
+            icon: None,
         };
         let saved = ws
             .save_item(SaveTarget::Device, host, SecretUpdate::Keep, None)

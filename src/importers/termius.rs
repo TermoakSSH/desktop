@@ -3,8 +3,8 @@
 //! - CSV (Termius' own CSV import/export layout): the columns `Groups`,
 //!   `Label`, `Tags`, `Hostname/IP`, `Protocol`, `Port`, and when present
 //!   `Username`, `Password` and `Notes`. Nested groups are written
-//!   `Parent/Child`; tags are separated by commas. Rows whose protocol is
-//!   not SSH (Telnet) are skipped.
+//!   `Parent/Child`; tags are separated by commas. Telnet rows are Telnet
+//!   hosts; other protocols are skipped.
 //! - JSON (best effort, there is no documented Termius JSON export): an
 //!   array of hosts, or an object with `hosts` (and optionally `groups`,
 //!   whose `id`/`parent_group` build the folder path). A host may have
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::{ImportHost, ImportSet, csv, is_ssh_protocol};
+use super::{ImportHost, ImportSet, csv, protocol_of};
 
 /// Reads a Termius export (JSON or CSV).
 pub fn parse(text: &str) -> Result<ImportSet, String> {
@@ -107,9 +107,10 @@ pub fn from_json(value: &Value) -> ImportSet {
     for h in &hosts {
         let Some(o) = h.as_object() else { continue };
         let ssh = o.get("ssh_config").and_then(Value::as_object);
-        let protocol = str_of(first(o, &["protocol", "type"])).unwrap_or_default();
+        let protocol_text = str_of(first(o, &["protocol", "type"])).unwrap_or_default();
         let label = str_of(first(o, &["label", "name", "alias"])).unwrap_or_default();
-        if !is_ssh_protocol(&protocol) {
+        let Some(protocol) = protocol_of(&protocol_text) else {
+            let protocol = protocol_text;
             set.warnings.push(
                 t!(
                     "import_export.warn.not_ssh",
@@ -119,7 +120,7 @@ pub fn from_json(value: &Value) -> ImportSet {
                 .to_string(),
             );
             continue;
-        }
+        };
         let port = first(o, &["port"])
             .or_else(|| ssh.and_then(|s| s.get("port")))
             .and_then(|p| p.as_u64().or_else(|| p.as_str()?.trim().parse().ok()))
@@ -146,6 +147,7 @@ pub fn from_json(value: &Value) -> ImportSet {
             tags,
             notes: str_of(first(o, &["notes", "note", "description"])).unwrap_or_default(),
             password: str_of(first(o, &["password"])),
+            protocol,
             ..Default::default()
         });
     }
@@ -164,8 +166,11 @@ mod tests {
             Network,switch,,10.0.0.254,telnet,23,\n\
             ,lab,,lab.local,,,\n";
         let set = parse(text).unwrap();
-        assert_eq!(set.hosts.len(), 3);
-        assert_eq!(set.warnings.len(), 1);
+        // The telnet row is a Telnet host.
+        assert_eq!(set.hosts.len(), 4);
+        assert_eq!(set.warnings.len(), 0);
+        assert!(set.hosts[2].protocol.is_telnet());
+        assert_eq!(set.hosts[2].port, Some(23));
         let web = &set.hosts[0];
         assert_eq!(web.label, "web-1");
         assert_eq!(web.tags, vec!["nginx", "prod"]);
@@ -174,7 +179,7 @@ mod tests {
             "Production / Web"
         );
         assert_eq!(set.hosts[1].port, Some(5522));
-        assert_eq!(set.hosts[2].group, None);
+        assert_eq!(set.hosts[3].group, None);
     }
 
     #[test]
@@ -194,7 +199,8 @@ mod tests {
           ]
         }"#;
         let set = parse(text).unwrap();
-        assert_eq!(set.hosts.len(), 2);
+        assert_eq!(set.hosts.len(), 3);
+        assert!(set.hosts[2].protocol.is_telnet());
         let web = &set.hosts[0];
         assert_eq!(web.port, Some(2222));
         assert_eq!(web.username.as_deref(), Some("deploy"));
@@ -207,7 +213,7 @@ mod tests {
             set.group_label(set.hosts[1].group.as_deref().unwrap()),
             "Databases"
         );
-        assert_eq!(set.warnings.len(), 1);
+        assert_eq!(set.warnings.len(), 0);
     }
 
     #[test]

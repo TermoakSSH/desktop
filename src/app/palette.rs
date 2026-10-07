@@ -19,7 +19,7 @@ use gpui_component::input::{
     Input, InputEvent, InputState, MoveDown, MovePageDown, MovePageUp, MoveUp,
 };
 use gpui_component::kbd::Kbd;
-use gpui_component::{ActiveTheme, Sizable, WindowExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Icon, Sizable, WindowExt, h_flex, v_flex};
 use termoak_core::Id;
 
 use super::{AppView, CommandPalette, Section, TabContent};
@@ -130,7 +130,7 @@ impl Clone for Target {
 pub(super) struct Item {
     entry: Entry,
     target: Target,
-    icon: IconName,
+    icon: Icon,
 }
 
 impl Item {
@@ -144,13 +144,13 @@ impl Item {
                 keywords: Vec::new(),
             },
             target,
-            icon: match kind {
+            icon: Icon::new(match kind {
                 Kind::Tab => IconName::Terminal,
                 Kind::Host => IconName::Server,
                 Kind::Session => IconName::Cloud,
                 Kind::Snippet => IconName::SquareTerminal,
                 Kind::Command => IconName::ChevronRight,
-            },
+            }),
         }
     }
 
@@ -164,8 +164,8 @@ impl Item {
         self
     }
 
-    fn icon(mut self, icon: IconName) -> Self {
-        self.icon = icon;
+    fn icon(mut self, icon: impl Into<Icon>) -> Self {
+        self.icon = icon.into();
         self
     }
 
@@ -273,10 +273,15 @@ impl AppView {
                 detail
             };
             let icon = match &tab.content {
-                TabContent::Sftp(_) => IconName::FolderOpen,
-                TabContent::Dormant { .. } => IconName::Cloud,
-                TabContent::Terminal(p) if p.is_split() => IconName::LayoutGrid,
-                TabContent::Terminal(_) => IconName::Terminal,
+                TabContent::Sftp(_) => Icon::new(IconName::FolderOpen),
+                TabContent::Dormant { .. } => Icon::new(IconName::Cloud),
+                TabContent::Terminal(p) if p.is_split() => Icon::new(IconName::LayoutGrid),
+                // The host's logo, if it has one.
+                TabContent::Terminal(p) => p
+                    .focused()
+                    .read(cx)
+                    .host_logo(cx)
+                    .unwrap_or_else(|| Icon::new(IconName::Terminal)),
             };
             items.push(
                 Item::new(
@@ -296,25 +301,35 @@ impl AppView {
             let user = m.effective_user(host);
             let port = m.effective_port(host);
             let address = format!(
-                "{}{}{}",
+                "{}{}{}{}",
+                if host.protocol.is_telnet() {
+                    "telnet://"
+                } else {
+                    ""
+                },
                 user.map(|u| format!("{u}@")).unwrap_or_default(),
                 host.address,
-                if port == 22 {
+                if port == host.protocol.default_port() {
                     String::new()
                 } else {
                     format!(":{port}")
                 }
             );
-            items.push(
-                Item::new(
-                    Kind::Host,
-                    format!("host:{}", host.id),
-                    host.label.clone(),
-                    Target::Host(host.id),
-                )
-                .detail(address)
-                .keywords(host.tags.iter().cloned()),
-            );
+            let mut item = Item::new(
+                Kind::Host,
+                format!("host:{}", host.id),
+                host.label.clone(),
+                Target::Host(host.id),
+            )
+            .detail(address)
+            .keywords(host.tags.iter().cloned());
+            if let Some(logo) = crate::logos::small_icon(host) {
+                item = item.icon(logo);
+            }
+            if host.protocol.is_telnet() {
+                item = item.keywords(["telnet".to_string()]);
+            }
+            items.push(item);
         }
 
         // Server sessions to attach to (not already in a tab).
@@ -911,15 +926,11 @@ impl Render for PaletteView {
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.click(i, window, cx)
                     }))
-                    .child(
-                        ui::icon(item.icon.clone())
-                            .size(px(16.))
-                            .text_color(if selected {
-                                theme.primary
-                            } else {
-                                theme.muted_foreground
-                            }),
-                    )
+                    .child(item.icon.clone().size(px(16.)).text_color(if selected {
+                        theme.primary
+                    } else {
+                        theme.muted_foreground
+                    }))
                     .child(
                         v_flex()
                             .flex_1()
