@@ -6,12 +6,14 @@
 pub mod backend;
 pub mod command_watch;
 pub mod complete;
+mod drop_upload;
 mod element;
 pub mod find;
 pub mod input;
 pub mod latency;
 pub mod model;
 pub mod mouse;
+mod osc7;
 pub mod paste;
 pub mod serial;
 mod share_ui;
@@ -355,6 +357,8 @@ pub struct TerminalView {
     /// Checks for the prompt while a command runs (without shell
     /// integration).
     command_tick: Option<Task<()>>,
+    /// Files dropped on it being uploaded.
+    uploads: drop_upload::Uploads,
     _reader: Option<Task<()>>,
 }
 
@@ -418,6 +422,7 @@ impl TerminalView {
             commands: command_watch::CommandWatch::default(),
             marks: command_watch::MarkScanner::default(),
             command_tick: None,
+            uploads: drop_upload::Uploads::default(),
             _reader: None,
         }
     }
@@ -3456,6 +3461,16 @@ impl Render for TerminalView {
                     // Motion and release are registered by the element for the whole window.
                     .on_any_mouse_down(cx.listener(Self::mouse_down))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                    // Files from the system file manager: uploaded (SSH) or
+                    // their paths typed (local shell).
+                    .drag_over::<gpui::ExternalPaths>(|s, _, _, cx| {
+                        s.border_2().border_color(cx.theme().drop_target)
+                    })
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            this.drop_paths(paths.paths().to_vec(), window, cx)
+                        }),
+                    )
                     .child(TerminalElement::new(
                         entity,
                         self.focus.clone(),

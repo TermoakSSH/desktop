@@ -23,9 +23,9 @@ use crate::ui::{self, IconName};
 /// Delay after changing an option before repeating the preview.
 const PREVIEW_DELAY: Duration = Duration::from_millis(400);
 
-/// Opens the import dialog.
-pub fn open(model: Entity<AppModel>, window: &mut Window, cx: &mut App) {
-    let dialog = cx.new(|cx| ImportDialog::new(model, window, cx));
+/// Opens the import dialog, with a file (by default `~/.ssh/config`).
+pub fn open(model: Entity<AppModel>, path: Option<PathBuf>, window: &mut Window, cx: &mut App) {
+    let dialog = cx.new(|cx| ImportDialog::new(model, path, window, cx));
     window.open_dialog(cx, move |d, _, _| {
         d.title(t!("import.title"))
             .w(px(680.))
@@ -110,8 +110,16 @@ struct ImportDialog {
 }
 
 impl ImportDialog {
-    fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let default = termoak_ssh::sshconfig::default_path().display().to_string();
+    fn new(
+        model: Entity<AppModel>,
+        path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let default = path
+            .unwrap_or_else(termoak_ssh::sshconfig::default_path)
+            .display()
+            .to_string();
         let path = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("~/.ssh/config")

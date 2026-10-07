@@ -127,6 +127,8 @@ pub struct TermModel {
     processor: Processor,
     events: Proxy,
     size: Size,
+    /// Working directory reported by the shell (OSC 7).
+    osc7: super::osc7::Scanner,
 }
 
 impl TermModel {
@@ -145,6 +147,7 @@ impl TermModel {
             processor: Processor::new(),
             events,
             size,
+            osc7: super::osc7::Scanner::default(),
         }
     }
 
@@ -162,8 +165,14 @@ impl TermModel {
 
     /// Processes server output.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<TermEvent> {
+        self.osc7.feed(bytes);
         self.processor.advance(&mut self.term, bytes);
         self.drain_events()
+    }
+
+    /// Working directory the shell reported (OSC 7), if any.
+    pub fn cwd(&self) -> Option<&str> {
+        self.osc7.cwd()
     }
 
     fn drain_events(&mut self) -> Vec<TermEvent> {

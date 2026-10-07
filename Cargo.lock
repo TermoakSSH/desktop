@@ -8396,6 +8396,7 @@ dependencies = [
  "polling",
  "raw-window-handle",
  "reqwest",
+ "roxmltree 0.21.1",
  "rust-i18n",
  "semver",
  "serde",
@@ -8416,6 +8417,7 @@ dependencies = [
  "uuid",
  "windows 0.62.2",
  "windows-future 0.3.2",
+ "winreg 0.55.0",
  "zeroize",
 ]
 
