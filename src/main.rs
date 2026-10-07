@@ -42,6 +42,7 @@ mod sharing;
 mod state;
 mod terminal;
 mod theme;
+mod transfers;
 mod ui;
 mod update;
 mod views;
