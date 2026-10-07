@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::search::RegexSearch;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
 use gpui::Hsla;
@@ -19,19 +19,7 @@ use parking_lot::Mutex;
 use crate::theme::{TermPalette, rgb8};
 
 /// A match of the find bar: first and last cell (inclusive).
-pub type FindMatch = std::ops::RangeInclusive<Point>;
-
-/// Regular expression that matches `text` literally.
-fn literal_pattern(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() * 2);
-    for c in text.chars() {
-        if "\\.+*?()|[]{}^$#&-~".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
+pub type FindMatch = super::find::Match;
 
 /// Terminal size for `alacritty_terminal`.
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +117,8 @@ pub struct CursorSnapshot {
 pub struct Snapshot {
     pub rows: Vec<RowSnapshot>,
     pub cursor: Option<CursorSnapshot>,
+    /// Matches of the find bar on screen.
+    pub highlights: Vec<super::find::Highlight>,
 }
 
 /// Emulator state of a terminal.
@@ -334,40 +324,61 @@ impl TermModel {
 
     // ----- Find -----
 
-    /// Finds `query` literally (ignoring case unless it has capitals) in the
-    /// screen and the history, starting next to `from` (or at the bottom
-    /// for `older`, at the top otherwise) and wrapping around. `older`
-    /// searches upwards. The match is selected and scrolled into view.
-    pub fn find(
-        &mut self,
-        query: &str,
-        from: Option<&FindMatch>,
-        older: bool,
-    ) -> Option<FindMatch> {
-        if query.is_empty() {
-            return None;
-        }
-        let mut regex = RegexSearch::new(&literal_pattern(query)).ok()?;
-        let direction = if older {
-            Direction::Left
-        } else {
-            Direction::Right
-        };
-        let last_col = Column(self.size.cols.saturating_sub(1));
-        let origin = match from {
-            Some(m) if older => m.start().sub(&self.term, Boundary::None, 1),
-            Some(m) => m.end().add(&self.term, Boundary::None, 1),
-            None if older => Point::new(self.term.bottommost_line(), last_col),
-            None => Point::new(self.term.topmost_line(), Column(0)),
-        };
-        let found = self
+    /// Every match of `regex` in the screen and the history, from the top
+    /// down (at most `max`; the flag says there were more).
+    pub fn find_all(&self, regex: &mut RegexSearch, max: usize) -> (Vec<FindMatch>, bool) {
+        let start = Point::new(self.term.topmost_line(), Column(0));
+        let end = Point::new(
+            self.term.bottommost_line(),
+            Column(self.size.cols.saturating_sub(1)),
+        );
+        let mut all: Vec<FindMatch> =
+            RegexIter::new(start, end, Direction::Right, &self.term, regex)
+                .take(max + 1)
+                .collect();
+        let capped = all.len() > max;
+        all.truncate(max);
+        (all, capped)
+    }
+
+    /// The matches of `regex` on screen (to highlight them), including the
+    /// ones that start or end on wrapped lines just outside it.
+    pub fn visible_matches(&self, regex: &mut RegexSearch) -> Vec<FindMatch> {
+        let offset = self.display_offset() as i32;
+        let start = self
             .term
-            .search_next(&mut regex, origin, direction, Side::Left, None)?;
+            .line_search_left(Point::new(Line(-offset), Column(0)));
+        let end = self.term.line_search_right(Point::new(
+            Line(self.size.lines as i32 - 1 - offset),
+            Column(self.size.cols.saturating_sub(1)),
+        ));
+        RegexIter::new(start, end, Direction::Right, &self.term, regex)
+            .take(super::find::MAX_MATCHES)
+            .collect()
+    }
+
+    /// Selects a match and scrolls it into view.
+    pub fn select_match(&mut self, found: &FindMatch) {
         let mut sel = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
         sel.update(*found.end(), Side::Right);
         self.term.selection = Some(sel);
         self.term.scroll_to_point(*found.start());
-        Some(found)
+    }
+
+    /// First and last cell of the selection (the current match while
+    /// finding; it moves with the text when new output scrolls it).
+    pub fn selection_range(&self) -> Option<FindMatch> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some(range.start..=range.end)
+    }
+
+    /// Last cell on screen (where searching starts from).
+    pub fn view_bottom(&self) -> Point {
+        let offset = self.display_offset() as i32;
+        Point::new(
+            Line(self.size.lines as i32 - 1 - offset),
+            Column(self.size.cols.saturating_sub(1)),
+        )
     }
 
     // ----- Links -----
@@ -616,7 +627,11 @@ impl TermModel {
             kind: cursor_kind,
             wide: cursor_wide,
         });
-        Snapshot { rows, cursor }
+        Snapshot {
+            rows,
+            cursor,
+            highlights: Vec::new(),
+        }
     }
 }
 
@@ -738,24 +753,63 @@ mod tests {
 
     #[test]
     fn find_walks_the_history() {
+        use super::super::find::{self, FindOptions};
+        let regex = |q: &str, case_sensitive: bool, is_regex: bool| {
+            let options = FindOptions {
+                case_sensitive,
+                regex: is_regex,
+            };
+            RegexSearch::new(&find::pattern(q, options).unwrap()).unwrap()
+        };
         let mut m = TermModel::new(40, 3, 100);
         for i in 0..10 {
             m.feed(format!("line {i} needle.{i}\r\n").as_bytes());
         }
-        // The most recent first (upwards), then older ones.
-        let first = m.find("NEEDLE.9", None, true);
-        assert!(first.is_none(), "capitals make the search case sensitive");
-        let first = m.find("needle.", None, true).unwrap();
-        assert_eq!(m.selection_text().as_deref(), Some("needle."));
-        let second = m.find("needle.", Some(&first), true).unwrap();
-        assert!(second.start().line < first.start().line);
-        // And back down.
-        let again = m.find("needle.", Some(&second), false).unwrap();
-        assert_eq!(again.start(), first.start());
-        // Literal text: the dot is not "any character".
+        // Every match, from the top of the history down.
+        let (all, capped) = m.find_all(&mut regex("needle.", false, false), 100);
+        assert_eq!(all.len(), 10);
+        assert!(!capped);
+        assert!(all.windows(2).all(|w| w[0].start() < w[1].start()));
+        // Case: ignored unless asked for, even with capitals.
+        assert_eq!(
+            m.find_all(&mut regex("NEEDLE.9", false, false), 100)
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            m.find_all(&mut regex("NEEDLE.9", true, false), 100)
+                .0
+                .is_empty()
+        );
+        // Literal text: the dot is not "any character"; as a regex it is.
         m.feed(b"needleX");
-        assert!(m.find("e.X", None, true).is_none());
-        assert!(m.find("missing", None, true).is_none());
+        assert!(
+            m.find_all(&mut regex("l.X", false, false), 100)
+                .0
+                .is_empty()
+        );
+        assert_eq!(m.find_all(&mut regex("l.X", false, true), 100).0.len(), 1);
+        assert_eq!(
+            m.find_all(&mut regex(r"needle\.[0-4]", false, true), 100)
+                .0
+                .len(),
+            5
+        );
+        // The limit.
+        let (some, capped) = m.find_all(&mut regex("needle", false, false), 4);
+        assert_eq!(some.len(), 4);
+        assert!(capped);
+        // On screen (3 rows): only the last ones.
+        let visible = m.visible_matches(&mut regex("needle", false, false));
+        assert!(!visible.is_empty() && visible.len() < 11);
+        // Selecting one scrolls to it and it can be read back.
+        m.select_match(&all[0]);
+        assert_eq!(m.selection_text().as_deref(), Some("needle."));
+        assert_eq!(m.selection_range(), Some(all[0].clone()));
+        assert!(m.display_offset() > 0);
+        // Searching again starts from what is on screen (3 rows).
+        assert!(find::nearest(&all, m.view_bottom()).unwrap() <= 2);
         m.clear_history();
         assert_eq!(m.display_offset(), 0);
         assert!(!m.has_selection());

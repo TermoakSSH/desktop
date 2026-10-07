@@ -20,6 +20,21 @@ use crate::theme::TermPalette;
 /// Inner padding of the terminal.
 pub const PADDING: Pixels = px(8.);
 
+/// Behind every match of the find bar (amber, see-through) and behind the
+/// current one (orange, stronger), in both themes.
+const FIND_MATCH: gpui::Hsla = gpui::Hsla {
+    h: 45. / 360.,
+    s: 0.95,
+    l: 0.55,
+    a: 0.35,
+};
+const FIND_CURRENT: gpui::Hsla = gpui::Hsla {
+    h: 24. / 360.,
+    s: 0.95,
+    l: 0.55,
+    a: 0.8,
+};
+
 /// Painting element of a [`TerminalView`].
 pub struct TerminalElement {
     view: Entity<TerminalView>,
@@ -312,6 +327,15 @@ impl Element for TerminalElement {
                     );
                     window.paint_quad(fill(b, bg.color));
                 }
+            }
+
+            // Matches of the find bar: all of them, and the current one stronger.
+            for h in &snapshot.highlights {
+                let b = Bounds::new(
+                    point(origin.x + cw * h.col as f32, origin.y + lh * h.row as f32),
+                    size(cw * h.cells as f32, lh),
+                );
+                window.paint_quad(fill(b, if h.current { FIND_CURRENT } else { FIND_MATCH }));
             }
 
             // Cursor (the block goes under the text, painted in the background color).

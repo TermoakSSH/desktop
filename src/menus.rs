@@ -286,6 +286,13 @@ pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
         ("shortcuts.paste", "⌘V", "Ctrl+Shift+V · Shift+Insert"),
         ("shortcuts.select_all", "⌘A", "Ctrl+Shift+A"),
         ("shortcuts.find", "⌘F", "Ctrl+Shift+F"),
+        ("shortcuts.find_next", "↵ · F3 · ⌘G", "Enter · F3"),
+        (
+            "shortcuts.find_previous",
+            "⇧↵ · ⇧F3 · ⌘⇧G",
+            "Shift+Enter · Shift+F3",
+        ),
+        ("shortcuts.find_options", "⌥⌘C · ⌥⌘R", "Alt+C · Alt+R"),
         ("shortcuts.clear", "⌘K", "Ctrl+Shift+K"),
         ("shortcuts.add_pane", "⌘D", "Ctrl+Shift+D"),
         ("shortcuts.focus_mode", "⌘⇧M", "Ctrl+Shift+M"),
