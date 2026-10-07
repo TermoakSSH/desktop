@@ -7,6 +7,7 @@ pub mod admin;
 pub mod ai;
 pub mod ai_chat;
 pub mod ai_settings;
+pub mod ai_ui;
 pub mod forwards;
 pub mod host_editor;
 pub mod host_picker;

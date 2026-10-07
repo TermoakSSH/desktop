@@ -2496,6 +2496,13 @@ impl TerminalView {
         self.write_input(bytes, cx);
     }
 
+    /// Types a command line and presses Enter (Run on a code block of the
+    /// copilot, after the user approved it).
+    pub fn run_line(&mut self, line: &str, cx: &mut Context<Self>) {
+        self.insert_text(line, cx);
+        self.write_input(b"\r".to_vec(), cx);
+    }
+
     // ----- Mouse -----
 
     fn cell_at(&self, pos: Point<Pixels>) -> (usize, usize, bool) {

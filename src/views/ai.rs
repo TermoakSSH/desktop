@@ -1,24 +1,28 @@
-//! AI: tasks the server's agent runs on your hosts, with the live
-//! conversation (text, reasoning and tools), approvals and follow-up
-//! messages. Needs to be signed in to the server, with "Your Termoak
-//! account" chosen in Settings → AI (with "This computer", it says that
-//! running the AI locally comes next and sends nothing).
+//! AI: tasks the agent runs on your hosts (on the server or on this
+//! computer, as chosen in Settings → AI), with the live conversation (text,
+//! reasoning and tools), approvals and follow-up messages.
+//!
+//! On the left, the tasks with their status, filters and search; on the
+//! right, the task shown or the composer of a new one.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gpui::{
-    AppContext, ClickEvent, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, Context, Entity, EventEmitter, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
-use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
-use std::collections::{BTreeMap, HashSet};
+use gpui_component::switch::Switch;
+use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 
 use serde_json::{Value, json};
+use termoak_ai::HostRun;
 use termoak_ai::message::Message;
 use termoak_ai::runbook::{self, ExecutedStep, HostNames};
 use termoak_core::Id;
@@ -26,14 +30,37 @@ use termoak_core::model::{Snippet, SyncMode};
 
 use super::OpenRequest;
 use super::ai_chat::{
-    AiChat, AiChatEvent, MODES, TaskSummary, ai_backend, ai_result, fix_banner, mode_hint,
-    mode_label, status_label, truncate,
+    AiChat, AiChatEvent, MODES, TaskSummary, ai_backend, ai_result, fix_banner, local_model_label,
+    mode_hint, mode_icon, mode_label,
 };
+use super::ai_ui::status::{
+    TaskFilter, format_cost, format_duration, matches_search, model_name, progress, relative_time,
+};
+use super::ai_ui::{self as w};
 use crate::local_ai::RunOn;
 use crate::local_ai::tasks::AiBackend;
 use crate::runtime;
 use crate::state::{AppModel, ModelEvent};
 use crate::ui::{self, Choice, ChoiceState, IconName};
+
+/// Examples to try in an empty composer: (icon, text).
+fn examples() -> [(IconName, SharedString); 4] {
+    [
+        (IconName::HardDrive, t!("ai_ui.example.disk")),
+        (IconName::CircleAlert, t!("ai_ui.example.nginx")),
+        (IconName::PackageCheck, t!("ai_ui.example.updates")),
+        (IconName::FileSearch, t!("ai_ui.example.logs")),
+    ]
+}
+
+/// The shortcut that starts a task from the composer.
+fn send_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘↵"
+    } else {
+        "Ctrl+↵"
+    }
+}
 
 pub struct AiView {
     model: Entity<AppModel>,
@@ -59,11 +86,20 @@ pub struct AiView {
     /// Unknown tasks waiting for the list to be reloaded.
     unknown: HashSet<Id>,
     loading: bool,
+    /// The list was loaded at least once (before that, a skeleton).
+    loaded: bool,
     error: Option<String>,
     /// Creating the task failed for a reason Settings → AI fixes.
     blocked: Option<String>,
     /// The tasks shown are the ones on this computer.
     local: bool,
+    /// Filter and search of the task list.
+    filter: TaskFilter,
+    search: Entity<InputState>,
+    /// Finished and all hosts of the running multi-host tasks.
+    fan_progress: HashMap<Id, (usize, usize)>,
+    /// The multi-host task each host's conversation belongs to.
+    child_parent: HashMap<Id, Id>,
     _subs: Vec<Subscription>,
 }
 
@@ -73,9 +109,10 @@ impl AiView {
     pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(5, 12)
+                .auto_grow(4, 14)
                 .placeholder(t!("ai.prompt_placeholder"))
         });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(t!("ai_ui.search")));
         let chat = cx.new(|cx| AiChat::new(model.clone(), window, cx));
         let subs = vec![
             cx.subscribe_in(
@@ -109,6 +146,20 @@ impl AiView {
                 AiChatEvent::OpenAiSettings => cx.emit(OpenRequest::AiSettings),
                 AiChatEvent::Close => {}
             }),
+            // Cmd/Ctrl+Enter starts the task.
+            cx.subscribe_in(&prompt, window, |this, _, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter {
+                    secondary: true, ..
+                } = ev
+                {
+                    this.create(window, cx);
+                }
+            }),
+            cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
         ];
         let mut view = Self {
             model,
@@ -127,9 +178,14 @@ impl AiView {
             not_listed: HashSet::new(),
             unknown: HashSet::new(),
             loading: false,
+            loaded: false,
             error: None,
             blocked: None,
             local: false,
+            filter: TaskFilter::All,
+            search,
+            fan_progress: HashMap::new(),
+            child_parent: HashMap::new(),
             _subs: subs,
         };
         view.refresh(window, cx);
@@ -208,8 +264,9 @@ impl AiView {
             cx,
             window,
             async move { backend.list(50).await.map_err(|f| f.text) },
-            |this, res, _, cx| {
+            |this, res, window, cx| {
                 this.loading = false;
+                this.loaded = true;
                 match res {
                     Ok(list) => {
                         this.tasks = list.iter().filter_map(TaskSummary::from).collect();
@@ -221,10 +278,47 @@ impl AiView {
                                 this.not_listed.insert(id);
                             }
                         }
+                        // The progress of the multi-host tasks still running.
+                        let running: Vec<Id> = this
+                            .tasks
+                            .iter()
+                            .filter(|t| t.fan_out && t.running())
+                            .map(|t| t.id)
+                            .take(10)
+                            .collect();
+                        for id in running {
+                            this.load_progress(id, window, cx);
+                        }
                     }
                     Err(e) => this.error = Some(e),
                 }
                 cx.notify();
+            },
+        );
+    }
+
+    /// How many hosts of a multi-host task have finished.
+    fn load_progress(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backend) = ai_backend(&self.model, cx) else {
+            return;
+        };
+        runtime::run_in(
+            cx,
+            window,
+            async move { backend.get(id).await.map_err(|f| f.text) },
+            move |this, res, _, cx| {
+                if let Ok(v) = res {
+                    let hosts: Vec<HostRun> =
+                        serde_json::from_value(v["hosts"].clone()).unwrap_or_default();
+                    for h in &hosts {
+                        this.child_parent.insert(h.task_id, id);
+                        this.not_listed.insert(h.task_id);
+                    }
+                    if !hosts.is_empty() {
+                        this.fan_progress.insert(id, progress(&hosts));
+                    }
+                    cx.notify();
+                }
             },
         );
     }
@@ -425,9 +519,21 @@ impl AiView {
         };
         let ev = &v["event"];
         let ty = ev["type"].as_str().unwrap_or("");
+        // A host of a multi-host task: its progress.
+        if let Some(parent) = self.child_parent.get(&task_id).copied() {
+            if matches!(ty, "finished" | "status") {
+                self.load_progress(parent, window, cx);
+            }
+            return;
+        }
         match self.tasks.iter_mut().find(|t| t.id == task_id) {
             Some(t) => match ty {
-                "status" | "finished" => t.status = ev["status"].as_str().unwrap_or("").to_string(),
+                "status" | "finished" => {
+                    t.status = ev["status"].as_str().unwrap_or("").to_string();
+                    if ty == "finished" && t.finished_at.is_none() {
+                        t.finished_at = Some(w::now_ms());
+                    }
+                }
                 "approval_requested" => t.pending += 1,
                 "approval_decided" => t.pending = t.pending.saturating_sub(1),
                 _ => {}
@@ -513,7 +619,7 @@ impl AiView {
         (groups, tags.into_iter().collect())
     }
 
-    /// "Add a group", "Add a tag" and "Clear" above the host list.
+    /// "Add a group" and "Add a tag": menus that add their hosts.
     fn render_scope_shortcuts(
         &self,
         groups: Vec<(String, Vec<Id>)>,
@@ -527,7 +633,7 @@ impl AiView {
                            items: Vec<(String, Vec<Id>)>| {
             let me = me.clone();
             Button::new(id)
-                .small()
+                .xsmall()
                 .ghost()
                 .icon(ui::icon(icon))
                 .label(label)
@@ -549,9 +655,7 @@ impl AiView {
                 })
         };
         h_flex()
-            .pl_6()
-            .gap_2()
-            .flex_wrap()
+            .gap_1()
             .when(!groups.is_empty(), |this| {
                 this.child(menu_button(
                     "ai-scope-group",
@@ -568,54 +672,293 @@ impl AiView {
                     tags,
                 ))
             })
-            .when(!self.scope.is_empty(), |this| {
-                this.child(
-                    Button::new("ai-scope-clear")
-                        .small()
-                        .ghost()
-                        .icon(ui::icon(IconName::X))
-                        .label(t!("ai.scope_clear"))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.scope.clear();
-                            cx.notify();
-                        })),
-                )
-            })
             .into_any_element()
     }
 
     // ----- Rendering -----
 
-    fn render_task_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// Where a task works: its group, tag, host or number of hosts.
+    fn scope_of(&self, t: &TaskSummary, cx: &gpui::App) -> Option<(IconName, String)> {
+        let m = self.model.read(cx);
+        if let Some(g) = t
+            .group_id
+            .and_then(|g| m.groups.iter().find(|x| x.data.id == g))
+        {
+            return Some((IconName::Folder, g.data.name.clone()));
+        }
+        if let Some(tag) = &t.tag {
+            return Some((IconName::Tag, tag.clone()));
+        }
+        match t.host_ids.as_slice() {
+            [one] => m
+                .hosts
+                .iter()
+                .find(|h| h.data.id == *one)
+                .map(|h| (IconName::Server, h.data.label.clone())),
+            _ if t.hosts > 1 => Some((IconName::Layers, tn!("ai.hosts_count", t.hosts).into())),
+            _ => None,
+        }
+    }
+
+    /// The tasks the filter and the search leave.
+    fn visible_tasks(&self, cx: &gpui::App) -> Vec<&TaskSummary> {
+        let query = self.search.read(cx).value().trim().to_string();
+        self.tasks
+            .iter()
+            .filter(|t| self.filter.matches(t.phase()))
+            .filter(|t| {
+                let scope = self.scope_of(t, cx).map(|(_, s)| s).unwrap_or_default();
+                matches_search(&query, &[&t.title, &scope, &t.provider])
+            })
+            .collect()
+    }
+
+    fn render_task_row(
+        &self,
+        i: usize,
+        t: &TaskSummary,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let selected = self.selected;
+        let active = self.selected == Some(t.id);
+        let id = t.id;
+        let phase = t.phase();
+        let scope = self.scope_of(t, cx);
+        let progress = self.fan_progress.get(&t.id).copied();
+        let mut meta: Vec<String> = Vec::new();
+        if let Some((done, total)) = progress.filter(|_| t.fan_out) {
+            meta.push(t!("ai_ui.hosts.progress_short", done = done, total = total).to_string());
+        }
+        meta.push(relative_time(now, t.created_at).to_string());
+        if let Some(d) = t.duration_ms(now).filter(|_| !t.running()) {
+            meta.push(format_duration(d));
+        }
+        if let Some(c) = format_cost(t.cost_micros) {
+            meta.push(c);
+        }
+        let title: SharedString = t.title.clone().into();
         v_flex()
-            .w(px(300.))
+            .id(("ai-task", i))
+            .px_3()
+            .py_2()
+            .gap_1()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .cursor_pointer()
+            .when(active, |this| {
+                this.bg(theme.list_active)
+                    .border_color(w::tint(theme.list_active_border, 0.5))
+            })
+            .when(!active, |this| this.hover(|s| s.bg(theme.list_hover)))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.select(Some(id), window, cx)
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .flex()
+                            .justify_center()
+                            .child(w::status_icon(phase, 14., cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_medium()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(t.title.clone()),
+                    )
+                    .when(t.pending > 0, |this| {
+                        this.child(w::chip(
+                            Some(IconName::ShieldAlert),
+                            t.pending.to_string(),
+                            theme.warning,
+                            cx,
+                        ))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .pl(px(24.))
+                    .gap_1p5()
+                    .items_center()
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .when_some(scope, |this, (icon, label)| {
+                        this.child(w::neutral_chip(Some(icon), label, cx).max_w(px(130.)))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(meta.join(" · ")),
+                    ),
+            )
+    }
+
+    fn render_task_list(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let now = w::now_ms();
+        let counts: Vec<(TaskFilter, usize)> = TaskFilter::ALL
+            .iter()
+            .map(|f| {
+                (
+                    *f,
+                    self.tasks.iter().filter(|t| f.matches(t.phase())).count(),
+                )
+            })
+            .collect();
+        let visible: Vec<TaskSummary> = self.visible_tasks(cx).into_iter().cloned().collect();
+        let filtering =
+            self.filter != TaskFilter::All || !self.search.read(cx).value().trim().is_empty();
+        let body: gpui::AnyElement = if !self.loaded && self.error.is_none() {
+            w::list_skeleton(6)
+        } else if let Some(e) = self.error.clone().filter(|_| self.tasks.is_empty()) {
+            let me = cx.entity().downgrade();
+            div()
+                .px_2()
+                .child(w::error_banner(
+                    "ai-tasks-retry",
+                    ui::capitalize(&e),
+                    Some(std::rc::Rc::new(move |window, cx| {
+                        let _ = me.update(cx, |v, cx| v.refresh(window, cx));
+                    })),
+                    cx,
+                ))
+                .into_any_element()
+        } else if visible.is_empty() {
+            let theme = cx.theme();
+            v_flex()
+                .px_4()
+                .py_8()
+                .gap_2()
+                .items_center()
+                .text_center()
+                .child(
+                    ui::icon(if filtering {
+                        IconName::SearchX
+                    } else {
+                        IconName::Inbox
+                    })
+                    .size(px(28.))
+                    .text_color(theme.muted_foreground),
+                )
+                .child(div().text_sm().font_medium().child(if filtering {
+                    t!("ai_ui.list.no_match")
+                } else {
+                    t!("ai.no_tasks")
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if filtering {
+                            t!("ai_ui.list.no_match_hint")
+                        } else {
+                            t!("ai_ui.list.empty_hint")
+                        }),
+                )
+                .when(filtering, |this| {
+                    this.child(
+                        Button::new("ai-clear-filters")
+                            .xsmall()
+                            .ghost()
+                            .icon(ui::icon(IconName::X))
+                            .label(t!("ai_ui.list.clear_filters"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.filter = TaskFilter::All;
+                                this.search.update(cx, |s, cx| s.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    )
+                })
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap_0p5()
+                .px_2()
+                .pb_2()
+                .children(
+                    visible
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| self.render_task_row(i, t, now, cx)),
+                )
+                .into_any_element()
+        };
+        let theme = cx.theme();
+        v_flex()
+            .w(px(320.))
             .h_full()
             .flex_shrink_0()
             .border_r_1()
             .border_color(theme.border)
+            .bg(theme.sidebar)
             .child(
-                h_flex()
+                v_flex()
                     .p_3()
                     .gap_2()
                     .child(
-                        Button::new("ai-new")
-                            .flex_1()
-                            .primary()
-                            .icon(ui::icon(IconName::Plus))
-                            .label(t!("ai.new_task"))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.select(None, window, cx)
-                            })),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("ai-new")
+                                    .flex_1()
+                                    .primary()
+                                    .icon(ui::icon(IconName::Plus))
+                                    .label(t!("ai.new_task"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.select(None, window, cx);
+                                        ui::focus_later(&this.prompt, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("ai-refresh")
+                                    .ghost()
+                                    .icon(ui::icon(IconName::RefreshCw))
+                                    .tooltip(t!("ai_ui.refresh"))
+                                    .loading(self.loading)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.refresh(window, cx)
+                                    })),
+                            ),
                     )
                     .child(
-                        Button::new("ai-refresh")
-                            .ghost()
-                            .icon(ui::icon(IconName::RefreshCw))
-                            .loading(self.loading)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.refresh(window, cx)
+                        Input::new(&self.search)
+                            .small()
+                            .cleanable(true)
+                            .prefix(ui::icon(IconName::Search).size(px(14.))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .flex_wrap()
+                            .children(counts.into_iter().map(|(f, n)| {
+                                let active = self.filter == f;
+                                Button::new(SharedString::from(format!("ai-filter-{f:?}")))
+                                    .xsmall()
+                                    .label(format!("{} · {n}", f.label()))
+                                    .selected(active)
+                                    .map(|b| if active { b.primary() } else { b.ghost() })
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.filter = f;
+                                        cx.notify();
+                                    }))
                             })),
                     ),
             )
@@ -624,80 +967,39 @@ impl AiView {
                     v_flex()
                         .id("ai-tasks")
                         .size_full()
-                        .px_2()
-                        .gap_1()
                         .overflow_y_scrollbar()
-                        .when(self.tasks.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .p_3()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(t!("ai.no_tasks")),
-                            )
-                        })
-                        .children(self.tasks.iter().enumerate().map(|(i, t)| {
-                            let active = selected == Some(t.id);
-                            let id = t.id;
-                            let color = match t.status.as_str() {
-                                "completed" => theme.success,
-                                "failed" => theme.danger,
-                                "waiting_approval" => theme.warning,
-                                "running" | "queued" => theme.info,
-                                _ => theme.muted_foreground,
-                            };
-                            v_flex()
-                                .id(("ai-task", i))
-                                .p_2()
-                                .gap_0p5()
-                                .rounded(theme.radius)
-                                .cursor_pointer()
-                                .when(active, |this| this.bg(theme.list_active))
-                                .when(!active, |this| this.hover(|s| s.bg(theme.list_hover)))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.select(Some(id), window, cx)
-                                }))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_medium()
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(t.title.clone()),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(div().size(px(6.)).rounded_full().bg(color))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(status_label(&t.status)),
-                                        )
-                                        .when(t.fan_out, |this| {
-                                            this.child(ui::pill(
-                                                tn!("ai.hosts_count", t.hosts),
-                                                theme.info,
-                                            ))
-                                        })
-                                        .when(t.pending > 0, |this| {
-                                            this.child(ui::pill(
-                                                tn!("ai.pending_approvals", t.pending),
-                                                theme.warning,
-                                            ))
-                                        }),
-                                )
-                        })),
+                        .child(body),
                 ),
             )
     }
 
-    fn render_new_task(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The model the new task uses: the server's providers, or what Settings
+    /// → AI chose on this computer.
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if let Some(p) = self.providers.clone() {
+            return div()
+                .w(px(210.))
+                .child(Select::new(&p).small().icon(ui::icon(IconName::Bot)))
+                .into_any_element();
+        }
+        let label = if self.local {
+            local_model_label(&self.model.read(cx).settings.ai)
+        } else {
+            t!("ai.provider_default")
+        };
+        let open = self.open_settings(cx);
+        Button::new("ai-model")
+            .xsmall()
+            .ghost()
+            .icon(ui::icon(IconName::Bot))
+            .label(label)
+            .tooltip(t!("ai_ui.model.change"))
+            .on_click(move |_: &ClickEvent, window, cx| open(window, cx))
+            .into_any_element()
+    }
+
+    fn render_new_task(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (groups, tags) = self.scope_shortcuts(cx);
-        let theme = cx.theme();
         // The server AI reaches the hosts of its account (This device ones
         // and other accounts' cannot be used there).
         let hosts: Vec<(Id, String, bool)> = {
@@ -718,165 +1020,362 @@ impl AiView {
                 })
                 .collect()
         };
+        let focused = self.prompt.read(cx).focus_handle(cx).is_focused(window);
+        let model_picker = self.render_model_picker(cx);
+        let scope_chips: Vec<(Id, String)> = self
+            .scope
+            .iter()
+            .filter_map(|id| {
+                hosts
+                    .iter()
+                    .find(|(h, _, _)| h == id)
+                    .map(|(_, l, _)| (*id, l.clone()))
+            })
+            .collect();
+        let theme = cx.theme();
         let mode = self.mode;
-        let mode_button =
-            |id: &'static str, value: &'static str, hint: SharedString, cx: &mut Context<Self>| {
-                Button::new(id)
-                    .label(mode_label(value))
-                    .tooltip(hint)
-                    .map(|b| {
-                        if mode == value {
-                            b.primary()
-                        } else {
-                            b.ghost()
-                        }
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.mode = value;
-                        cx.notify();
-                    }))
-            };
-        v_flex()
-            .p_6()
-            .gap_4()
-            .max_w(px(820.))
-            .child(div().text_xl().font_semibold().child(t!("ai.new_task")))
+
+        let hero = h_flex()
+            .gap_3()
+            .items_center()
             .child(
                 div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(if self.local {
-                        t!("ai.new_task_detail_local")
-                    } else {
-                        t!("ai.new_task_detail")
-                    }),
+                    .flex_shrink_0()
+                    .size(px(40.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(w::tint(theme.primary, 0.16))
+                    .child(
+                        ui::icon(IconName::Sparkles)
+                            .size(px(20.))
+                            .text_color(w::readable(theme.primary, cx)),
+                    ),
             )
-            .child(Textarea::new(&self.prompt))
-            .when_some(self.blocked.clone(), |this, text| {
-                this.child(fix_banner(&text, self.open_settings(cx), cx))
-            })
-            .child(ui::field(
-                t!("ai.permissions"),
-                h_flex().gap_2().flex_wrap().children(
-                    MODES
-                        .iter()
-                        .map(|value| mode_button(value, value, mode_hint(value), cx)),
-                ),
-                cx,
-            ))
-            .when_some(self.providers.clone(), |this, p| {
-                this.child(ui::field(t!("ai.provider"), Select::new(&p), cx))
-            })
             .child(
                 v_flex()
-                    .gap_2()
-                    .child(
-                        Checkbox::new("ai-scope")
-                            .label(if self.scope.is_empty() {
-                                t!("ai.scope_optional")
-                            } else {
-                                tn!("ai.scope_limited", self.scope.len())
-                            })
-                            .checked(self.show_scope)
-                            .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                this.show_scope = *v;
-                                if !*v {
-                                    this.scope.clear();
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.show_scope, |this| {
-                        this.child(self.render_scope_shortcuts(groups, tags, cx))
-                    })
-                    .when(self.show_scope, |this| {
-                        this.child(
-                            v_flex()
-                                .id("ai-scope-list")
-                                .max_h(px(180.))
-                                .pl_6()
-                                .gap_1()
-                                .overflow_y_scrollbar()
-                                .children(hosts.into_iter().enumerate().map(
-                                    |(i, (id, label, device_only))| {
-                                        Checkbox::new(("scope", i))
-                                            .label(if device_only {
-                                                t!("ai.scope_device_only", host = label).to_string()
-                                            } else {
-                                                label
-                                            })
-                                            .checked(self.scope.contains(&id))
-                                            .on_click(cx.listener(move |this, v: &bool, _, cx| {
-                                                if *v {
-                                                    this.scope.push(id);
-                                                } else {
-                                                    this.scope.retain(|s| *s != id);
-                                                }
-                                                cx.notify();
-                                            }))
-                                    },
-                                )),
-                        )
-                    }),
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(div().text_xl().font_semibold().child(t!("ai.new_task")))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        if self.local {
+                            t!("ai.new_task_detail_local")
+                        } else {
+                            t!("ai.new_task_detail")
+                        },
+                    )),
+            );
+
+        let scope_button_label = if self.scope.is_empty() {
+            t!("ai_ui.scope.all_hosts")
+        } else {
+            tn!("ai.hosts_count", self.scope.len())
+        };
+        let toolbar = h_flex()
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .items_center()
+            .flex_wrap()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("ai-scope")
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(IconName::Server))
+                    .label(scope_button_label)
+                    .tooltip(t!("ai.scope_optional"))
+                    .selected(self.show_scope)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.show_scope = !this.show_scope;
+                        cx.notify();
+                    })),
             )
-            .when(self.scope.len() > 1, |this| {
+            .child(self.render_scope_shortcuts(groups, tags, cx))
+            .child(div().flex_1())
+            .child(model_picker)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(w::kbd(send_shortcut(), cx)),
+            )
+            .child(
+                Button::new("ai-create")
+                    .small()
+                    .primary()
+                    .icon(ui::icon(IconName::Sparkles))
+                    .label(t!("ai.start"))
+                    .tooltip(t!("ai_ui.start_hint", keys = send_shortcut()))
+                    .loading(self.creating)
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.create(window, cx)),
+                    ),
+            );
+
+        let composer = v_flex()
+            .w_full()
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(if focused { theme.ring } else { theme.border })
+            .bg(theme.background)
+            .shadow_sm()
+            .child(
+                div()
+                    .px_1()
+                    .pt_1()
+                    .child(Textarea::new(&self.prompt).appearance(false)),
+            )
+            .when(!scope_chips.is_empty(), |this| {
                 this.child(
-                    v_flex()
+                    h_flex()
+                        .px_3()
+                        .pb_2()
                         .gap_1()
+                        .flex_wrap()
+                        .children(scope_chips.into_iter().enumerate().map(|(i, (id, label))| {
+                            h_flex()
+                                .h(px(22.))
+                                .pl_1p5()
+                                .gap_0p5()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(w::tint(theme.primary, 0.12))
+                                .text_xs()
+                                .text_color(w::readable(theme.primary, cx))
+                                .child(ui::icon(IconName::Server).size(px(12.)))
+                                .child(label)
+                                .child(
+                                    Button::new(("ai-scope-remove", i))
+                                        .xsmall()
+                                        .ghost()
+                                        .icon(ui::icon(IconName::X))
+                                        .tooltip(t!("ai_ui.scope.remove"))
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, _, cx| {
+                                                this.scope.retain(|s| *s != id);
+                                                cx.notify();
+                                            },
+                                        )),
+                                )
+                        }))
                         .child(
-                            Checkbox::new("ai-fan-out")
-                                .label(tn!("ai.fan_out", self.scope.len()))
-                                .checked(self.fan_out)
-                                .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                    this.fan_out = *v;
+                            Button::new("ai-scope-clear")
+                                .xsmall()
+                                .ghost()
+                                .label(t!("ai.scope_clear"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.scope.clear();
                                     cx.notify();
                                 })),
-                        )
-                        .child(
-                            div()
-                                .pl_6()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if self.fan_out {
-                                    t!("ai.fan_out_hint")
-                                } else {
-                                    t!("ai.fan_out_off_hint")
-                                }),
                         ),
                 )
             })
-            .child(
+            .child(toolbar);
+
+        let scope_panel =
+            self.show_scope.then(|| {
                 v_flex()
-                    .gap_1()
+                    .gap_2()
+                    .p_3()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
                     .child(
-                        Checkbox::new("ai-plan-first")
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("ai_ui.scope.hint")),
+                    )
+                    .child(
+                        div()
+                            .id("ai-scope-list")
+                            .max_h(px(200.))
+                            .overflow_y_scrollbar()
+                            .child(h_flex().flex_wrap().gap_y_1().children(
+                                hosts.into_iter().enumerate().map(
+                                    |(i, (id, label, device_only))| {
+                                        div().w(px(220.)).child(
+                                            Checkbox::new(("scope", i))
+                                                .label(if device_only {
+                                                    t!("ai.scope_device_only", host = label)
+                                                        .to_string()
+                                                } else {
+                                                    label
+                                                })
+                                                .checked(self.scope.contains(&id))
+                                                .on_click(cx.listener(
+                                                    move |this, v: &bool, _, cx| {
+                                                        if *v {
+                                                            this.scope.push(id);
+                                                        } else {
+                                                            this.scope.retain(|s| *s != id);
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                    },
+                                ),
+                            )),
+                    )
+            });
+
+        let theme = cx.theme();
+        let options = v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_x_6()
+                    .gap_y_3()
+                    .flex_wrap()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_medium()
+                                    .text_color(theme.muted_foreground)
+                                    .child(t!("ai.permissions")),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .p_0p5()
+                                    .rounded(theme.radius)
+                                    .bg(theme.muted)
+                                    .children(MODES.iter().map(|&value| {
+                                        Button::new(SharedString::from(format!("ai-mode-{value}")))
+                                            .xsmall()
+                                            .icon(ui::icon(mode_icon(value)))
+                                            .label(mode_label(value))
+                                            .tooltip(mode_hint(value))
+                                            .selected(mode == value)
+                                            .map(|b| {
+                                                if mode == value {
+                                                    b.primary()
+                                                } else {
+                                                    b.ghost()
+                                                }
+                                            })
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, _, cx| {
+                                                    this.mode = value;
+                                                    cx.notify();
+                                                },
+                                            ))
+                                    })),
+                            ),
+                    )
+                    .child(
+                        Switch::new("ai-plan-first")
+                            .small()
                             .label(t!("ai.plan_first"))
+                            .tooltip(t!("ai.plan_first_hint"))
                             .checked(self.plan_first)
                             .on_click(cx.listener(|this, v: &bool, _, cx| {
                                 this.plan_first = *v;
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        div()
-                            .pl_6()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t!("ai.plan_first_hint")),
-                    ),
+                    .when(self.scope.len() > 1, |this| {
+                        this.child(
+                            Switch::new("ai-fan-out")
+                                .small()
+                                .label(tn!("ai.fan_out", self.scope.len()))
+                                .tooltip(if self.fan_out {
+                                    t!("ai.fan_out_hint")
+                                } else {
+                                    t!("ai.fan_out_off_hint")
+                                })
+                                .checked(self.fan_out)
+                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                    this.fan_out = *v;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .child(
-                h_flex().child(
-                    Button::new("ai-create")
-                        .primary()
-                        .icon(ui::icon(IconName::Sparkles))
-                        .label(t!("ai.start"))
-                        .loading(self.creating)
-                        .on_click(
-                            cx.listener(|this, _: &ClickEvent, window, cx| this.create(window, cx)),
-                        ),
-                ),
-            )
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(ui::icon(mode_icon(mode)).size(px(12.)))
+                    .child(mode_hint(mode)),
+            );
+
+        let examples =
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("ai_ui.examples_title")),
+                )
+                .child(h_flex().flex_wrap().gap_2().children(
+                    examples().into_iter().enumerate().map(|(i, (icon, text))| {
+                        let fill = text.to_string();
+                        h_flex()
+                            .id(("ai-example", i))
+                            .min_w(px(280.))
+                            .flex_1()
+                            .gap_2()
+                            .items_start()
+                            .px_3()
+                            .py_2p5()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.secondary)
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.secondary_hover))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.prompt.update(cx, |p, cx| {
+                                    p.set_value(fill.clone(), window, cx);
+                                    p.focus(window, cx);
+                                });
+                            }))
+                            .child(
+                                ui::icon(icon)
+                                    .size(px(14.))
+                                    .mt(px(2.))
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted_foreground),
+                            )
+                            .child(div().flex_1().min_w_0().child(text))
+                    }),
+                ));
+
+        v_flex()
+            .w_full()
+            .max_w(px(820.))
+            .px_8()
+            .py_8()
+            .gap_5()
+            .child(hero)
+            .child(composer)
+            .children(scope_panel)
+            .when_some(self.blocked.clone(), |this, text| {
+                this.child(fix_banner(&text, self.open_settings(cx), cx))
+            })
+            .child(options)
+            .when(self.prompt.read(cx).value().trim().is_empty(), |this| {
+                this.child(examples)
+            })
             .into_any_element()
     }
 
@@ -890,120 +1389,152 @@ impl AiView {
         // A host's conversation after drilling down into a multi-host task.
         let shown = self.chat.read(cx).task_id().or(self.selected);
         let runbook_busy = self.runbook_busy;
-        let theme = cx.theme();
-        let header =
-            summary.map(|t| {
-                let running = t.running();
-                let finished = matches!(t.status.as_str(), "completed" | "failed" | "cancelled");
-                h_flex()
-                    .px_6()
-                    .py_3()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .font_semibold()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(t.title.clone()),
-                            )
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(
-                                format!(
-                                    "{} · {} · {}{}{}",
-                                    status_label(&t.status),
-                                    mode_label(&t.mode),
-                                    if t.provider.is_empty() {
-                                        t!("ai.provider_default_lower").to_string()
-                                    } else {
-                                        t.provider.clone()
-                                    },
-                                    if t.fan_out {
-                                        format!(" · {}", tn!("ai.hosts_count", t.hosts))
-                                    } else {
-                                        String::new()
-                                    },
-                                    if t.cost_micros > 0 {
-                                        format!(" · {:.4} $", t.cost_micros as f64 / 1_000_000.0)
-                                    } else {
-                                        String::new()
-                                    }
-                                ),
-                            ))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(ui::format_ms(t.created_at)),
-                            ),
-                    )
-                    .when(
-                        !running && matches!(t.status.as_str(), "failed" | "cancelled"),
-                        |this| {
-                            this.child(
-                                Button::new("ai-continue")
-                                    .small()
-                                    .icon(ui::icon(IconName::Play))
-                                    .label(t!("ai.continue"))
-                                    .tooltip(t!("ai.continue_hint"))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.chat.update(cx, |c, cx| {
-                                            c.send_text(
-                                                t!("ai.continue_prompt").to_string(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                    })),
-                            )
-                        },
-                    )
-                    .when(running, |this| {
+        let now = w::now_ms();
+        let header = summary.map(|t| {
+            let running = t.running();
+            let phase = t.phase();
+            let finished = phase.finished();
+            let scope = self.scope_of(&t, cx);
+            let progress = self.fan_progress.get(&t.id).copied();
+            let theme = cx.theme();
+            let created: SharedString = ui::format_ms(t.created_at).into();
+            let meta = h_flex()
+                .gap_1p5()
+                .flex_wrap()
+                .items_center()
+                .child(w::status_chip(phase, cx))
+                .child(w::neutral_chip(
+                    Some(mode_icon(&t.mode)),
+                    mode_label(&t.mode),
+                    cx,
+                ))
+                .child(w::neutral_chip(
+                    Some(IconName::Bot),
+                    if !t.provider.is_empty() {
+                        model_name(&t.provider).to_string()
+                    } else if self.local {
+                        local_model_label(&self.model.read(cx).settings.ai).to_string()
+                    } else {
+                        t!("ai.provider_default_lower").to_string()
+                    },
+                    cx,
+                ))
+                .when_some(scope, |this, (icon, label)| {
+                    this.child(w::neutral_chip(Some(icon), label, cx))
+                })
+                .when_some(progress.filter(|_| t.fan_out && running), |this, (d, n)| {
+                    this.child(w::neutral_chip(
+                        Some(IconName::Layers),
+                        t!("ai_ui.hosts.progress_short", done = d, total = n),
+                        cx,
+                    ))
+                })
+                .when_some(t.duration_ms(now).filter(|_| finished), |this, d| {
+                    this.child(w::neutral_chip(
+                        Some(IconName::Timer),
+                        format_duration(d),
+                        cx,
+                    ))
+                })
+                .when_some(format_cost(t.cost_micros), |this, c| {
+                    this.child(w::neutral_chip(Some(IconName::CircleDollarSign), c, cx))
+                })
+                .child(
+                    div()
+                        .id("ai-task-created")
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(created.clone()).build(window, cx)
+                        })
+                        .child(relative_time(now, t.created_at)),
+                );
+            h_flex()
+                .px_6()
+                .py_3()
+                .gap_3()
+                .items_center()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_semibold()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(t.title.clone()),
+                        )
+                        .child(meta),
+                )
+                .when(
+                    !running && matches!(t.status.as_str(), "failed" | "cancelled"),
+                    |this| {
                         this.child(
-                            Button::new("ai-cancel")
+                            Button::new("ai-continue")
                                 .small()
-                                .icon(ui::icon(IconName::CircleStop))
-                                .label(t!("ai.stop"))
-                                .tooltip(t!("ai.stop_hint"))
+                                .icon(ui::icon(IconName::Play))
+                                .label(t!("ai.continue"))
+                                .tooltip(t!("ai.continue_hint"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.chat.update(cx, |c, cx| c.cancel(window, cx))
+                                    this.chat.update(cx, |c, cx| {
+                                        c.send_text(
+                                            t!("ai.continue_prompt").to_string(),
+                                            window,
+                                            cx,
+                                        )
+                                    })
                                 })),
                         )
-                    })
-                    .when_some(shown.filter(|_| finished), |this, id| {
-                        this.child(
-                            Button::new("ai-runbook")
-                                .small()
-                                .icon(ui::icon(IconName::ScrollText))
-                                .label(t!("ai.runbook.save"))
-                                .tooltip(t!("ai.runbook.hint"))
-                                .loading(runbook_busy)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.save_runbook(id, window, cx)
-                                })),
-                        )
-                    })
-                    // A host's conversation is deleted with its multi-host task.
-                    .when(t.parent_id.is_none(), |this| {
-                        this.child(
-                            Button::new("ai-delete")
-                                .small()
-                                .ghost()
-                                .icon(ui::icon(IconName::Trash))
-                                .tooltip(t!("ai.delete_task"))
-                                .disabled(running)
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.delete_task(window, cx)
-                                })),
-                        )
-                    })
-            });
+                    },
+                )
+                .when(running, |this| {
+                    this.child(
+                        Button::new("ai-cancel")
+                            .small()
+                            .outline()
+                            .icon(ui::icon(IconName::CircleStop))
+                            .label(t!("ai.stop"))
+                            .tooltip(t!("ai.stop_hint"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.chat.update(cx, |c, cx| c.cancel(window, cx))
+                            })),
+                    )
+                })
+                .when_some(shown.filter(|_| finished), |this, id| {
+                    this.child(
+                        Button::new("ai-runbook")
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::ScrollText))
+                            .label(t!("ai.runbook.save"))
+                            .tooltip(t!("ai.runbook.hint"))
+                            .loading(runbook_busy)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.save_runbook(id, window, cx)
+                            })),
+                    )
+                })
+                // A host's conversation is deleted with its multi-host task.
+                .when(t.parent_id.is_none(), |this| {
+                    this.child(
+                        Button::new("ai-delete")
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::Trash))
+                            .tooltip(t!("ai.delete_task"))
+                            .disabled(running)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.delete_task(window, cx)
+                            })),
+                    )
+                })
+        });
         v_flex()
             .size_full()
             .children(header)
@@ -1076,24 +1607,30 @@ impl AiView {
 }
 
 impl Render for AiView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let local = self.model.read(cx).ai_run_on() == RunOn::Local;
         let list = self.render_task_list(cx);
         let right = if self.selected.is_some() {
             self.render_detail(cx)
         } else {
+            let composer = self.render_new_task(window, cx);
             v_flex()
                 .size_full()
                 .child(
                     div().flex_1().min_h_0().child(
                         v_flex()
+                            .id("ai-new-task")
                             .size_full()
+                            .items_center()
                             .overflow_y_scrollbar()
-                            .child(self.render_new_task(cx)),
+                            .child(composer),
                     ),
                 )
                 .into_any_element()
         };
+        // A failed reload with tasks already shown: said in place.
+        let reload_error = self.error.clone().filter(|_| !self.tasks.is_empty());
+        let me = cx.entity().downgrade();
         v_flex()
             .size_full()
             .child(ui::section_header(
@@ -1106,14 +1643,19 @@ impl Render for AiView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .children((!local).then(|| self.render_account_picker(cx)).flatten())
-                    .child(div().when_some(self.error.clone(), |this, e| {
-                        this.text_xs()
-                            .text_color(cx.theme().danger)
-                            .child(truncate(&e, 80))
-                    })),
+                    .children((!local).then(|| self.render_account_picker(cx)).flatten()),
                 cx,
             ))
+            .when_some(reload_error, |this, e| {
+                this.child(div().px_6().py_2().child(w::error_banner(
+                    "ai-reload-retry",
+                    ui::capitalize(&e),
+                    Some(std::rc::Rc::new(move |window, cx| {
+                        let _ = me.update(cx, |v, cx| v.refresh(window, cx));
+                    })),
+                    cx,
+                )))
+            })
             .child(
                 h_flex()
                     .flex_1()
