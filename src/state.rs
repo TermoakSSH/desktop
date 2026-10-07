@@ -95,6 +95,15 @@ pub struct Settings {
     /// Entries of the command palette used last (most recent first, see
     /// `palette::remember`).
     pub palette_recent: Vec<String>,
+    /// The hosts list shows whether each host answers (a TCP check of its
+    /// SSH port every minute while the list is on screen).
+    pub host_status: bool,
+    /// Hosts whose status is not checked (on this device).
+    pub host_status_off: Vec<Id>,
+    /// The tabs of the previous session open again at start.
+    pub reopen_tabs: bool,
+    /// Touch ID / Windows Hello to open the app (Settings → General).
+    pub lock: crate::app_lock::LockSettings,
 }
 
 impl Default for Settings {
@@ -118,6 +127,10 @@ impl Default for Settings {
             layout_notice_seen: false,
             cloud_notice_dismissed: 0,
             palette_recent: Vec::new(),
+            host_status: true,
+            host_status_off: Vec::new(),
+            reopen_tabs: true,
+            lock: crate::app_lock::LockSettings::default(),
         }
     }
 }

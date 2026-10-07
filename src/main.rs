@@ -27,8 +27,10 @@ mod i18n;
 
 mod accounts;
 mod app;
+mod app_lock;
 mod dock;
 mod drag;
+mod host_status;
 mod links;
 mod local_ai;
 mod menus;
@@ -46,6 +48,7 @@ mod ui;
 mod update;
 mod views;
 mod windows;
+mod workspaces;
 
 use std::sync::Arc;
 use std::time::Duration;
