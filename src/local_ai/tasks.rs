@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use termoak_ai::engine::{AiEngine, CreateTask};
-use termoak_ai::{AiError, PermissionMode};
+use termoak_ai::{AiError, ApprovalDecision, PermissionMode};
 use termoak_client::{ApiClient, LOCAL_OWNER};
 use termoak_core::Id;
 
@@ -128,24 +128,27 @@ impl AiBackend {
         }
     }
 
+    /// Answers an approval: approve or deny, `always`, the edited command
+    /// or plan and the reason of a denial. (A server older than 0.5 ignores
+    /// `edited` and `reason`: the interface only offers editing when the
+    /// approval has a preview, which those servers do not send.)
     pub async fn decide(
         &self,
         id: Id,
         approval: Id,
-        approve: bool,
-        always: bool,
+        decision: ApprovalDecision,
     ) -> Result<(), AiFailure> {
         match self {
             AiBackend::Server(api) => {
                 api.post::<Value>(
                     &format!("/api/v1/ai/tasks/{id}/approvals/{approval}"),
-                    &json!({"approve": approve, "always": always}),
+                    &serde_json::to_value(&decision).unwrap_or_default(),
                 )
                 .await?;
                 Ok(())
             }
             AiBackend::Local(e) => e
-                .decide(LOCAL_OWNER, id, approval, approve, always, "user")
+                .decide_with(LOCAL_OWNER, id, approval, decision, "user")
                 .await
                 .map_err(local_failure),
         }
@@ -400,7 +403,10 @@ mod tests {
                 let pending = backend.get(id).await.unwrap()["pending_approvals"].clone();
                 if let Some(a) = pending.as_array().and_then(|a| a.first()) {
                     let aid: Id = a["id"].as_str().unwrap().parse().unwrap();
-                    backend.decide(id, aid, true, false).await.unwrap();
+                    backend
+                        .decide(id, aid, ApprovalDecision::approve())
+                        .await
+                        .unwrap();
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
