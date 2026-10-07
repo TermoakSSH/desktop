@@ -745,7 +745,10 @@ impl AddAccountDialog {
                             window,
                             cx,
                             ToastKind::Success,
-                            t!("settings.verify.resent", email = email),
+                            t!(
+                                "settings.verify.resent",
+                                email = crate::accounts::shown_email(&email)
+                            ),
                         );
                         ui::focus_later(&this.email_code, window, cx);
                     }
@@ -1241,11 +1244,10 @@ impl AddAccountDialog {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(t!("settings.verify.sent", email = pending.email)),
-                    )
+                    .child(div().text_sm().child(t!(
+                        "settings.verify.sent",
+                        email = crate::accounts::shown_email(&pending.email)
+                    )))
                     .child(
                         div()
                             .text_xs()

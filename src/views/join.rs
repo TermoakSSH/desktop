@@ -325,7 +325,7 @@ impl Render for JoinDialog {
         let signed_in = info
             .as_ref()
             .is_some_and(|(link, _)| self.signed_in_to(link, cx));
-        let me = self.model.read(cx).server_user.clone();
+        let me = self.model.read(cx).current_account_name();
         let theme = cx.theme();
         v_flex()
             .gap_3()

@@ -14,8 +14,9 @@
 //! The hosts on screen are checked in the background, at most
 //! [`CONCURRENCY`] at a time, every [`EVERY`] while the hosts list is in
 //! view (a hidden list does not render, so it does not ask), and at once
-//! with "Check now". Settings → General turns it off for every host; the
-//! host menu, for one host on this device.
+//! with "Check now". It is off until turned on in Settings → General (and
+//! then nothing is checked at all: no dots, no "Check now"); the host menu
+//! turns it off for one host on this device.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -524,6 +525,10 @@ impl HostStatus {
     /// The list on screen: checks the hosts that are due and wakes the
     /// views when the next one is.
     pub fn tick(&mut self, probes: Vec<Probe>, cx: &mut Context<Self>) {
+        if !self.enabled(cx) {
+            self.timer = None;
+            return;
+        }
         let now = Instant::now();
         let targets: Vec<(Id, &Target)> = probes.iter().map(|p| (p.host_id, &p.target)).collect();
         let due = self.book.due(&targets, now, EVERY);
@@ -559,8 +564,13 @@ impl HostStatus {
         self.run(run, cx);
     }
 
+    /// The checks are turned on (Settings → General; off by default).
+    fn enabled(&self, cx: &App) -> bool {
+        self.model.read(cx).settings.host_status
+    }
+
     fn run(&mut self, probes: Vec<Probe>, cx: &mut Context<Self>) {
-        if probes.is_empty() {
+        if probes.is_empty() || !self.enabled(cx) {
             return;
         }
         let ids: Vec<Id> = probes.iter().map(|p| p.host_id).collect();

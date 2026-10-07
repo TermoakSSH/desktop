@@ -2,13 +2,15 @@
 //! server and user) with its status, server, vaults and last sync. From here
 //! an account is synced, used, signed in again, verified, signed out (its
 //! local data is deleted; unsynced changes are asked about first: "Sync now
-//! / Discard") or removed. New vaults are created here too.
+//! / Discard") or removed. New vaults are created here too, and each
+//! account gets its alias on this device ([`edit_alias`]).
 
 use gpui::{
-    ClickEvent, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Window,
-    div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, Context, Entity, IntoElement, ParentElement, Render, Styled,
+    Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, WindowExt, h_flex, v_flex};
 use termoak_client::AccountStatus;
@@ -48,6 +50,53 @@ pub fn avatar(row: &AccountRow, size: f32) -> gpui::Div {
         .font_semibold()
         .text_size(px(size * 0.5))
         .child(row.initial.clone())
+}
+
+/// Asks for the alias of one of your accounts ("Work", "Personal"): shown
+/// instead of its email on this device. Empty shows the email again.
+pub fn edit_alias(model: Entity<AppModel>, id: Id, window: &mut Window, cx: &mut gpui::App) {
+    let (current, email) = {
+        let m = model.read(cx);
+        let Some(a) = m.account(id) else {
+            return;
+        };
+        (
+            m.settings
+                .account_aliases
+                .get(&id)
+                .cloned()
+                .unwrap_or_default(),
+            vm::shown_email(&a.info.email),
+        )
+    };
+    let input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(t!("accounts.alias.placeholder"))
+            .default_value(current)
+    });
+    ui::focus_later(&input, window, cx);
+    let field = input.clone();
+    ui::open_form_dialog(
+        window,
+        cx,
+        t!("accounts.alias.title"),
+        t!("common.save"),
+        420.,
+        move |_, cx| {
+            ui::field_with_hint(
+                t!("accounts.alias.label"),
+                Input::new(&input),
+                t!("accounts.alias.hint", email = email.clone()),
+                cx,
+            )
+            .into_any_element()
+        },
+        move |_, cx| {
+            let alias = field.read(cx).value().to_string();
+            model.update(cx, |m, cx| m.set_account_alias(id, &alias, cx));
+            true
+        },
+    );
 }
 
 impl AccountsView {
@@ -156,7 +205,7 @@ impl AccountsView {
 
     fn confirm_sign_out(&mut self, a: &AccountModel, window: &mut Window, cx: &mut Context<Self>) {
         let id = a.id();
-        let email = a.info.email.clone();
+        let email = vm::shown_name(&a.info);
         let weak = cx.entity().downgrade();
         ui::confirm(
             window,
@@ -177,19 +226,16 @@ impl AccountsView {
     fn confirm_remove(&mut self, a: &AccountModel, window: &mut Window, cx: &mut Context<Self>) {
         let id = a.id();
         let unsynced = a.unsynced;
+        let email = vm::shown_name(&a.info);
         let weak = cx.entity().downgrade();
         ui::confirm(
             window,
             cx,
             t!("accounts.remove_title"),
             if unsynced > 0 {
-                tn!(
-                    "accounts.remove_message_unsynced",
-                    unsynced,
-                    email = a.info.email.clone()
-                )
+                tn!("accounts.remove_message_unsynced", unsynced, email = email)
             } else {
-                t!("accounts.remove_message", email = a.info.email.clone())
+                t!("accounts.remove_message", email = email)
             },
             t!("accounts.remove"),
             true,
@@ -277,7 +323,13 @@ impl AccountsView {
         );
         let vault_list = a.vaults.clone();
         let vaults_supported = a.vaults_supported();
-        let (m1, m2, m3, m4) = (model.clone(), model.clone(), model.clone(), model.clone());
+        let (m1, m2, m3, m4, m5) = (
+            model.clone(),
+            model.clone(),
+            model.clone(),
+            model.clone(),
+            model.clone(),
+        );
         let info = a.info.clone();
         let a2 = a.clone();
         let a3 = a.clone();
@@ -301,10 +353,15 @@ impl AccountsView {
                                     .gap_2()
                                     .items_center()
                                     .flex_wrap()
-                                    .when(!a.info.name.is_empty(), |this| {
+                                    .when(!row.aliased && !a.info.name.is_empty(), |this| {
                                         this.child(div().font_semibold().child(a.info.name.clone()))
                                     })
-                                    .child(div().font_medium().child(a.info.email.clone()))
+                                    .child(
+                                        div()
+                                            .when(row.aliased, |this| this.font_semibold())
+                                            .when(!row.aliased, |this| this.font_medium())
+                                            .child(row.title.clone()),
+                                    )
                                     .child(ui::pill(status_text, status_color))
                                     .when(current, |this| {
                                         this.child(ui::pill(t!("accounts.current"), theme.primary))
@@ -440,6 +497,17 @@ impl AccountsView {
                                     }),
                             )
                         },
+                    )
+                    .child(
+                        Button::new(("account-alias", ix))
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::Pencil))
+                            .label(t!("accounts.alias.button"))
+                            .tooltip(t!("accounts.alias.tooltip"))
+                            .on_click(move |_: &ClickEvent, window, cx| {
+                                edit_alias(m5.clone(), id, window, cx)
+                            }),
                     )
                     .child(div().flex_1())
                     .map(|this| {

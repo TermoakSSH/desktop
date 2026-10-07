@@ -461,7 +461,7 @@ impl AppView {
                 SwitcherEntry::Account { row, selected } if !selected => Item::new(
                     Kind::Command,
                     format!("view:{}", row.id),
-                    t!("palette.switch_account", account = row.email.clone()),
+                    t!("palette.switch_account", account = row.title.clone()),
                     Target::View(ViewMode::Account(row.id)),
                 )
                 .detail(row.server.clone().unwrap_or_default())

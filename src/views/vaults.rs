@@ -977,8 +977,25 @@ impl VaultManager {
         }
         let manager = self.manager();
         let weak = cx.entity().downgrade();
+        // You among the members: your email masked when emails are hidden;
+        // the others' as they are.
+        let me = self
+            .model
+            .read(cx)
+            .account(self.account)
+            .and_then(|a| a.info.user_id);
+        let names = crate::accounts::names();
         let rows = self.members.iter().enumerate().map(|(i, m)| {
             let (icon, title, detail) = match &m.principal {
+                VaultPrincipal::User { id, email, name } if Some(*id) == me => (
+                    IconName::User,
+                    if name.trim().is_empty() {
+                        names.email(email)
+                    } else {
+                        name.clone()
+                    },
+                    (!name.trim().is_empty()).then(|| names.email(email)),
+                ),
                 VaultPrincipal::User { email, name, .. } => (
                     IconName::User,
                     if name.trim().is_empty() {

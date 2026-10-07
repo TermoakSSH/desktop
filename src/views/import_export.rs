@@ -1209,6 +1209,7 @@ fn export_places(model: &AppModel) -> Vec<Destination> {
     let infos = model.account_infos();
     let vaults = model.all_vaults();
     let multi = infos.len() > 1;
+    let names = accounts::names();
     let mut out = Vec::new();
     for a in &infos {
         let mine: Vec<_> = vaults.iter().filter(|v| v.account == a.id).collect();
@@ -1216,7 +1217,7 @@ fn export_places(model: &AppModel) -> Vec<Destination> {
             out.push(Destination {
                 scope: Scope::Account(a.id),
                 vault: None,
-                label: a.email.clone(),
+                label: names.name(a.id, &a.email),
             });
         }
         for v in mine {
@@ -1224,7 +1225,7 @@ fn export_places(model: &AppModel) -> Vec<Destination> {
                 scope: Scope::Account(a.id),
                 vault: Some(v.id()),
                 label: if multi {
-                    format!("{} · {}", a.email, v.label())
+                    format!("{} · {}", names.name(a.id, &a.email), v.label())
                 } else {
                     v.label()
                 },

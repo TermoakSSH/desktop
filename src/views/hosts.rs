@@ -8,7 +8,8 @@
 //! view". Cmd/Ctrl+click and Shift+click select several hosts, with a bar to
 //! connect them in tabs or in a split view, move or delete them.
 //!
-//! Each card shows whether its host answers (a dot and the time, see
+//! With the status checks turned on (Settings → General; off by default),
+//! each card shows whether its host answers (a dot and the time, see
 //! `host_status.rs`), checked while the list is on screen.
 
 use std::collections::HashMap;
@@ -305,6 +306,9 @@ impl HostsView {
 
     /// "Check now" (the header button or the host menu).
     fn check_now(&mut self, ids: Vec<Id>, cx: &mut Context<Self>) {
+        if !self.model.read(cx).settings.host_status {
+            return;
+        }
         let probes = self.probes(&ids, cx);
         self.status.update(cx, |s, cx| s.check_now(probes, cx));
     }

@@ -4203,7 +4203,7 @@ impl AppView {
         let model = self.model.read(cx);
         let logged_in = model.logged_in();
         let is_admin = model.is_admin();
-        let user = model.server_user.clone();
+        let user = model.current_account_name();
         let syncing = model.syncing;
         let events_online = model.events_online;
         // Requests waiting in sessions you are not watching.
@@ -4449,9 +4449,11 @@ impl AppView {
                 .into_any_element(),
         };
         let model = self.model.clone();
+        let menu_model = self.model.clone();
         let app = cx.entity().downgrade();
+        let menu_app = app.clone();
         let muted = theme.muted_foreground;
-        Button::new("account-switcher")
+        let switcher = Button::new("account-switcher")
             .ghost()
             .w_full()
             .child(
@@ -4526,7 +4528,7 @@ impl AppView {
                                         .child(avatar(&row, 22.))
                                         .child(
                                             v_flex()
-                                                .child(div().text_sm().child(row.email.clone()))
+                                                .child(div().text_sm().child(row.title.clone()))
                                                 .when_some(row.server.clone(), |this, s| {
                                                     this.child(
                                                         div()
@@ -4594,6 +4596,80 @@ impl AppView {
                             )
                         }
                     };
+                }
+                menu
+            });
+        // Right click: the alias of the accounts in sight and hiding the
+        // emails (before a screenshot or sharing the screen).
+        div()
+            .id("account-switcher-menu")
+            .w_full()
+            .child(switcher)
+            .context_menu(move |mut menu, _, cx| {
+                let m = menu_model.read(cx);
+                let infos = m.account_infos();
+                let view = accounts::normalize_view(&infos, m.view);
+                let hide = m.settings.hide_emails;
+                let names = accounts::names();
+                let in_sight: Vec<_> = accounts::accounts_in_view(&infos, view)
+                    .into_iter()
+                    .filter_map(|id| infos.iter().find(|a| a.id == id))
+                    .map(|a| (a.id, names.name(a.id, &a.email)))
+                    .collect();
+                let one = in_sight.len() == 1;
+                for (id, title) in in_sight {
+                    let model = menu_model.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(if one {
+                            t!("accounts.alias.menu")
+                        } else {
+                            t!("accounts.alias.menu_for", account = title)
+                        })
+                        .icon(ui::icon(IconName::Pencil))
+                        .on_click(move |_, window, cx| {
+                            crate::views::accounts::edit_alias(model.clone(), id, window, cx)
+                        }),
+                    );
+                }
+                if !infos.is_empty() {
+                    let model = menu_model.clone();
+                    let app = menu_app.clone();
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new(t!("settings.privacy.hide_emails"))
+                                .checked(hide)
+                                .on_click(move |_, _, cx| {
+                                    model.update(cx, |m, cx| {
+                                        let mut s = m.settings.clone();
+                                        s.hide_emails = !s.hide_emails;
+                                        m.save_settings(s, cx);
+                                    })
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(t!("accounts.manage_menu"))
+                                .icon(ui::icon(IconName::Settings))
+                                .on_click(move |_, window, cx| {
+                                    if let Some(app) = app.upgrade() {
+                                        app.update(cx, |app, cx| app.open_accounts(window, cx));
+                                    }
+                                }),
+                        );
+                } else {
+                    let model = menu_model.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(t!("accounts.add_menu"))
+                            .icon(ui::icon(IconName::UserPlus))
+                            .on_click(move |_, window, cx| {
+                                add_account::open(
+                                    model.clone(),
+                                    add_account::Start::Choose,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    );
                 }
                 menu
             })

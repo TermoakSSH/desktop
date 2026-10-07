@@ -1,6 +1,7 @@
 //! Settings: the current account (with two-step verification), appearance,
 //! language, terminal (with autocomplete), copy and paste, the hosts list
-//! and tabs (status checks, reopening the tabs), the app lock (macOS and
+//! and tabs (status checks, off by default; reopening the tabs), privacy
+//! (hiding the emails of your accounts), the app lock (macOS and
 //! Windows), notifications and updates. Accounts (sign in, sign out, the account of each server) and the
 //! AI (where it runs, API keys, AI credit) have their own pages.
 
@@ -488,6 +489,33 @@ impl SettingsView {
     }
 
     /// Touch ID / Windows Hello (only where the system has it).
+    /// Privacy: hide the emails of your own accounts (for screenshots and
+    /// screen sharing).
+    fn render_privacy(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let settings = self.model.read(cx).settings.clone();
+        let muted = cx.theme().muted_foreground;
+        self.render_card(t!("settings.privacy.title"), IconName::EyeOff, cx)
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("hide-emails")
+                            .label(t!("settings.privacy.hide_emails"))
+                            .checked(settings.hide_emails)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_paste(cx, |s| s.hide_emails = v)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(t!("settings.privacy.hide_emails_hint")),
+                    ),
+            )
+    }
+
     fn render_lock(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let lock = self.model.read(cx).settings.lock;
         let muted = cx.theme().muted_foreground;
@@ -742,11 +770,16 @@ impl SettingsView {
     fn render_account(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let m = self.model.read(cx);
         let logged_in = m.logged_in();
-        let user = m.server_user.clone().unwrap_or_default();
+        let user = m.current_account_name().unwrap_or_default();
+        // An alias stands for the account: the name the server knows is not
+        // shown with it.
+        let aliased = m
+            .current_account
+            .is_some_and(|id| m.settings.account_aliases.contains_key(&id));
         let display_name =
             m.me.as_ref()
                 .map(|u| u.name.clone())
-                .filter(|n| !n.is_empty());
+                .filter(|n| !n.is_empty() && !aliased);
         let is_admin = m.is_admin();
         let url = m.server_url.clone().unwrap_or_default();
         let syncing = m.syncing;
@@ -1042,6 +1075,7 @@ impl Render for SettingsView {
         let paste = self.render_paste(cx);
         let notifications = self.render_notifications(cx);
         let hosts_tabs = self.render_hosts_tabs(cx);
+        let privacy = self.render_privacy(cx);
         let lock = crate::app_lock::supported().then(|| self.render_lock(cx));
         let updates = self.render_updates(cx);
         let about = self.render_about(cx);
@@ -1055,6 +1089,7 @@ impl Render for SettingsView {
                         .child(appearance)
                         .child(paste)
                         .child(hosts_tabs)
+                        .child(privacy)
                         .children(lock)
                         .child(notifications)
                         .child(updates)

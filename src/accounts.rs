@@ -112,6 +112,129 @@ pub fn filter_matches(filter: VaultFilter, scope: Scope, vault: Option<Id>) -> b
 
 // ----- Accounts -----
 
+/// How your own accounts are named on screen, on this device (Settings):
+/// an alias per account ("Work", "Personal") and "Hide email addresses".
+/// Only the accounts signed in here; the emails of other people (vault
+/// members, share participants, users of the admin) are shown as they are.
+///
+/// - With an alias, the alias is shown instead of the email (and the
+///   avatar takes its letter).
+/// - Without one, the email; masked ("o•••@t•••.com") when emails are
+///   hidden.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountNames {
+    pub aliases: BTreeMap<Id, String>,
+    pub hide_emails: bool,
+}
+
+/// Longest alias kept (characters).
+pub const ALIAS_MAX: usize = 40;
+
+impl AccountNames {
+    const EMPTY: Self = Self {
+        aliases: BTreeMap::new(),
+        hide_emails: false,
+    };
+
+    /// The alias of an account, if it has one that is not blank.
+    pub fn alias(&self, id: Id) -> Option<&str> {
+        self.aliases
+            .get(&id)
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+    }
+
+    /// An email of one of your accounts as shown: masked when emails are
+    /// hidden.
+    pub fn email(&self, email: &str) -> String {
+        if self.hide_emails {
+            mask_email(email)
+        } else {
+            email.trim().to_string()
+        }
+    }
+
+    /// Name of an account: its alias, or its email as shown.
+    pub fn name(&self, id: Id, email: &str) -> String {
+        match self.alias(id) {
+            Some(a) => a.to_string(),
+            None => self.email(email),
+        }
+    }
+
+    /// Letter of an account's avatar: from the alias, or from the name the
+    /// server knows and the email.
+    pub fn initial(&self, id: Id, name: &str, email: &str) -> String {
+        match self.alias(id) {
+            Some(a) => avatar_initial(a, ""),
+            None => avatar_initial(name, email),
+        }
+    }
+}
+
+/// An alias as kept: trimmed, at most [`ALIAS_MAX`] characters (`None`:
+/// blank, the email is shown again).
+pub fn clean_alias(alias: &str) -> Option<String> {
+    let a: String = alias.trim().chars().take(ALIAS_MAX).collect();
+    let a = a.trim_end().to_string();
+    (!a.is_empty()).then_some(a)
+}
+
+/// An email with only its first letters: "oihalitz@termoak.com" →
+/// "o•••@t•••.com" (the top-level domain stays).
+pub fn mask_email(email: &str) -> String {
+    const DOTS: &str = "•••";
+    fn first(s: &str) -> String {
+        s.chars().next().map(String::from).unwrap_or_default()
+    }
+    let email = email.trim();
+    if email.is_empty() {
+        return String::new();
+    }
+    let Some((user, domain)) = email.rsplit_once('@') else {
+        return format!("{}{DOTS}", first(email));
+    };
+    let domain = match domain.rsplit_once('.') {
+        Some((name, tld)) if !name.is_empty() && !tld.is_empty() => {
+            format!("{}{DOTS}.{tld}", first(name))
+        }
+        _ => format!("{}{DOTS}", first(domain)),
+    };
+    format!("{}{DOTS}@{domain}", first(user))
+}
+
+/// The names in use, set from the settings by the app model whenever they
+/// load or change (the functions here have no access to the model).
+static NAMES: std::sync::RwLock<AccountNames> = std::sync::RwLock::new(AccountNames::EMPTY);
+
+/// Sets the names in use.
+pub fn set_names(names: AccountNames) {
+    match NAMES.write() {
+        Ok(mut n) => *n = names,
+        Err(e) => *e.into_inner() = names,
+    }
+}
+
+/// The names in use.
+pub fn names() -> AccountNames {
+    match NAMES.read() {
+        Ok(n) => n.clone(),
+        Err(e) => e.into_inner().clone(),
+    }
+}
+
+/// Name of one of your accounts as shown: its alias, or its email (masked
+/// when emails are hidden).
+pub fn shown_name(info: &AccountInfo) -> String {
+    names().name(info.id, &info.email)
+}
+
+/// An email of one of your accounts as shown (masked when emails are
+/// hidden), where there is no account to take an alias from yet.
+pub fn shown_email(email: &str) -> String {
+    names().email(email)
+}
+
 /// Letter of an account's avatar.
 pub fn avatar_initial(name: &str, email: &str) -> String {
     name.trim()
@@ -126,7 +249,13 @@ pub fn avatar_initial(name: &str, email: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRow {
     pub id: Id,
+    /// The real email (only for the avatar color; show [`Self::title`]).
     pub email: String,
+    /// What the account is called on screen: its alias, or its email
+    /// (masked when emails are hidden). See [`AccountNames`].
+    pub title: String,
+    /// It has an alias (the name the server knows is not shown then).
+    pub aliased: bool,
     pub name: String,
     pub initial: String,
     /// Server host when it is not the official server.
@@ -136,23 +265,31 @@ pub struct AccountRow {
 }
 
 impl AccountRow {
+    /// With the names in use ([`names`]).
     pub fn new(info: &AccountInfo) -> Self {
+        Self::with_names(info, &names())
+    }
+
+    pub fn with_names(info: &AccountInfo, names: &AccountNames) -> Self {
         Self {
             id: info.id,
             email: info.email.clone(),
+            title: names.name(info.id, &info.email),
+            aliased: names.alias(info.id).is_some(),
             name: info.name.clone(),
-            initial: avatar_initial(&info.name, &info.email),
+            initial: names.initial(info.id, &info.name, &info.email),
             server: (!info.official).then(|| info.server_host()),
             color: info.color.clone(),
             status: info.status,
         }
     }
 
-    /// "ana@example.com" or "ana@example.com · ssh.example.com".
+    /// "ana@example.com" or "ana@example.com · ssh.example.com" (the
+    /// alias instead of the email when it has one).
     pub fn label(&self) -> String {
         match &self.server {
-            Some(s) => format!("{} · {s}", self.email),
-            None => self.email.clone(),
+            Some(s) => format!("{} · {s}", self.title),
+            None => self.title.clone(),
         }
     }
 }
@@ -218,7 +355,7 @@ pub fn switcher_title(accounts: &[AccountInfo], view: ViewMode) -> (String, Stri
                 .server
                 .clone()
                 .unwrap_or_else(|| a.server_host().to_string());
-            (row.email, detail)
+            (row.title, detail)
         }
         ViewMode::All => (
             t!("accounts.switcher.all").to_string(),
@@ -405,6 +542,7 @@ pub fn destinations(
     include_device: bool,
 ) -> Vec<Destination> {
     let multi = accounts.len() > 1;
+    let names = names();
     let mut out = Vec::new();
     for a in accounts {
         if a.status != AccountStatus::Active && a.status != AccountStatus::NeedsSignIn {
@@ -415,7 +553,7 @@ pub fn destinations(
             out.push(Destination {
                 scope: Scope::Account(a.id),
                 vault: None,
-                label: a.email.clone(),
+                label: names.name(a.id, &a.email),
             });
             continue;
         }
@@ -424,7 +562,7 @@ pub fn destinations(
                 scope: Scope::Account(a.id),
                 vault: Some(v.id()),
                 label: if multi {
-                    format!("{} · {}", a.email, v.label())
+                    format!("{} · {}", names.name(a.id, &a.email), v.label())
                 } else {
                     v.label()
                 },
@@ -917,5 +1055,76 @@ mod tests {
             ]
         );
         assert!(sync_notices(&SyncReport::default()).is_empty());
+    }
+
+    #[test]
+    fn emails_are_masked_to_their_first_letters() {
+        assert_eq!(mask_email("oihalitz@termoak.com"), "o•••@t•••.com");
+        assert_eq!(mask_email(" Ana@Mail.Example.co.uk "), "A•••@M•••.uk");
+        assert_eq!(mask_email("ñandú@ñ.es"), "ñ•••@ñ•••.es");
+        assert_eq!(mask_email("root@localhost"), "r•••@l•••");
+        assert_eq!(mask_email("@example.com"), "•••@e•••.com");
+        assert_eq!(mask_email("ana@"), "a•••@•••");
+        assert_eq!(mask_email("ana@.com"), "a•••@.•••");
+        assert_eq!(mask_email("not-an-email"), "n•••");
+        assert_eq!(mask_email("   "), "");
+        // Nothing of the user or the domain name is left.
+        let m = mask_email("ana.garcia@example.org");
+        assert!(!m.contains("garcia") && !m.contains("example"));
+    }
+
+    #[test]
+    fn aliases_are_trimmed_and_blank_ones_dropped() {
+        assert_eq!(clean_alias("  Work "), Some("Work".into()));
+        assert_eq!(clean_alias("   "), None);
+        assert_eq!(clean_alias(""), None);
+        let long = "x".repeat(ALIAS_MAX + 10);
+        assert_eq!(clean_alias(&long).unwrap().chars().count(), ALIAS_MAX);
+        // Cut at a space: no trailing blank.
+        let spaced = format!("{} y", "x".repeat(ALIAS_MAX - 1));
+        assert_eq!(clean_alias(&spaced), Some("x".repeat(ALIAS_MAX - 1)));
+    }
+
+    #[test]
+    fn own_accounts_show_their_alias_or_their_email() {
+        let mut ana = account(1, "ana@example.com", true);
+        ana.name = "Ana García".into();
+        let work = account(2, "ana@work.com", false);
+        let mut names = AccountNames::default();
+
+        // Nothing set: the email, the letter of the name.
+        let row = AccountRow::with_names(&ana, &names);
+        assert_eq!(row.title, "ana@example.com");
+        assert_eq!(row.initial, "A");
+        assert!(!row.aliased);
+        assert_eq!(names.name(ana.id, &ana.email), "ana@example.com");
+
+        // An alias: shown instead of the email, its letter on the avatar.
+        names.aliases.insert(ana.id, " Personal ".into());
+        names.aliases.insert(work.id, "Work".into());
+        let row = AccountRow::with_names(&ana, &names);
+        assert_eq!(row.title, "Personal");
+        assert_eq!(row.initial, "P");
+        assert!(row.aliased);
+        assert_eq!(row.email, "ana@example.com");
+        let row = AccountRow::with_names(&work, &names);
+        assert_eq!(row.label(), "Work · ssh.example.com");
+        assert_eq!(row.initial, "W");
+
+        // A blank alias counts as none.
+        names.aliases.insert(ana.id, "  ".into());
+        assert_eq!(names.alias(ana.id), None);
+        assert_eq!(names.name(ana.id, &ana.email), "ana@example.com");
+
+        // Hidden emails: the alias if there is one, otherwise masked.
+        names.hide_emails = true;
+        assert_eq!(names.name(ana.id, &ana.email), "a•••@e•••.com");
+        assert_eq!(names.name(work.id, &work.email), "Work");
+        assert_eq!(names.email("ana@work.com"), "a•••@w•••.com");
+        let row = AccountRow::with_names(&ana, &names);
+        assert_eq!(row.label(), "a•••@e•••.com");
+        assert!(!row.label().contains("example"));
+        // An account the names know nothing about.
+        assert_eq!(names.name(id(99), "bob@example.net"), "b•••@e•••.net");
     }
 }

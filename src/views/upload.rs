@@ -111,7 +111,7 @@ impl Render for UploadDialog {
             .model
             .read(cx)
             .account(self.account)
-            .map(|a| a.info.email.clone())
+            .map(|a| crate::accounts::shown_name(&a.info))
             .unwrap_or_default();
         v_flex()
             .gap_3()

@@ -96,7 +96,14 @@ pub struct Settings {
     /// `palette::remember`).
     pub palette_recent: Vec<String>,
     /// The hosts list shows whether each host answers (a TCP check of its
-    /// SSH port every minute while the list is on screen).
+    /// SSH port every minute while the list is on screen). Off unless
+    /// turned on: when off, no host is checked at all.
+    ///
+    /// Stored as `host_status_on`: the first builds with the check (never
+    /// released) saved it on by default as `host_status`, so a saved `true`
+    /// did not mean the user chose it. That key is ignored, and every
+    /// settings file without the new one starts with the check off.
+    #[serde(rename = "host_status_on")]
     pub host_status: bool,
     /// Hosts whose status is not checked (on this device).
     pub host_status_off: Vec<Id>,
@@ -104,6 +111,12 @@ pub struct Settings {
     pub reopen_tabs: bool,
     /// Touch ID / Windows Hello to open the app (Settings → General).
     pub lock: crate::app_lock::LockSettings,
+    /// Names of your accounts on this device, by account id (Settings →
+    /// Accounts; not synced): shown instead of their emails.
+    pub account_aliases: BTreeMap<Id, String>,
+    /// The emails of your own accounts are never shown: their alias, or a
+    /// masked form (Settings → General → Privacy).
+    pub hide_emails: bool,
 }
 
 impl Default for Settings {
@@ -127,10 +140,12 @@ impl Default for Settings {
             layout_notice_seen: false,
             cloud_notice_dismissed: 0,
             palette_recent: Vec::new(),
-            host_status: true,
+            host_status: false,
             host_status_off: Vec::new(),
             reopen_tabs: true,
             lock: crate::app_lock::LockSettings::default(),
+            account_aliases: BTreeMap::new(),
+            hide_emails: false,
         }
     }
 }
@@ -150,6 +165,14 @@ pub fn cloud_notice_lowered(running: usize, dismissed: usize) -> Option<usize> {
 }
 
 impl Settings {
+    /// How your accounts are named on screen (aliases, hidden emails).
+    pub fn account_names(&self) -> accounts::AccountNames {
+        accounts::AccountNames {
+            aliases: self.account_aliases.clone(),
+            hide_emails: self.hide_emails,
+        }
+    }
+
     /// Reads the saved preferences.
     pub async fn load(store: &termoak_core::Store) -> Self {
         store
@@ -652,6 +675,7 @@ impl AppModel {
                 AccountView::All => ViewMode::All,
             }
         };
+        accounts::set_names(settings.account_names());
         let mut model = Self {
             ws,
             settings,
@@ -1112,7 +1136,7 @@ impl AppModel {
         let Some(acc) = self.account(a) else {
             return String::new();
         };
-        let email = acc.info.email.clone();
+        let email = accounts::shown_name(&acc.info);
         match vault.and_then(|v| acc.vault(v)).map(VaultEntry::label) {
             Some(vault) if accounts::show_account_badges(self.accounts_in_view().len()) => {
                 format!("{email} · {vault}")
@@ -1583,8 +1607,30 @@ impl AppModel {
             .unwrap_or(22)
     }
 
+    /// Name of the current account as shown (its alias, or its email;
+    /// masked when emails are hidden).
+    pub fn current_account_name(&self) -> Option<String> {
+        let id = self.current_account?;
+        let email = self.server_user.as_deref()?;
+        Some(accounts::names().name(id, email))
+    }
+
+    /// Sets or clears (blank) the alias of one of your accounts on this
+    /// device.
+    pub fn set_account_alias(&mut self, id: Id, alias: &str, cx: &mut Context<Self>) {
+        let mut s = self.settings.clone();
+        match accounts::clean_alias(alias) {
+            Some(a) => s.account_aliases.insert(id, a),
+            None => s.account_aliases.remove(&id),
+        };
+        if s.account_aliases != self.settings.account_aliases {
+            self.save_settings(s, cx);
+        }
+    }
+
     /// Saves the preferences.
     pub fn save_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        accounts::set_names(settings.account_names());
         self.settings = settings.clone();
         cx.notify();
         let store = self.ws.store.clone();
@@ -1817,7 +1863,7 @@ impl AppModel {
     fn synced(&mut self, id: Id, res: Result<SyncReport, ClientError>, cx: &mut Context<Self>) {
         let email = self
             .account(id)
-            .map(|a| a.info.email.clone())
+            .map(|a| accounts::shown_name(&a.info))
             .unwrap_or_default();
         let summary = match res {
             Ok(report) => {
@@ -2072,7 +2118,7 @@ impl AppModel {
         self.reload(cx);
         self.toast(
             ToastKind::Success,
-            t!("state.signed_in", email = acc.info().email).to_string(),
+            t!("state.signed_in", email = accounts::shown_name(&acc.info())).to_string(),
             cx,
         );
         // A language picked explicitly goes to the account (emails).
@@ -2473,6 +2519,37 @@ mod tests {
         assert_eq!(p.resend_wait(), 60);
         p.resend_at = Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(p.resend_wait(), 0);
+    }
+
+    #[test]
+    fn host_status_checks_are_off_unless_turned_on() {
+        assert!(!Settings::default().host_status);
+        // Saved by the first builds with the check: on by default, so it
+        // does not say the user chose it.
+        let s: Settings =
+            serde_json::from_str(r#"{"host_status":true,"host_status_off":[]}"#).unwrap();
+        assert!(!s.host_status);
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.host_status);
+        // Turned on now: kept.
+        let mut s = Settings::default();
+        s.host_status = true;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""host_status_on":true"#));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(back.host_status);
+    }
+
+    #[test]
+    fn account_aliases_and_hidden_emails_are_kept() {
+        let mut s = Settings::default();
+        assert!(!s.hide_emails && s.account_aliases.is_empty());
+        s.account_aliases.insert(Id::nil(), "Work".into());
+        s.hide_emails = true;
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let names = back.account_names();
+        assert!(names.hide_emails);
+        assert_eq!(names.alias(Id::nil()), Some("Work"));
     }
 
     #[test]
