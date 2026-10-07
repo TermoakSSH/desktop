@@ -1,8 +1,13 @@
 //! Host editor (side panel, in the style of Termius): the address first and
-//! big, then the label, group, tags and color; the SSH credentials with a
-//! "Connect" button at the top; and a collapsible "Advanced" section with
-//! jumps, proxy, agent forwarding, keep-alive, startup snippet, environment,
-//! recording, terminal type and theme. Errors are shown under each field.
+//! big, then the label and protocol (SSH or Telnet), group, tags, color and
+//! logo; the credentials with a "Connect" button at the top; and a
+//! collapsible "Advanced" section with jumps, proxy, agent forwarding,
+//! keep-alive, startup snippet, environment, recording, terminal type and
+//! theme. Errors are shown under each field.
+//!
+//! Telnet hosts hide what only SSH has (keys, jump hosts, agent forwarding,
+//! keep-alive, startup snippet, environment) and warn that Telnet is not
+//! encrypted; switching the protocol moves the port between 22 and 23.
 //!
 //! Keyboard: Enter saves, Ctrl+Enter (⌘↩ on macOS) saves and connects and
 //! Escape closes the panel.
@@ -27,14 +32,16 @@ use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaSta
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent};
 use gpui_component::switch::Switch;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 use termoak_client::{SaveTarget, Scope};
 use termoak_core::Id;
-use termoak_core::model::{Host, HostSettings, ProxyKind, ProxySettings, SyncMode};
+use termoak_core::model::{Host, HostProtocol, HostSettings, ProxyKind, ProxySettings, SyncMode};
 use termoak_core::transfer::TransferMode;
 
 use super::OpenRequest;
 use crate::accounts::{self as vm, Destination};
+use crate::logos::{self, LogoKind};
 use crate::state::{AppModel, Item};
 use crate::theme;
 use crate::ui::{self, Choice, ChoiceState, IconName};
@@ -168,6 +175,43 @@ pub(crate) fn parse_tags(text: &str) -> Vec<String> {
 }
 
 /// Optional text: `None` when empty.
+/// Text of the port field after the protocol changes from `from` to `to`:
+/// empty or the old protocol's default becomes the new one's (written out
+/// for Telnet, empty for SSH, see `HostProtocol::switch_port`); another
+/// port, or text that is not a port, stays.
+pub(crate) fn port_after_switch(from: &HostProtocol, to: &HostProtocol, text: &str) -> String {
+    let text = text.trim();
+    let port = if text.is_empty() {
+        None
+    } else {
+        match parse_port(text) {
+            Some(p) => Some(p),
+            None => return text.to_string(),
+        }
+    };
+    to.switch_port(from, port)
+        .map(|p| p.to_string())
+        .unwrap_or_default()
+}
+
+/// What the editor shows for a protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtocolFields {
+    /// Key (and the identity's key), agent forwarding, jump hosts,
+    /// keep-alive, startup snippet and environment.
+    pub ssh_only: bool,
+    /// "Telnet sends everything unencrypted".
+    pub unencrypted: bool,
+}
+
+pub(crate) fn fields_for(protocol: &HostProtocol) -> ProtocolFields {
+    let ssh = !protocol.is_telnet();
+    ProtocolFields {
+        ssh_only: ssh,
+        unencrypted: !ssh,
+    }
+}
+
 fn optional(text: &str) -> Option<String> {
     Some(text.trim().to_string()).filter(|t| !t.is_empty())
 }
@@ -415,6 +459,14 @@ pub struct HostEditor {
     label: Entity<InputState>,
     address: Entity<InputState>,
     port: Entity<InputState>,
+    /// SSH or Telnet (a later version's protocol is kept).
+    protocol: ChoiceState<HostProtocol>,
+    /// Protocol the port field was last adjusted for.
+    port_protocol: HostProtocol,
+    /// Logo id (`None`: automatic).
+    icon: Option<String>,
+    /// The logo grid is open.
+    logos_open: bool,
     username: Entity<InputState>,
     password: Entity<InputState>,
     clear_password: bool,
@@ -579,12 +631,21 @@ impl HostEditor {
             t!("host_editor.address_placeholder"),
             h.as_ref().map(|h| h.address.clone()).unwrap_or_default(),
         );
+        let host_protocol = h.as_ref().map(|h| h.protocol.clone()).unwrap_or_default();
         let port = input(
             window,
             cx,
-            "22".into(),
+            host_protocol.default_port().to_string().into(),
             s.port.map(|p| p.to_string()).unwrap_or_default(),
         );
+        let mut protocols = vec![
+            Choice::new("SSH", HostProtocol::Ssh),
+            Choice::new("Telnet", HostProtocol::Telnet),
+        ];
+        if let HostProtocol::Other(name) = &host_protocol {
+            protocols.push(Choice::new(name.clone(), host_protocol.clone()));
+        }
+        let protocol = ui::choice_state(protocols, Some(&host_protocol), window, cx);
         let username = input(
             window,
             cx,
@@ -750,6 +811,13 @@ impl HostEditor {
                 },
             ));
         }
+        subs.push(cx.subscribe_in(
+            &protocol,
+            window,
+            |this, _, _: &SelectEvent<Vec<Choice<HostProtocol>>>, window, cx| {
+                this.protocol_changed(window, cx)
+            },
+        ));
 
         Self {
             targets,
@@ -778,6 +846,10 @@ impl HostEditor {
             label,
             address,
             port,
+            protocol,
+            port_protocol: host_protocol,
+            icon: h.as_ref().and_then(|h| h.icon.clone()),
+            logos_open: false,
             username,
             password,
             clear_password: false,
@@ -795,6 +867,29 @@ impl HostEditor {
             saving: false,
             _subs: subs,
         }
+    }
+
+    /// Protocol chosen in the form.
+    fn chosen_protocol(&self, cx: &App) -> HostProtocol {
+        ui::chosen(&self.protocol, cx).unwrap_or_else(|| self.port_protocol.clone())
+    }
+
+    /// The protocol changed: the port follows (22 ↔ 23) and its placeholder
+    /// too.
+    fn protocol_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to = self.chosen_protocol(cx);
+        let from = std::mem::replace(&mut self.port_protocol, to.clone());
+        if from == to {
+            return;
+        }
+        let text = port_after_switch(&from, &to, &self.port.read(cx).value());
+        let placeholder = to.default_port().to_string();
+        self.port.update(cx, |i, cx| {
+            i.set_value(text, window, cx);
+            i.set_placeholder(placeholder, window, cx);
+        });
+        self.clear_error(Field::Port, cx);
+        cx.notify();
     }
 
     pub fn host_id(&self) -> Option<Id> {
@@ -933,6 +1028,8 @@ impl HostEditor {
                 os: None,
                 os_version: None,
                 favorite: false,
+                protocol: Default::default(),
+                icon: None,
             });
         host.label = values.label;
         host.address = values.address;
@@ -941,16 +1038,20 @@ impl HostEditor {
         host.notes = self.notes.read(cx).value().to_string();
         host.favorite = self.favorite;
         host.color = self.color.clone();
+        host.protocol = self.chosen_protocol(cx);
+        host.icon = self.icon.clone();
+        let fields = fields_for(&host.protocol);
         let s = &mut host.settings;
         s.port = values.port;
         s.username = optional(&text(&self.username));
         s.identity_id = ui::chosen(&self.identity, cx).flatten();
         s.key_id = ui::chosen(&self.key, cx).flatten();
         s.startup_snippet_id = ui::chosen(&self.snippet, cx).flatten();
-        s.jump_host_ids = (!self.jumps.is_empty()).then(|| self.jumps.clone());
+        // Telnet cannot go through jump hosts or forward the agent.
+        s.jump_host_ids = (fields.ssh_only && !self.jumps.is_empty()).then(|| self.jumps.clone());
         s.env = values.env;
         s.keepalive_secs = values.keepalive;
-        s.agent_forwarding = self.agent_forwarding.then_some(true);
+        s.agent_forwarding = (fields.ssh_only && self.agent_forwarding).then_some(true);
         s.record_sessions = self.record.then_some(true);
         s.term = optional(&text(&self.term));
         // A theme this version does not know (nothing selected) is kept.
@@ -1208,6 +1309,114 @@ impl HostEditor {
             }))
     }
 
+    /// The "Logo" field: the avatar as it will look and, open, every logo
+    /// (Automatic first).
+    fn render_logos(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let radius = theme.radius;
+        let ring = theme.foreground;
+        let muted = theme.muted_foreground;
+        let label = self.label.read(cx).value().to_string();
+        let label = if label.trim().is_empty() {
+            self.address.read(cx).value().to_string()
+        } else {
+            label
+        };
+        let os = self.original.as_ref().and_then(|r| r.data.os.clone());
+        let own_color = self.color.as_deref().and_then(theme::parse_color);
+        let automatic = os.as_deref().and_then(logos::for_os);
+        let current = logos::resolve(self.icon.as_deref(), os.as_deref());
+        let bg_of = |logo: Option<&logos::Logo>| {
+            own_color
+                .or(logo.map(logos::Logo::color))
+                .unwrap_or_else(|| theme::color_for(&label))
+        };
+        let name: SharedString = match (self.icon.as_deref().and_then(logos::by_id), automatic) {
+            (Some(l), _) => l.name(),
+            (None, Some(a)) => t!("host_editor.logo_automatic_with", name = a.name()),
+            (None, None) => t!("host_editor.logo_automatic"),
+        };
+        let open = self.logos_open;
+        let summary = h_flex()
+            .gap_2()
+            .items_center()
+            .child(logos::tile(current, &label, bg_of(current), 28., radius))
+            .child(div().flex_1().min_w_0().text_sm().child(name))
+            .child(
+                Button::new("host-logo-toggle")
+                    .xsmall()
+                    .ghost()
+                    .icon(ui::icon(if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    }))
+                    .label(if open {
+                        t!("host_editor.logo_done")
+                    } else {
+                        t!("host_editor.logo_change")
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.logos_open = !this.logos_open;
+                        cx.notify();
+                    })),
+            );
+        if !open {
+            return summary.into_any_element();
+        }
+        let selected = self.icon.clone();
+        let tile = |ix: usize,
+                    id: Option<&'static str>,
+                    logo: Option<&'static logos::Logo>,
+                    tip: SharedString,
+                    cx: &mut Context<Self>| {
+            let active = match (&selected, id) {
+                (None, None) => true,
+                (Some(s), Some(i)) => s.eq_ignore_ascii_case(i),
+                _ => false,
+            };
+            let bg = logo.map(logos::Logo::color).unwrap_or(muted);
+            div()
+                .id(("host-logo", ix))
+                .p(px(2.))
+                .rounded(radius)
+                .border_2()
+                .border_color(if active {
+                    ring
+                } else {
+                    gpui::transparent_black()
+                })
+                .cursor_pointer()
+                .child(logos::tile(logo, &label, bg, 26., radius))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.icon = id.map(str::to_string);
+                    cx.notify();
+                }))
+        };
+        let mut systems = vec![tile(
+            0,
+            None,
+            automatic,
+            t!("host_editor.logo_automatic_hint"),
+            cx,
+        )];
+        let mut generic = Vec::new();
+        for (i, l) in logos::LOGOS.iter().enumerate() {
+            let t = tile(i + 1, Some(l.id), Some(l), l.name(), cx);
+            match l.kind {
+                LogoKind::System => systems.push(t),
+                LogoKind::Generic => generic.push(t),
+            }
+        }
+        v_flex()
+            .gap_2()
+            .child(summary)
+            .child(h_flex().gap_1().flex_wrap().children(systems))
+            .child(h_flex().gap_1().flex_wrap().children(generic))
+            .into_any_element()
+    }
+
     fn render_advanced(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let has_secret = self.original.as_ref().is_some_and(|r| r.meta.has_secret);
@@ -1218,6 +1427,8 @@ impl HostEditor {
             m.hosts
                 .iter()
                 .filter(|h| Some(h.data.id) != own_id)
+                // A Telnet host is not an SSH server to jump through.
+                .filter(|h| !h.data.protocol.is_telnet())
                 // Jumps of the same vault, or of This device.
                 .filter(|h| {
                     h.scope == Scope::Device || (h.scope == scope && m.vault_of(h) == vault)
@@ -1271,20 +1482,23 @@ impl HostEditor {
                 .into_any_element()
         };
         let proxy_on = ui::chosen(&self.proxy_kind, cx).flatten().is_some();
+        let ssh = fields_for(&self.chosen_protocol(cx)).ssh_only;
 
         v_flex()
             .gap_4()
             // Connection: jumps and proxy.
             .child(sub_title(t!("host_editor.section.connection"), cx))
-            .child(
-                ui::field_with_hint(
-                    t!("host_editor.jumps"),
-                    jumps,
-                    t!("host_editor.jumps_hint"),
-                    cx,
+            .when(ssh, |this| {
+                this.child(
+                    ui::field_with_hint(
+                        t!("host_editor.jumps"),
+                        jumps,
+                        t!("host_editor.jumps_hint"),
+                        cx,
+                    )
+                    .children(jump_warnings.into_iter().map(|w| warning_text(w, cx))),
                 )
-                .children(jump_warnings.into_iter().map(|w| warning_text(w, cx))),
-            )
+            })
             .child(ui::field_with_hint(
                 t!("host_editor.proxy.kind"),
                 Select::new(&self.proxy_kind),
@@ -1335,47 +1549,55 @@ impl HostEditor {
                     )
                 })
             })
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        Switch::new("agent-forwarding")
-                            .label(t!("host_editor.agent_forwarding"))
-                            .checked(self.agent_forwarding)
-                            .on_click(cx.listener(|this, v: &bool, _, cx| {
-                                this.agent_forwarding = *v;
-                                cx.notify();
-                            })),
-                    )
-                    .child(hint(t!("host_editor.agent_forwarding_hint"), cx)),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(self.checked_field(
-                        Field::Keepalive,
-                        t!("host_editor.keepalive"),
-                        div().w(px(120.)).child(Input::new(&self.keepalive)),
-                        cx,
-                    ))
-                    .child(hint(t!("host_editor.keepalive_hint"), cx)),
-            )
+            .when(ssh, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Switch::new("agent-forwarding")
+                                .label(t!("host_editor.agent_forwarding"))
+                                .checked(self.agent_forwarding)
+                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                    this.agent_forwarding = *v;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(hint(t!("host_editor.agent_forwarding_hint"), cx)),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(self.checked_field(
+                            Field::Keepalive,
+                            t!("host_editor.keepalive"),
+                            div().w(px(120.)).child(Input::new(&self.keepalive)),
+                            cx,
+                        ))
+                        .child(hint(t!("host_editor.keepalive_hint"), cx)),
+                )
+            })
             // Terminal: startup, environment, recording, TERM and theme.
             .child(sub_title(t!("host_editor.section.terminal"), cx))
-            .child(
-                ui::field(
-                    t!("host_editor.startup_snippet"),
-                    Select::new(&self.snippet),
-                    cx,
+            .when(ssh, |this| {
+                this.child(
+                    ui::field(
+                        t!("host_editor.startup_snippet"),
+                        Select::new(&self.snippet),
+                        cx,
+                    )
+                    .children(self.kept_warning(
+                        &self.snippet,
+                        &self.kept.snippet,
+                        cx,
+                    )),
                 )
-                .children(self.kept_warning(&self.snippet, &self.kept.snippet, cx)),
-            )
-            .child(self.checked_field(
-                Field::Env,
-                t!("host_editor.env"),
-                Textarea::new(&self.env),
-                cx,
-            ))
+                .child(self.checked_field(
+                    Field::Env,
+                    t!("host_editor.env"),
+                    Textarea::new(&self.env),
+                    cx,
+                ))
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -1434,6 +1656,10 @@ impl Render for HostEditor {
             t!("host_editor.new_title")
         };
         let colors = self.render_colors(cx).into_any_element();
+        let logos = self.render_logos(cx);
+        let protocol = self.chosen_protocol(cx);
+        let fields = fields_for(&protocol);
+        let telnet = protocol.is_telnet();
         let advanced = self.advanced_open.then(|| self.render_advanced(cx));
         let advanced_open = self.advanced_open;
         let shortcut = if cfg!(target_os = "macos") {
@@ -1515,11 +1741,24 @@ impl Render for HostEditor {
                     )
                     .when_some(address_error, |this, e| this.child(error_text(e, cx))),
             )
-            .child(ui::field(
-                t!("host_editor.label"),
-                Input::new(&self.label),
-                cx,
-            ));
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(ui::field(
+                        t!("host_editor.label"),
+                        Input::new(&self.label),
+                        cx,
+                    )))
+                    .child(div().w(px(120.)).flex_shrink_0().child(ui::field(
+                        t!("host_editor.protocol"),
+                        Select::new(&self.protocol).disabled(read_only),
+                        cx,
+                    ))),
+            )
+            .when(fields.unencrypted, |this| {
+                this.child(warning_text(t!("host_editor.telnet_warning"), cx))
+            });
 
         let place_field = show_place.then(|| {
             let control: AnyElement = match (&self.target, editing) {
@@ -1588,13 +1827,18 @@ impl Render for HostEditor {
                             cx,
                         ))),
                 )
-                .child(ui::field(t!("host_editor.color"), colors, cx)),
+                .child(ui::field(t!("host_editor.color"), colors, cx))
+                .child(ui::field(t!("host_editor.logo"), logos, cx)),
             cx,
         );
 
-        // SSH: port, user and credentials.
+        // SSH (or Telnet): port, user and credentials.
         let ssh = section(
-            t!("host_editor.section.ssh"),
+            if telnet {
+                t!("host_editor.section.telnet")
+            } else {
+                t!("host_editor.section.ssh")
+            },
             IconName::KeyRound,
             v_flex()
                 .gap_3()
@@ -1614,10 +1858,18 @@ impl Render for HostEditor {
                             cx,
                         ))),
                 )
-                .when(!read_only, |this| {
+                .when(!read_only && !telnet, |this| {
                     this.child(ui::field(
                         t!("host_editor.password"),
                         Input::new(&self.password).mask_toggle(),
+                        cx,
+                    ))
+                })
+                .when(!read_only && telnet, |this| {
+                    this.child(ui::field_with_hint(
+                        t!("host_editor.password"),
+                        Input::new(&self.password).mask_toggle(),
+                        t!("host_editor.telnet_login_hint"),
                         cx,
                     ))
                 })
@@ -1632,20 +1884,30 @@ impl Render for HostEditor {
                             })),
                     )
                 })
-                .child(
-                    ui::field_with_hint(
-                        t!("host_editor.key"),
-                        Select::new(&self.key),
-                        t!("host_editor.key_hint"),
-                        cx,
+                .when(fields.ssh_only, |this| {
+                    this.child(
+                        ui::field_with_hint(
+                            t!("host_editor.key"),
+                            Select::new(&self.key),
+                            t!("host_editor.key_hint"),
+                            cx,
+                        )
+                        .children(self.kept_warning(
+                            &self.key,
+                            &self.kept.key,
+                            cx,
+                        )),
                     )
-                    .children(self.kept_warning(&self.key, &self.kept.key, cx)),
-                )
+                })
                 .child(
                     ui::field_with_hint(
                         t!("host_editor.identity"),
                         Select::new(&self.identity),
-                        t!("host_editor.identity_hint"),
+                        if telnet {
+                            t!("host_editor.identity_hint_telnet")
+                        } else {
+                            t!("host_editor.identity_hint")
+                        },
                         cx,
                     )
                     .children(self.kept_warning(
@@ -1920,6 +2182,32 @@ mod tests {
             address,
             ..FormText::default()
         }
+    }
+
+    #[test]
+    fn switching_the_protocol_moves_the_port() {
+        use HostProtocol::{Ssh, Telnet};
+        // To Telnet: empty or 22 becomes 23, written out.
+        assert_eq!(port_after_switch(&Ssh, &Telnet, ""), "23");
+        assert_eq!(port_after_switch(&Ssh, &Telnet, " 22 "), "23");
+        assert_eq!(port_after_switch(&Ssh, &Telnet, "2222"), "2222");
+        // Back to SSH: 23 is the default again (empty), others stay.
+        assert_eq!(port_after_switch(&Telnet, &Ssh, "23"), "");
+        assert_eq!(port_after_switch(&Telnet, &Ssh, ""), "");
+        assert_eq!(port_after_switch(&Telnet, &Ssh, "2323"), "2323");
+        // Not a port: left for the user to fix.
+        assert_eq!(port_after_switch(&Ssh, &Telnet, "abc"), "abc");
+        assert_eq!(port_after_switch(&Telnet, &Telnet, "23"), "23");
+    }
+
+    #[test]
+    fn telnet_hides_what_only_ssh_has() {
+        let ssh = fields_for(&HostProtocol::Ssh);
+        assert!(ssh.ssh_only && !ssh.unencrypted);
+        let telnet = fields_for(&HostProtocol::Telnet);
+        assert!(!telnet.ssh_only && telnet.unencrypted);
+        // A later version's protocol is shown as SSH-like (nothing hidden).
+        assert!(fields_for(&HostProtocol::Other("rdp".into())).ssh_only);
     }
 
     #[test]

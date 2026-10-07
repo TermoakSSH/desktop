@@ -314,6 +314,8 @@ pub fn to_set(file: &ExportFile, secrets: Option<&Secrets>) -> ImportSet {
             settings: Some(settings),
             os: h.os.clone(),
             os_version: h.os_version.clone(),
+            protocol: h.protocol.clone(),
+            icon: h.icon.clone(),
         });
     }
     set
@@ -386,6 +388,8 @@ mod tests {
             os: None,
             os_version: None,
             favorite: false,
+            protocol: Default::default(),
+            icon: None,
         });
         f.hosts.push(Host {
             id: web,
@@ -405,6 +409,8 @@ mod tests {
             os: Some("ubuntu".into()),
             os_version: Some("Ubuntu 24.04".into()),
             favorite: true,
+            protocol: termoak_core::model::HostProtocol::Telnet,
+            icon: Some("router".into()),
         });
         f.tags = vec!["edge".into(), "prod".into(), "web".into()];
         let mut s = Secrets::default();
@@ -441,6 +447,9 @@ mod tests {
         assert_eq!(web.port, Some(2222));
         assert_eq!(web.password, None);
         assert!(web.favorite);
+        // Protocol and logo go through.
+        assert!(web.protocol.is_telnet() && set.hosts[0].protocol.is_ssh());
+        assert_eq!(web.icon.as_deref(), Some("router"));
         let settings = web.settings.as_ref().unwrap();
         assert_eq!(settings.jump_host_ids, Some(vec![Id::from_u128(5)]));
         assert_eq!(settings.port, None, "moved to the host fields");

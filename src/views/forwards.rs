@@ -85,6 +85,12 @@ impl ForwardsView {
             m.hosts
                 .iter()
                 .filter(|h| place.is_none_or(|p| m.fits_place(h, p)))
+                // Tunnels go over SSH: Telnet hosts have none (unless one
+                // already points to it).
+                .filter(|h| {
+                    !h.data.protocol.is_telnet()
+                        || data.as_ref().is_some_and(|d| d.host_id == h.data.id)
+                })
                 .map(|h| Choice::new(h.data.label.clone(), Some(h.data.id)))
                 .collect()
         };

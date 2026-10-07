@@ -46,7 +46,9 @@ to every pane with the antenna lit (here, all but the log tail on
   connects them in tabs or in a split view, moves them to a group or
   deletes them.
 - **Host editor** (side panel): the address first, then the label (the
-  address if empty), group, tags and color; user, port and credentials
+  address if empty) and protocol (SSH or Telnet), group, tags, color and
+  logo (automatic: the detected system's; or one of the system and generic
+  logos); user, port and credentials
   (password, key, identity) with a Connect button at the top; and an
   Advanced section with ProxyJump hops, proxy, agent forwarding, keep-alive,
   startup snippet, environment variables, recording, terminal type and
@@ -116,6 +118,13 @@ to every pane with the antenna lit (here, all but the log tail on
   and macOS; PowerShell 7, Windows PowerShell or `%COMSPEC%` with ConPTY on
   Windows. If the shell exits, the tab shows the exit code and offers to
   reopen it; closing the tab closes the shell.
+- **Telnet**: hosts whose protocol is Telnet (switches, routers, old
+  systems) open a Telnet terminal from this computer, through the host's
+  proxy if it has one, optionally typing the username and password at the
+  first login prompts. Telnet is unencrypted: no keys, jump hosts, SFTP,
+  tunnels or server sessions. Quick connect takes `telnet://host:port`, and
+  the PuTTY, MobaXterm, SecureCRT, Termius, ZOC and CSV importers bring
+  their Telnet sessions as Telnet hosts.
 - **Serial port**: open a serial port (USB-serial adapter, router console,
   a board...) as a terminal, picking a detected port or typing its path, and
   the speed (8N1).
@@ -329,9 +338,10 @@ src/
   update.rs          automatic updates
   ui.rs              reusable UI pieces
   qr.rs              QR codes painted with squares
+  logos.rs           host logos (system logos in assets/logos, generic icons)
   terminal/          emulation, painting, keyboard (IME), mouse, autocompletion,
-                     copy and paste options, find, and connection (local SSH,
-                     server, local shell or serial port)
+                     copy and paste options, find, and connection (local SSH
+                     or Telnet, server, local shell or serial port)
   views/             hosts, ssh_config import, host editor, SFTP, keychain,
                      snippets, port forwards, known hosts, AI and copilot,
                      server sessions, sharing, teams, administration,

@@ -4,7 +4,8 @@
 //!
 //! Each session is a subkey whose name is %-escaped (`My%20Server`). Values
 //! used: `HostName` (may be `user@host`), `PortNumber`, `UserName`,
-//! `Protocol` (only `ssh` is imported), `PublicKeyFile` (the `.ppk` path:
+//! `Protocol` (`ssh`, and `telnet` as a Telnet host; others are skipped),
+//! `PublicKeyFile` (SSH only; the `.ppk` path:
 //! imported if the file can be read here and is not encrypted, otherwise
 //! written in the notes), `ProxyMethod` (1 SOCKS4, 2 SOCKS5, 3 HTTP;
 //! Telnet and local-command proxies are not supported), `ProxyHost`,
@@ -170,8 +171,9 @@ pub fn to_set(sessions: &[Session]) -> ImportSet {
         }
         let get = |k: &str| s.values.get(k);
         let text = |k: &str| get(k).map(RegValue::text).unwrap_or_default();
-        let protocol = text("Protocol");
-        if !protocol.is_empty() && !protocol.eq_ignore_ascii_case("ssh") {
+        let protocol_text = text("Protocol");
+        let Some(protocol) = super::protocol_of(&protocol_text) else {
+            let protocol = protocol_text;
             set.warnings.push(
                 t!(
                     "import_export.warn.not_ssh",
@@ -181,7 +183,7 @@ pub fn to_set(sessions: &[Session]) -> ImportSet {
                 .to_string(),
             );
             continue;
-        }
+        };
         let address = text("HostName");
         if address.trim().is_empty() {
             // A session that only keeps settings (no host).
@@ -237,8 +239,9 @@ pub fn to_set(sessions: &[Session]) -> ImportSet {
                 .as_ref()
                 .and_then(|_| Some(text("ProxyPassword")).filter(|p| !p.is_empty())),
             proxy,
-            key_file,
+            key_file: key_file.filter(|_| protocol.is_ssh()),
             notes: notes.join("\n"),
+            protocol,
             ..Default::default()
         });
     }
@@ -331,7 +334,7 @@ mod tests {
             Some(&RegValue::Dword(2222))
         );
         let set = to_set(&sessions);
-        assert_eq!(set.hosts.len(), 2);
+        assert_eq!(set.hosts.len(), 3);
         let web = &set.hosts[0];
         assert_eq!(web.label, "Web prod");
         assert_eq!(web.address, "web.example.com");
@@ -347,10 +350,16 @@ mod tests {
         assert_eq!(proxy.username.as_deref(), Some("ana"));
         assert_eq!(web.proxy_password.as_deref(), Some("s3cr\"et"));
         assert!(web.notes.contains("L8080=localhost:80"));
-        let db = &set.hosts[1];
+        // The telnet session is a Telnet host.
+        let router = &set.hosts[1];
+        assert_eq!(router.label, "router");
+        assert!(router.protocol.is_telnet());
+        assert_eq!(router.port, Some(23));
+        assert!(web.protocol.is_ssh());
+        let db = &set.hosts[2];
         assert_eq!(db.username.as_deref(), Some("postgres"));
         assert!(db.proxy.is_none());
-        // The telnet session and the local-command proxy.
-        assert_eq!(set.warnings.len(), 2, "{:?}", set.warnings);
+        // The local-command proxy.
+        assert_eq!(set.warnings.len(), 1, "{:?}", set.warnings);
     }
 }

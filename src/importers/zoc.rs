@@ -9,7 +9,8 @@
 //!   starts an entry; lines are `key=value` (quotes optional). Keys read:
 //!   `name`/`title`, `connectto`/`host`/`address`, `port`,
 //!   `login`/`username`/`user`, `device`/`connectiontype`/`protocol`
-//!   (entries whose device is Telnet, Serial/Modem, ISDN or Rlogin are
+//!   (Telnet entries are Telnet hosts; those whose device is Serial/Modem,
+//!   ISDN or Rlogin are
 //!   skipped), `folder`/`group`/`path` (`Parent/Child` or `Parent\Child`),
 //!   `comment`/`notes`.
 //! - XML variants: any element with one of those keys as attributes or
@@ -19,8 +20,15 @@
 use std::collections::HashMap;
 
 use super::{ImportHost, ImportSet, csv};
+use termoak_core::model::HostProtocol;
 
-/// Device names of ZOC that are not SSH.
+/// Plain Telnet (not over SSL/TLS): a Telnet host.
+fn is_telnet(device: &str) -> bool {
+    let d = device.to_ascii_lowercase();
+    d.contains("telnet") && !d.contains("ssl") && !d.contains("tls")
+}
+
+/// Device names of ZOC that are neither SSH nor plain Telnet.
 fn not_ssh(device: &str) -> bool {
     let d = device.to_ascii_lowercase();
     [
@@ -54,7 +62,8 @@ fn entry(set: &mut ImportSet, v: &HashMap<String, String>, folder: &str) {
     };
     let label = get(&["name", "title", "entry", "entryname"]);
     let device = get(&["device", "connectiontype", "protocol", "connection"]);
-    if !device.is_empty() && not_ssh(&device) {
+    let telnet = is_telnet(&device);
+    if !device.is_empty() && !telnet && not_ssh(&device) {
         set.warnings.push(
             t!(
                 "import_export.warn.not_ssh",
@@ -83,6 +92,11 @@ fn entry(set: &mut ImportSet, v: &HashMap<String, String>, folder: &str) {
         username: Some(get(&["login", "username", "user", "loginname"])),
         group,
         notes: get(&["comment", "notes", "description", "remark"]),
+        protocol: if telnet {
+            HostProtocol::Telnet
+        } else {
+            HostProtocol::Ssh
+        },
         ..Default::default()
     });
 }
@@ -211,12 +225,13 @@ mod tests {
             connectto=lab.local\n\
             comment=Test box\n";
         let set = parse(text).unwrap();
-        assert_eq!(set.hosts.len(), 3, "{:?}", set.hosts);
+        assert_eq!(set.hosts.len(), 4, "{:?}", set.hosts);
         assert_eq!(set.hosts[0].port, Some(2222));
         assert_eq!(set.hosts[0].label, "web-1");
-        assert_eq!(set.hosts[1].label, "db");
-        assert_eq!(set.hosts[2].notes, "Test box");
-        assert_eq!(set.warnings.len(), 1);
+        assert!(set.hosts[1].protocol.is_telnet());
+        assert_eq!(set.hosts[2].label, "db");
+        assert_eq!(set.hosts[3].notes, "Test box");
+        assert_eq!(set.warnings.len(), 0);
         assert!(parse("hello\nworld\n").is_err());
     }
 
@@ -230,12 +245,13 @@ mod tests {
           <entry name="router" connectto="10.0.0.1" device="Telnet"/>
         </hostdirectory>"#;
         let set = parse(text).unwrap();
-        assert_eq!(set.hosts.len(), 2);
+        assert_eq!(set.hosts.len(), 3);
         assert_eq!(
             set.group_label(set.hosts[0].group.as_deref().unwrap()),
             "Production"
         );
         assert_eq!(set.hosts[1].label, "db");
-        assert_eq!(set.warnings.len(), 1);
+        assert!(set.hosts[2].protocol.is_telnet());
+        assert_eq!(set.warnings.len(), 0);
     }
 }

@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use termoak_client::relay::{LocalTerm, RelayShare};
 use termoak_core::Id;
 use termoak_ssh::terminal::OutputHub;
-use termoak_ssh::{Connection, TerminalSession};
+use termoak_ssh::{Connection, Terminal, TerminalSession};
 
 use self::backend::{Backend, Cmd, LinkJoin, LocalParams, Out, ServerTarget};
 use self::complete::{LineTracker, Suggestions};
@@ -291,7 +291,8 @@ pub struct TerminalView {
     model: TermModel,
     backend: Option<Backend>,
     state: TermState,
-    local: Option<Arc<TerminalSession>>,
+    /// The SSH or Telnet terminal of a host, from this computer.
+    local: Option<Terminal>,
     can_write: bool,
     viewers: usize,
     relay: Option<SharedRelay>,
@@ -672,6 +673,7 @@ impl TerminalView {
                     cols,
                     rows,
                     conn: None,
+                    telnet_auto_login: app.settings.telnet_auto_login,
                 },
             )),
             TermKind::Server {
@@ -764,8 +766,11 @@ impl TerminalView {
                     }
                 }
                 Out::Local(term) => {
-                    if let TermKind::Local { host_id } = self.kind {
-                        let conn = term.connection().clone();
+                    // Tunnels go over SSH (Telnet has none).
+                    if let (TermKind::Local { host_id }, Some(conn)) =
+                        (&self.kind, term.connection())
+                    {
+                        let (host_id, conn) = (*host_id, conn.clone());
                         self.app
                             .update(cx, |m, cx| m.start_auto_forwards(host_id, conn, cx));
                     }
@@ -1247,7 +1252,7 @@ impl TerminalView {
     /// Connection of an SSH terminal from this computer (to reuse it for
     /// SFTP).
     pub fn ssh_connection(&self) -> Option<Arc<Connection>> {
-        self.local.as_ref().map(|t| t.connection().clone())
+        self.local.as_ref().and_then(|t| t.connection().cloned())
     }
 
     /// Whether the session ended or failed (reconnect makes sense).
@@ -1292,6 +1297,13 @@ impl TerminalView {
             TermKind::Server { host_id, .. } => *host_id,
             TermKind::Shell | TermKind::Serial { .. } => None,
         }
+    }
+
+    /// Logo of the host of this terminal, for the pane header (`None`: no
+    /// host, or a host without one).
+    pub fn host_logo(&self, cx: &App) -> Option<gpui_component::Icon> {
+        let id = self.host_id()?;
+        crate::logos::small_icon(self.app.read(cx).host(id)?)
     }
 
     /// Is what is on screen before the cursor the typed line, with nothing to
@@ -2557,14 +2569,11 @@ impl TerminalView {
             return;
         };
         let title = self.label(cx);
+        let source = relay_source(&term, &runtime::handle(cx));
         runtime::run_in(
             cx,
             window,
-            async move {
-                RelayShare::start(&api, term, &title)
-                    .await
-                    .map_err(api_error)
-            },
+            async move { source.start(&api, &title).await.map_err(api_error) },
             |this, res, window, cx| match res {
                 Ok(share) => {
                     this.share_session = Some(share.session_id);
@@ -2613,7 +2622,7 @@ impl TerminalView {
         let api = self.account_api(cx)?;
         let title = t!("terminal.copilot_session_title", host = self.label(cx)).to_string();
         let source = match &self.kind {
-            TermKind::Local { .. } => Err(self.local.clone()?),
+            TermKind::Local { .. } => relay_source(self.local.as_ref()?, &runtime::handle(cx)),
             _ => {
                 // Shell or serial: the output is copied here when painted
                 // (starting with what is already on screen) and what comes
@@ -2631,7 +2640,7 @@ impl TerminalView {
                 });
                 let (closed_tx, closed) = tokio::sync::watch::channel(false);
                 self.local_feed = Some((hub.clone(), closed_tx));
-                Ok(LocalTerm {
+                RelaySource::Local(LocalTerm {
                     hub,
                     input,
                     size: (self.model.cols(), self.model.rows()),
@@ -2639,12 +2648,7 @@ impl TerminalView {
                 })
             }
         };
-        Some(async move {
-            match source {
-                Err(term) => RelayShare::start(&api, term, &title).await,
-                Ok(local) => RelayShare::start_local(&api, local, &title).await,
-            }
-        })
+        Some(async move { source.start(&api, &title).await })
     }
 
     /// The copilot has shared the terminal.
@@ -3017,10 +3021,12 @@ impl TerminalView {
         let ai_ready = logged_in || self.ai_local(cx).is_some();
         let is_server = matches!(self.kind, TermKind::Server { .. });
         let is_shell = matches!(self.kind, TermKind::Shell);
+        // SFTP: SSH hosts only.
         let local_host = match &self.kind {
-            TermKind::Local { host_id } => Some(*host_id),
+            TermKind::Local { host_id } if !self.app.read(cx).is_telnet(*host_id) => Some(*host_id),
             _ => None,
         };
+        let logo = self.host_logo(cx);
         let weak: WeakEntity<Self> = cx.entity().downgrade();
         // In a split view the panes are narrow: icons only, and copy/paste
         // stay in the right-click menu.
@@ -3075,6 +3081,9 @@ impl TerminalView {
                             })
                     })
                     .child(div().size(px(8.)).rounded_full().bg(dot))
+                    .when_some(logo, |this, icon| {
+                        this.child(icon.size(px(14.)).text_color(theme.muted_foreground))
+                    })
                     .child(
                         div()
                             .text_sm()
@@ -3149,7 +3158,7 @@ impl TerminalView {
                 )
             })
             .when_some(local_host, |this, host_id| {
-                let conn = self.local.as_ref().map(|t| t.connection().clone());
+                let conn = self.local.as_ref().and_then(|t| t.connection().cloned());
                 this.child(
                     Button::new("sftp")
                         .small()
@@ -3598,5 +3607,56 @@ fn local_os() -> String {
         "macos" => "macOS".into(),
         "windows" => "Windows".into(),
         other => other.to_string(),
+    }
+}
+
+/// What a terminal of this computer shares through the relay: the SSH
+/// session itself, or the output and input of any other terminal.
+enum RelaySource {
+    Ssh(Arc<TerminalSession>),
+    Local(LocalTerm),
+}
+
+impl RelaySource {
+    async fn start(
+        self,
+        api: &termoak_client::ApiClient,
+        title: &str,
+    ) -> termoak_client::Result<RelayShare> {
+        match self {
+            RelaySource::Ssh(term) => RelayShare::start(api, term, title).await,
+            RelaySource::Local(local) => RelayShare::start_local(api, local, title).await,
+        }
+    }
+}
+
+/// [`RelaySource`] of a host terminal: a Telnet one shares its output hub,
+/// with its input and end forwarded.
+fn relay_source(term: &Terminal, rt: &tokio::runtime::Handle) -> RelaySource {
+    match term {
+        Terminal::Ssh(t) => RelaySource::Ssh(t.clone()),
+        Terminal::Telnet(t) => {
+            let (input, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+            let writer = t.clone();
+            rt.spawn(async move {
+                while let Some(data) = input_rx.recv().await {
+                    if writer.write(data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let (closed_tx, closed) = tokio::sync::watch::channel(false);
+            let mut status = t.watch_status();
+            rt.spawn(async move {
+                let _ = status.wait_for(|s| s.is_closed()).await;
+                let _ = closed_tx.send(true);
+            });
+            RelaySource::Local(LocalTerm {
+                hub: t.hub().clone(),
+                input,
+                size: t.size(),
+                closed,
+            })
+        }
     }
 }

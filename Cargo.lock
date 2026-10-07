@@ -8293,8 +8293,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.5.0-next.1"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
+version = "0.5.0-next.2"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.2#6e07ed6dc5d91748cade8c1021738d128252a302"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8319,8 +8319,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.5.0-next.1"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
+version = "0.5.0-next.2"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.2#6e07ed6dc5d91748cade8c1021738d128252a302"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8346,8 +8346,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.5.0-next.1"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
+version = "0.5.0-next.2"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.2#6e07ed6dc5d91748cade8c1021738d128252a302"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -8423,8 +8423,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.5.0-next.1"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
+version = "0.5.0-next.2"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.2#6e07ed6dc5d91748cade8c1021738d128252a302"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8441,12 +8441,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
 name = "termoak-update"
-version = "0.5.0-next.1"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.1#8831bdf9da579372f40f30938c80ddafa89f99e4"
+version = "0.5.0-next.2"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.5.0-next.2#6e07ed6dc5d91748cade8c1021738d128252a302"
 dependencies = [
  "base64 0.22.1",
  "chrono",

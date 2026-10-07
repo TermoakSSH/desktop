@@ -68,6 +68,10 @@ impl TerminalView {
                 self.insert_text(&format!("{text} "), cx);
             }
             TermKind::Serial { .. } => {}
+            // Telnet has no SFTP.
+            TermKind::Local { host_id } if self.app.read(cx).is_telnet(host_id) => {
+                ui::notify(window, cx, ToastKind::Info, t!("telnet.no_sftp"))
+            }
             TermKind::Local { host_id } => self.confirm_upload(host_id, paths, window, cx),
             TermKind::Server {
                 host_id: Some(host_id),

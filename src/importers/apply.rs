@@ -133,7 +133,11 @@ impl PlaceData {
                 ExistingHost {
                     id: h.id,
                     label: h.label.clone(),
-                    key: DupKey::new(&h.address, port.unwrap_or(22), user.as_deref()),
+                    key: DupKey::new(
+                        &h.address,
+                        port.unwrap_or(h.protocol.default_port()),
+                        user.as_deref(),
+                    ),
                 }
             })
             .collect()
@@ -491,6 +495,11 @@ pub async fn run(ws: Workspace, req: Request) -> Result<Summary, String> {
         if h.port.is_some() {
             settings.port = h.port;
         }
+        // Telnet hosts keep their port written out (see
+        // `HostProtocol::switch_port`).
+        if h.protocol.is_telnet() && settings.port.is_none() {
+            settings.port = Some(h.protocol.default_port());
+        }
         if h.username.is_some() {
             settings.username = h.username.clone();
         }
@@ -566,6 +575,8 @@ pub async fn run(ws: Workspace, req: Request) -> Result<Summary, String> {
                     os: h.os.clone(),
                     os_version: h.os_version.clone(),
                     favorite: h.favorite,
+                    protocol: h.protocol.clone(),
+                    icon: h.icon.clone(),
                 };
                 let id = save(&ws, target, host, secret(None)).await?;
                 s.created += 1;
@@ -742,6 +753,7 @@ pub async fn gather(ws: Workspace, req: ExportRequest) -> Result<Gathered, Strin
             group: data.group_path(h.group_id),
             tags: h.tags.clone(),
             notes: h.notes.clone(),
+            protocol: h.protocol.as_str().to_string(),
         })
         .collect();
     file.hosts = hosts;
@@ -830,6 +842,8 @@ mod tests {
                 os: None,
                 os_version: None,
                 favorite: false,
+                protocol: Default::default(),
+                icon: None,
             }],
             ..Default::default()
         };
