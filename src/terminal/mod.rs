@@ -3,6 +3,7 @@
 //! selection, copy/paste, session sharing, command autocompletion and quick
 //! AI actions. Used for SSH, server sessions and the local terminal.
 
+pub mod ai_assist;
 pub mod backend;
 pub mod command_watch;
 pub mod complete;
@@ -15,6 +16,7 @@ pub mod model;
 pub mod mouse;
 mod osc7;
 pub mod paste;
+pub mod redact;
 pub mod serial;
 mod share_ui;
 pub mod shell;
@@ -91,7 +93,16 @@ gpui::actions!(
         /// Find bar: upper and lower case are different (or not).
         ToggleFindCase,
         /// Find bar: the text is a regular expression (or not).
-        ToggleFindRegex
+        ToggleFindRegex,
+        /// Opens the copilot with the selection (and the terminal's context).
+        AskAiSelection,
+        /// Explains the selected text with the AI (in the copilot).
+        ExplainSelection,
+        /// Explains the selected error with the AI (in the copilot).
+        ExplainSelectionError,
+        /// A `# <request>` line at the prompt becomes the command the AI
+        /// suggests (typed, never run).
+        AiCommandFromLine
     ]
 );
 
@@ -125,6 +136,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-alt-r", ToggleFindRegex, Some(FIND_CONTEXT)),
         // ⌘K opens the command palette (see `app::init`).
         KeyBinding::new("cmd-shift-k", ClearTerminal, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-e", ExplainSelection, Some(CONTEXT)),
+        KeyBinding::new("cmd-enter", AiCommandFromLine, Some(CONTEXT)),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -140,6 +153,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("alt-c", ToggleFindCase, Some(FIND_CONTEXT)),
         KeyBinding::new("alt-r", ToggleFindRegex, Some(FIND_CONTEXT)),
         KeyBinding::new("ctrl-shift-k", ClearTerminal, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-e", ExplainSelection, Some(CONTEXT)),
+        // Ctrl+Enter was a plain Enter: it still is unless the line is a
+        // `# request` (see `on_ai_command_from_line`).
+        KeyBinding::new("ctrl-enter", AiCommandFromLine, Some(CONTEXT)),
         // Ctrl+K belongs to the shell (kill to the end of the line, nano's
         // cut): elsewhere it opens the command palette (see `app::init`).
         KeyBinding::new("ctrl-k", send("\x0b"), Some(CONTEXT)),
@@ -221,7 +238,121 @@ pub enum TerminalEvent {
     /// its threshold, not a full-screen program). The window tells about it
     /// if the terminal is out of sight.
     CommandFinished(crate::notifications::CommandDone),
+    /// Open this terminal's copilot for this.
+    Copilot(CopilotRequest),
 }
+
+/// What a terminal asks of its copilot.
+#[derive(Debug, Clone)]
+pub enum CopilotRequest {
+    /// Open it with the terminal's context (and the selection) to ask
+    /// something about it.
+    Ask,
+    /// Open it and explain this (a quick answer, with the context).
+    Explain(ExplainRequest),
+}
+
+/// Something to explain in the copilot.
+#[derive(Debug, Clone)]
+pub struct ExplainRequest {
+    /// Heading of the answer ("Why did `make` fail?").
+    pub title: String,
+    /// What is explained, as the AI gets it (secrets already hidden).
+    pub text: String,
+    /// What to ask about it (in the user's language).
+    pub question: String,
+}
+
+/// The quick assistant of a terminal (`/ai/suggest`, `/ai/explain`): on
+/// this computer ("This computer" in Settings → AI) or the server of the
+/// terminal's account.
+#[derive(Clone)]
+pub enum Assist {
+    Local(termoak_core::Store, crate::local_ai::AiSettings),
+    Server(termoak_client::ApiClient),
+}
+
+impl Assist {
+    /// A command for a request: `command`, `explanation`, `risk`.
+    pub async fn suggest(self, request: String, context: Value) -> Result<Value, String> {
+        match self {
+            Assist::Local(store, settings) => {
+                crate::local_ai::copilot::suggest(&store, &settings, &request, context).await
+            }
+            Assist::Server(api) => api
+                .post::<Value>(
+                    "/api/v1/ai/suggest",
+                    &json!({"request": request, "context": context}),
+                )
+                .await
+                .map_err(api_error),
+        }
+    }
+
+    /// Explains a text: `answer`, `provider`.
+    pub async fn explain(
+        self,
+        text: String,
+        question: Option<String>,
+        context: Value,
+    ) -> Result<Value, String> {
+        match self {
+            Assist::Local(store, settings) => {
+                crate::local_ai::copilot::explain(
+                    &store,
+                    &settings,
+                    &text,
+                    question.as_deref(),
+                    context,
+                )
+                .await
+            }
+            Assist::Server(api) => {
+                let mut body = json!({"text": text, "context": context});
+                if let Some(q) = question {
+                    body["question"] = json!(q);
+                }
+                api.post::<Value>("/api/v1/ai/explain", &body)
+                    .await
+                    .map_err(api_error)
+            }
+        }
+    }
+}
+
+/// A command the AI proposes in the terminal (Fix, or a `# request`): it
+/// is only typed when the user accepts it, and never run.
+struct Proposal {
+    /// The `# request` line it replaces (if it is still the typed line).
+    line: Option<String>,
+    state: ProposalState,
+}
+
+enum ProposalState {
+    Asking,
+    Ready(Suggested),
+    /// Already typed in place of the `# request` line: shown until the
+    /// next key.
+    Typed(Suggested),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct Suggested {
+    command: String,
+    explanation: String,
+    /// `read`, `write` or `dangerous`.
+    risk: String,
+}
+
+impl Suggested {
+    fn dangerous(&self) -> bool {
+        self.risk == "dangerous"
+    }
+}
+
+/// How long the "command failed" chip stays.
+const FAILED_CHIP_FOR: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// User input repeated in the other panes while broadcasting. It is kept as
 /// what the user did (a key, text, a paste) and not as bytes, so each
@@ -360,6 +491,16 @@ pub struct TerminalView {
     command_tick: Option<Task<()>>,
     /// Files dropped on it being uploaded.
     uploads: drop_upload::Uploads,
+    /// Output of the command running and of the last one (for the AI).
+    capture: ai_assist::Capture,
+    /// The last command that ended (for the AI).
+    last_command: Option<ai_assist::LastCommand>,
+    /// "Command failed · Explain · Fix" chip, with the timer that hides it.
+    failed_chip: Option<(ai_assist::LastCommand, Task<()>)>,
+    /// Command the AI proposes (never run by itself).
+    proposal: Option<Proposal>,
+    /// Requests for proposals made so far (an old answer is ignored).
+    proposal_gen: u64,
     _reader: Option<Task<()>>,
 }
 
@@ -424,6 +565,11 @@ impl TerminalView {
             marks: command_watch::MarkScanner::default(),
             command_tick: None,
             uploads: drop_upload::Uploads::default(),
+            capture: ai_assist::Capture::default(),
+            last_command: None,
+            failed_chip: None,
+            proposal: None,
+            proposal_gen: 0,
             _reader: None,
         }
     }
@@ -829,7 +975,14 @@ impl TerminalView {
                     {
                         let _ = tap.send(bytes.clone());
                     }
-                    let marks = self.marks.scan(&bytes);
+                    let at = self.marks.scan_at(&bytes);
+                    // What the command running prints, for the AI.
+                    self.capture.feed(&bytes, &at);
+                    if at.iter().any(|(_, m)| *m == command_watch::Mark::Executed) {
+                        // A new command: the chip of the last one goes.
+                        self.failed_chip = None;
+                    }
+                    let marks: Vec<command_watch::Mark> = at.into_iter().map(|(_, m)| m).collect();
                     let events = self.model.feed(&bytes);
                     if let Some(b) = &self.backend {
                         b.consumed(bytes.len());
@@ -838,7 +991,7 @@ impl TerminalView {
                     let alt = self.model.mode().contains(TermMode::ALT_SCREEN);
                     if let Some(done) = self.commands.output(std::time::Instant::now(), &marks, alt)
                     {
-                        self.command_finished(done, cx);
+                        self.command_finished(done, None, cx);
                     }
                     self.handle_term_events(events, cx);
                     // When leaving vim, less... the shell paints a new line.
@@ -997,7 +1150,12 @@ impl TerminalView {
                 .as_deref()
                 .and_then(|line| before.strip_suffix(line))
                 .map(str::to_string);
-            self.commands.enter(std::time::Instant::now(), sent, prompt);
+            if self.commands.enter(std::time::Instant::now(), sent, prompt) {
+                // Without shell integration its output starts now.
+                self.capture.begin();
+            }
+            // The next command: the chip of the last one goes.
+            self.failed_chip = None;
             self.watch_for_prompt(cx);
         }
         self.write(bytes, cx);
@@ -1021,7 +1179,8 @@ impl TerminalView {
                     let (before, after_blank) = this.model.text_around_cursor(300);
                     let now = std::time::Instant::now();
                     if let Some(done) = this.commands.idle(now, alt, &before, after_blank) {
-                        this.command_finished(done, cx);
+                        this.capture.finish();
+                        this.command_finished(done, Some(&before), cx);
                     }
                     let waiting = this.commands.waiting_for_prompt();
                     if !waiting {
@@ -1036,9 +1195,42 @@ impl TerminalView {
         }));
     }
 
-    /// A command ended: the window is told if it was long (and these
-    /// notices are on).
-    fn command_finished(&mut self, done: command_watch::Finished, cx: &mut Context<Self>) {
+    /// A command ended: it is kept for the AI (with what it printed; `prompt`
+    /// is the prompt it ended with, without shell integration), the chip
+    /// offers to explain or fix it if it failed, and the window is told if
+    /// it was long (and these notices are on).
+    fn command_finished(
+        &mut self,
+        done: command_watch::Finished,
+        prompt: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let output = match self.capture.take_last() {
+            _ if done.interactive => String::new(),
+            Some(raw) => ai_assist::output_text(&raw, prompt),
+            // Its start was not seen: the end of the screen instead.
+            None => ai_assist::screen_tail(&self.model.screen_text()),
+        };
+        let failure = ai_assist::failure(&ai_assist::ChipInput {
+            enabled: self.app.read(cx).settings.ai_failed_chip,
+            ai_ready: self.assist(cx).is_some(),
+            command: done.command.as_deref(),
+            exit: done.exit,
+            interactive: done.interactive,
+            output: &output,
+        });
+        if !done.interactive {
+            let last = ai_assist::LastCommand {
+                command: done.command.clone(),
+                exit: done.exit,
+                output,
+                failure,
+            };
+            if failure.is_some() {
+                self.show_failed_chip(last.clone(), cx);
+            }
+            self.last_command = Some(last);
+        }
         let prefs = self.app.read(cx).settings.notifications;
         if !prefs.commands || !done.worth_notifying(prefs.command_threshold()) {
             return;
@@ -1058,6 +1250,9 @@ impl TerminalView {
         self.commands.reset();
         self.marks = command_watch::MarkScanner::default();
         self.command_tick = None;
+        self.capture.reset();
+        self.failed_chip = None;
+        self.proposal = None;
     }
 
     /// Special keys, Ctrl and Alt. Normal text is not handled here: it goes
@@ -1066,6 +1261,10 @@ impl TerminalView {
     fn on_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keys typed in the find bar are not for the terminal.
         if !self.focus.is_focused(window) {
+            return;
+        }
+        if self.proposal_key(ev, window, cx) {
+            cx.stop_propagation();
             return;
         }
         if self.suggestion_key(ev, cx) {
@@ -1108,6 +1307,7 @@ impl TerminalView {
         if self.model.has_selection() {
             self.model.clear_selection();
         }
+        self.typing_dismisses_proposal(cx);
         self.emit_broadcast(BroadcastInput::Text(text.to_string()), cx);
         self.write_input(input::text_bytes(text), cx);
     }
@@ -2176,6 +2376,7 @@ impl TerminalView {
     ) {
         let has_selection = self.model.has_selection();
         let writable = self.writable();
+        let ai_ready = self.assist(cx).is_some();
         let split = self.pane.is_some();
         let broadcasting = self.pane.is_some_and(|p| p.broadcasting);
         let focus = self.focus.clone();
@@ -2199,6 +2400,28 @@ impl TerminalView {
                     Box::new(PasteSelection),
                     !has_selection || !writable,
                 )
+                // With a selection: ask the AI about it.
+                .when(has_selection, |menu| {
+                    menu.separator()
+                        .menu_with_icon_and_disabled(
+                            t!("terminal.menu.ask_ai"),
+                            IconName::Sparkles,
+                            Box::new(AskAiSelection),
+                            !ai_ready,
+                        )
+                        .menu_with_icon_and_disabled(
+                            t!("terminal.menu.explain"),
+                            IconName::BookOpen,
+                            Box::new(ExplainSelection),
+                            !ai_ready,
+                        )
+                        .menu_with_icon_and_disabled(
+                            t!("terminal.menu.explain_error"),
+                            IconName::TriangleAlert,
+                            Box::new(ExplainSelectionError),
+                            !ai_ready,
+                        )
+                })
                 .separator()
                 .menu(t!("terminal.menu.select_all"), Box::new(SelectAll))
                 .menu_with_icon(t!("terminal.menu.find"), IconName::Search, Box::new(Find))
@@ -2692,30 +2915,83 @@ impl TerminalView {
             .then(|| (app.ws.store.clone(), app.settings.ai.clone()))
     }
 
-    fn ai_context(&self, cx: &App) -> Value {
-        let os = match &self.kind {
-            TermKind::Local { host_id } => {
-                self.app.read(cx).host(*host_id).and_then(|h| h.os.clone())
-            }
-            TermKind::Server {
-                host_id: Some(h), ..
-            } => self.app.read(cx).host(*h).and_then(|h| h.os.clone()),
+    /// The quick assistant for this terminal, if there is one (AI on this
+    /// computer, or signed in to the server).
+    pub fn assist(&self, cx: &App) -> Option<Assist> {
+        match self.ai_local(cx) {
+            Some((store, settings)) => Some(Assist::Local(store, settings)),
+            None => self.account_api(cx).map(Assist::Server),
+        }
+    }
+
+    /// Operating system of the host (detected) or of this computer.
+    fn ai_os(&self, cx: &App) -> Option<String> {
+        match &self.kind {
+            TermKind::Local { host_id }
+            | TermKind::Server {
+                host_id: Some(host_id),
+                ..
+            } => self.app.read(cx).host(*host_id).and_then(|h| h.os.clone()),
             TermKind::Shell => Some(local_os()),
             _ => None,
-        };
+        }
+    }
+
+    /// Context for the quick assistant: the system, the shell's directory
+    /// (OSC 7) and the end of the screen (with its secrets hidden).
+    pub fn ai_context(&self, cx: &App) -> Value {
         let screen = self.model.screen_text();
         let tail: String = {
             let chars: Vec<char> = screen.chars().collect();
             chars[chars.len().saturating_sub(3000)..].iter().collect()
         };
-        json!({"os": os, "screen": tail})
+        json!({
+            "os": self.ai_os(cx),
+            "cwd": self.model.cwd(),
+            "screen": redact::redact(&tail),
+        })
+    }
+
+    /// The terminal's context for its copilot, as chips the user can remove
+    /// before sending: the host and its system, the directory, the last
+    /// command (its status and the end of its output) and the selection.
+    pub fn copilot_chips(&self, cx: &App) -> Vec<ai_assist::ContextChip> {
+        use ai_assist::{ContextChip, short};
+        let mut chips = vec![ContextChip::host(
+            &self.label(cx),
+            self.ai_os(cx).as_deref(),
+        )];
+        if let Some(cwd) = self.model.cwd() {
+            chips.push(ContextChip::directory(cwd));
+        }
+        if let Some(last) = &self.last_command
+            && let Some(command) = &last.command
+        {
+            let command = short(command, 32, false);
+            let label = match last.exit {
+                Some(code) => t!(
+                    "ai_chat.context.command_exit",
+                    command = command,
+                    code = code
+                )
+                .to_string(),
+                None => command,
+            };
+            chips.push(ContextChip::last_command(last, label));
+        }
+        if let Some(text) = self.model.selection_text().filter(|t| !t.trim().is_empty()) {
+            let lines = text.trim_end().lines().count();
+            chips.push(ContextChip::selection(
+                &text,
+                tn!("ai_chat.context.selection", lines).to_string(),
+            ));
+        }
+        chips
     }
 
     /// Explains the selection (or the visible screen) with the server AI.
     pub fn ai_explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let local = self.ai_local(cx);
-        let api = self.account_api(cx);
-        if local.is_none() && api.is_none() {
+        let Some(assist) = self.assist(cx) else {
             ui::notify(
                 window,
                 cx,
@@ -2723,7 +2999,7 @@ impl TerminalView {
                 t!("terminal.ai.not_signed_in"),
             );
             return;
-        }
+        };
         let text = self
             .model
             .selection_text()
@@ -2741,6 +3017,7 @@ impl TerminalView {
             let chars: Vec<char> = text.chars().collect();
             chars[chars.len().saturating_sub(6000)..].iter().collect()
         };
+        let text = redact::redact(&text);
         let context = self.ai_context(cx);
         self.ai_busy = true;
         cx.notify();
@@ -2748,21 +3025,7 @@ impl TerminalView {
         runtime::run_in(
             cx,
             window,
-            async move {
-                match (local, api) {
-                    (Some((store, settings)), _) => {
-                        crate::local_ai::copilot::explain(&store, &settings, &text, context).await
-                    }
-                    (None, Some(api)) => api
-                        .post::<Value>(
-                            "/api/v1/ai/explain",
-                            &json!({"text": text, "context": context}),
-                        )
-                        .await
-                        .map_err(api_error),
-                    (None, None) => Err(t!("terminal.ai.not_signed_in").to_string()),
-                }
-            },
+            assist.explain(text, None, context),
             |this, res, window, cx| {
                 this.ai_busy = false;
                 cx.notify();
@@ -2814,7 +3077,7 @@ impl TerminalView {
 
     /// Asks the AI for a command and inserts it without running it.
     pub fn ai_suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ai_local(cx).is_none() && self.account_api(cx).is_none() {
+        if self.assist(cx).is_none() {
             ui::notify(
                 window,
                 cx,
@@ -2829,6 +3092,14 @@ impl TerminalView {
         ui::focus_later(&input, window, cx);
         let weak = cx.entity().downgrade();
         let input_ok = input.clone();
+        let tip = t!(
+            "terminal.ai.suggest_tip",
+            shortcut = if cfg!(target_os = "macos") {
+                "⌘↵"
+            } else {
+                "Ctrl+Enter"
+            }
+        );
         ui::open_form_dialog(
             window,
             cx,
@@ -2845,6 +3116,12 @@ impl TerminalView {
                             .child(t!("terminal.ai.suggest_hint")),
                     )
                     .child(Input::new(&input))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(tip.clone()),
+                    )
                     .into_any_element()
             },
             move |window, cx| {
@@ -2861,33 +3138,16 @@ impl TerminalView {
     }
 
     fn request_suggestion(&mut self, request: String, window: &mut Window, cx: &mut Context<Self>) {
-        let local = self.ai_local(cx);
-        let api = self.account_api(cx);
-        if local.is_none() && api.is_none() {
+        let Some(assist) = self.assist(cx) else {
             return;
-        }
+        };
         let context = self.ai_context(cx);
         self.ai_busy = true;
         cx.notify();
         runtime::run_in(
             cx,
             window,
-            async move {
-                match (local, api) {
-                    (Some((store, settings)), _) => {
-                        crate::local_ai::copilot::suggest(&store, &settings, &request, context)
-                            .await
-                    }
-                    (None, Some(api)) => api
-                        .post::<Value>(
-                            "/api/v1/ai/suggest",
-                            &json!({"request": request, "context": context}),
-                        )
-                        .await
-                        .map_err(api_error),
-                    (None, None) => Err(t!("terminal.ai.not_signed_in").to_string()),
-                }
-            },
+            assist.suggest(request, context),
             |this, res, window, cx| {
                 this.ai_busy = false;
                 cx.notify();
@@ -2900,7 +3160,8 @@ impl TerminalView {
     }
 
     fn show_suggestion(&mut self, v: Value, window: &mut Window, cx: &mut Context<Self>) {
-        let command: SharedString = v["command"].as_str().unwrap_or("").to_string().into();
+        let command: SharedString =
+            ai_assist::typeable_command(v["command"].as_str().unwrap_or("")).into();
         if command.trim().is_empty() {
             ui::notify(window, cx, ToastKind::Warning, t!("terminal.ai.no_command"));
             return;
@@ -2909,11 +3170,7 @@ impl TerminalView {
         let risk = v["risk"].as_str().unwrap_or("read").to_string();
         let weak = cx.entity().downgrade();
         window.open_dialog(cx, move |d, _, cx| {
-            let (risk_label, risk_color) = match risk.as_str() {
-                "dangerous" => (t!("terminal.ai.risk_dangerous"), cx.theme().danger),
-                "write" => (t!("terminal.ai.risk_write"), cx.theme().warning),
-                _ => (t!("terminal.ai.risk_read"), cx.theme().success),
-            };
+            let (risk_label, risk_color) = risk_badge(&risk, cx);
             let insert_cmd = command.clone();
             let copy_cmd = command.clone();
             let weak = weak.clone();
@@ -2965,6 +3222,603 @@ impl TerminalView {
                         ),
                 )
         });
+    }
+
+    // ----- AI: failed commands, selection, `# request` -----
+
+    /// Shows the "command failed" chip for a while (until the next command).
+    fn show_failed_chip(&mut self, last: ai_assist::LastCommand, cx: &mut Context<Self>) {
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FAILED_CHIP_FOR).await;
+            let _ = this.update(cx, |v, cx| {
+                v.failed_chip = None;
+                cx.notify();
+            });
+        });
+        self.failed_chip = Some((last, timer));
+        cx.notify();
+    }
+
+    /// The failed command the chip shows, or else the last one if it failed.
+    fn failed_command(&self) -> Option<ai_assist::LastCommand> {
+        self.failed_chip
+            .as_ref()
+            .map(|(l, _)| l.clone())
+            .or_else(|| self.last_command.clone().filter(|l| l.failure.is_some()))
+    }
+
+    /// Explain (chip): the copilot explains why the command failed.
+    fn explain_failed(&mut self, cx: &mut Context<Self>) {
+        let Some(last) = self.failed_command() else {
+            return;
+        };
+        self.failed_chip = None;
+        let command = last.command.clone().unwrap_or_default();
+        let question = match last.exit {
+            Some(code) => t!("terminal.ai_ask.failed_exit", code = code),
+            None => t!("terminal.ai_ask.failed"),
+        };
+        cx.emit(TerminalEvent::Copilot(CopilotRequest::Explain(
+            ExplainRequest {
+                title: t!(
+                    "terminal.ai_ask.failed_title",
+                    command = ai_assist::short(&command, 48, false)
+                )
+                .to_string(),
+                text: last.for_ai(),
+                question: question.to_string(),
+            },
+        )));
+        cx.notify();
+    }
+
+    /// Fix (chip): asks for a corrected command and shows it, to be typed
+    /// (never run) if the user accepts it.
+    fn fix_failed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(last) = self.failed_command() else {
+            return;
+        };
+        self.failed_chip = None;
+        let command = last.command.clone().unwrap_or_default();
+        let request = t!("terminal.ai_ask.fix", command = redact::redact(&command)).to_string();
+        let mut context = self.ai_context(cx);
+        // What the command printed is the screen that matters.
+        context["screen"] = json!(last.for_ai());
+        self.start_proposal(request, context, None, window, cx);
+    }
+
+    /// Asks the AI for a command and shows it in the proposal bar.
+    fn start_proposal(
+        &mut self,
+        request: String,
+        context: Value,
+        line: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(assist) = self.assist(cx) else {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.ai.not_signed_in"),
+            );
+            return;
+        };
+        self.proposal_gen += 1;
+        let generation = self.proposal_gen;
+        self.proposal = Some(Proposal {
+            line,
+            state: ProposalState::Asking,
+        });
+        cx.notify();
+        runtime::run_in(
+            cx,
+            window,
+            assist.suggest(request, context),
+            move |this, res, _, cx| {
+                if this.proposal_gen != generation || this.proposal.is_none() {
+                    return;
+                }
+                match res {
+                    Ok(v) => this.proposal_ready(&v, cx),
+                    Err(e) => {
+                        if let Some(p) = this.proposal.as_mut() {
+                            p.state = ProposalState::Failed(e);
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// The AI answered: a `# request` still at the prompt is replaced at
+    /// once (unless the command is dangerous: that one waits for a
+    /// confirmation); anything else waits for Enter or a click.
+    fn proposal_ready(&mut self, v: &Value, cx: &mut Context<Self>) {
+        let command = ai_assist::typeable_command(v["command"].as_str().unwrap_or(""));
+        let Some(p) = self.proposal.as_mut() else {
+            return;
+        };
+        if command.is_empty() {
+            p.state = ProposalState::Failed(t!("terminal.ai.no_command").to_string());
+            return;
+        }
+        let suggested = Suggested {
+            command,
+            explanation: v["explanation"].as_str().unwrap_or("").trim().to_string(),
+            risk: v["risk"].as_str().unwrap_or("write").to_string(),
+        };
+        let replace = p.line.clone().filter(|_| !suggested.dangerous());
+        match replace {
+            Some(line) if self.is_current_line(&line) => {
+                self.replace_line(&line, &suggested.command, cx);
+                if let Some(p) = self.proposal.as_mut() {
+                    p.state = ProposalState::Typed(suggested);
+                }
+            }
+            _ => {
+                if let Some(p) = self.proposal.as_mut() {
+                    p.state = ProposalState::Ready(suggested);
+                }
+            }
+        }
+    }
+
+    /// Is this the line being typed, with the cursor at its end and as the
+    /// screen shows it?
+    fn is_current_line(&self, line: &str) -> bool {
+        self.line.current().as_deref() == Some(line)
+            && self.line.at_end()
+            && self.line_on_screen(line)
+            && !self.model.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Replaces the typed line with `command` (erased with Backspace, which
+    /// every shell understands), without Enter.
+    fn replace_line(&mut self, line: &str, command: &str, cx: &mut Context<Self>) {
+        let n = line.chars().count();
+        if n > 0 {
+            self.write_input(vec![0x7f; n], cx);
+        }
+        self.insert_text(command, cx);
+    }
+
+    /// Enter or a click on the proposal: types the command (a dangerous one
+    /// only after confirming).
+    fn accept_proposal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Proposal {
+            state: ProposalState::Ready(s),
+            ..
+        }) = &self.proposal
+        else {
+            return;
+        };
+        if !s.dangerous() {
+            self.type_proposal(cx);
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let message = format!("{}\n\n{}", s.command, s.explanation);
+        ui::confirm(
+            window,
+            cx,
+            t!("terminal.ai_bar.dangerous_title"),
+            message.trim().to_string(),
+            t!("terminal.ai_bar.insert_anyway"),
+            true,
+            move |window, cx| {
+                if let Some(v) = weak.upgrade() {
+                    v.update(cx, |v, cx| {
+                        v.type_proposal(cx);
+                        v.focus.focus(window, cx);
+                    });
+                }
+            },
+        );
+    }
+
+    /// Types the proposed command (in place of its `# request` line if
+    /// that is still the line), without Enter.
+    fn type_proposal(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.proposal.take() else {
+            return;
+        };
+        let ProposalState::Ready(s) = p.state else {
+            self.proposal = Some(p);
+            return;
+        };
+        match p.line.filter(|l| self.is_current_line(l)) {
+            Some(line) => self.replace_line(&line, &s.command, cx),
+            None => self.insert_text(&s.command, cx),
+        }
+        cx.notify();
+    }
+
+    /// Keys while a proposal is shown: Enter types it, Escape closes it,
+    /// anything else closes it (unless the AI is still thinking) and goes
+    /// on to the terminal as usual.
+    fn proposal_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(p) = &self.proposal else {
+            return false;
+        };
+        let m = &ev.keystroke.modifiers;
+        let plain = !m.control && !m.alt && !m.shift && !m.platform && !m.function;
+        match ev.keystroke.key.as_str() {
+            "enter" if plain && matches!(p.state, ProposalState::Ready(_)) => {
+                self.accept_proposal(window, cx);
+                true
+            }
+            "escape" if plain => {
+                self.proposal = None;
+                cx.notify();
+                true
+            }
+            _ => {
+                self.typing_dismisses_proposal(cx);
+                false
+            }
+        }
+    }
+
+    /// Typing closes a proposal that is not waiting for the AI.
+    fn typing_dismisses_proposal(&mut self, cx: &mut Context<Self>) {
+        if self
+            .proposal
+            .as_ref()
+            .is_some_and(|p| !matches!(p.state, ProposalState::Asking))
+        {
+            self.proposal = None;
+            cx.notify();
+        }
+    }
+
+    /// Cmd/Ctrl+Enter: a `# <request>` line becomes the command the AI
+    /// suggests. Any other line gets the key as before (Enter).
+    fn on_ai_command_from_line(
+        &mut self,
+        _: &AiCommandFromLine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window) || !self.writable() {
+            cx.propagate();
+            return;
+        }
+        let line = self
+            .line
+            .current()
+            .filter(|l| self.is_current_line(l) && ai_assist::nl_request(l).is_some());
+        let Some(line) = line else {
+            cx.propagate();
+            return;
+        };
+        // Typed in the terminal: its obvious secrets are hidden too.
+        let request = redact::redact(ai_assist::nl_request(&line).unwrap_or_default());
+        let context = self.ai_context(cx);
+        self.start_proposal(request, context, Some(line), window, cx);
+    }
+
+    /// The selection, as the AI gets it (its end, secrets hidden).
+    fn selection_for_ai(&self) -> Option<String> {
+        let text = self
+            .model
+            .selection_text()
+            .filter(|t| !t.trim().is_empty())?;
+        Some(redact::redact(&ai_assist::tail_lines(
+            text.trim_end(),
+            200,
+            6000,
+        )))
+    }
+
+    /// Explains the selection in the copilot (`error`: as an error). With
+    /// nothing selected, the failed command if there is one.
+    fn explain_selection(&mut self, error: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.assist(cx).is_none() {
+            ui::notify(
+                window,
+                cx,
+                ToastKind::Warning,
+                t!("terminal.ai.not_signed_in"),
+            );
+            return;
+        }
+        let Some(text) = self.selection_for_ai() else {
+            if self.failed_command().is_some() {
+                self.explain_failed(cx);
+            } else {
+                ui::notify(window, cx, ToastKind::Info, t!("terminal.no_selection"));
+            }
+            return;
+        };
+        let (title, question) = if error {
+            (
+                t!("terminal.ai_ask.error_title"),
+                t!("terminal.ai_ask.error"),
+            )
+        } else {
+            (
+                t!("terminal.ai_ask.selection_title"),
+                t!("terminal.ai_ask.selection"),
+            )
+        };
+        cx.emit(TerminalEvent::Copilot(CopilotRequest::Explain(
+            ExplainRequest {
+                title: title.to_string(),
+                text,
+                question: question.to_string(),
+            },
+        )));
+    }
+
+    fn on_explain_selection(
+        &mut self,
+        _: &ExplainSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.explain_selection(false, window, cx);
+    }
+
+    fn on_explain_selection_error(
+        &mut self,
+        _: &ExplainSelectionError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.explain_selection(true, window, cx);
+    }
+
+    fn on_ask_ai_selection(&mut self, _: &AskAiSelection, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TerminalEvent::Copilot(CopilotRequest::Ask));
+    }
+
+    /// "Command failed (exit 127) · Explain · Fix" at the bottom right.
+    fn render_failed_chip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (last, _) = self.failed_chip.as_ref()?;
+        if self.proposal.is_some() || !matches!(self.state, TermState::Running) {
+            return None;
+        }
+        let text = match last.failure? {
+            ai_assist::Failure::Exit(code) => t!("terminal.ai_chip.failed_exit", code = code),
+            ai_assist::Failure::Likely => t!("terminal.ai_chip.failed"),
+        };
+        let writable = self.writable();
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .id("ai-failed-chip")
+                .absolute()
+                .bottom_2()
+                .right_4()
+                .pl_2()
+                .pr_1()
+                .py_0p5()
+                .gap_1()
+                .items_center()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .shadow_md()
+                .text_xs()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .child(
+                    ui::icon(IconName::TriangleAlert)
+                        .size(px(12.))
+                        .text_color(theme.danger),
+                )
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_nowrap()
+                        .child(text),
+                )
+                .child(
+                    Button::new("ai-chip-explain")
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::BookOpen))
+                        .label(t!("terminal.ai_chip.explain"))
+                        .tooltip(t!("terminal.ai_chip.explain_tooltip"))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.explain_failed(cx)),
+                        ),
+                )
+                .when(writable, |this| {
+                    this.child(
+                        Button::new("ai-chip-fix")
+                            .xsmall()
+                            .ghost()
+                            .icon(ui::icon(IconName::WandSparkles))
+                            .label(t!("terminal.ai_chip.fix"))
+                            .tooltip(t!("terminal.ai_chip.fix_tooltip"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.fix_failed(window, cx)
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("ai-chip-close")
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::X))
+                        .tooltip(t!("common.close"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.failed_chip = None;
+                            this.focus.focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The command the AI proposes, at the bottom of the terminal: it is
+    /// typed with Enter or a click (never run); dangerous ones in red, after
+    /// a confirmation.
+    fn render_proposal(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let p = self.proposal.as_ref()?;
+        if !matches!(self.state, TermState::Running) {
+            return None;
+        }
+        let theme = cx.theme();
+        let mono = ui::mono_family(cx);
+        let mac = cfg!(target_os = "macos");
+        let close = Button::new("ai-bar-close")
+            .xsmall()
+            .ghost()
+            .icon(ui::icon(IconName::X))
+            .tooltip(t!("terminal.ai_bar.dismiss"))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.proposal = None;
+                this.focus.focus(window, cx);
+                cx.notify();
+            }));
+        let dangerous = matches!(&p.state, ProposalState::Ready(s) if s.dangerous());
+        let bar = h_flex()
+            .id("ai-proposal")
+            .absolute()
+            .bottom_2()
+            .left_4()
+            .right_4()
+            .max_w(px(760.))
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(if dangerous {
+                theme.danger
+            } else {
+                theme.border
+            })
+            .bg(theme.popover)
+            .shadow_md()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        let el = match &p.state {
+            ProposalState::Asking => bar
+                .child(Spinner::new().small())
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(if p.line.is_some() {
+                            t!("terminal.ai_bar.asking_request")
+                        } else {
+                            t!("terminal.ai_bar.asking_fix")
+                        }),
+                )
+                .child(close),
+            ProposalState::Failed(e) => bar
+                .child(
+                    ui::icon(IconName::TriangleAlert)
+                        .size(px(14.))
+                        .text_color(theme.danger),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(t!("terminal.ai.failed", error = e)),
+                )
+                .child(close),
+            ProposalState::Ready(s) | ProposalState::Typed(s) => {
+                let typed = matches!(p.state, ProposalState::Typed(_));
+                let (risk_label, risk_color) = risk_badge(&s.risk, cx);
+                let tip: SharedString = if s.explanation.is_empty() {
+                    risk_label.clone()
+                } else {
+                    format!("{} · {}", risk_label, s.explanation).into()
+                };
+                let theme = cx.theme();
+                bar.child(
+                    ui::icon(IconName::Sparkles)
+                        .size(px(14.))
+                        .text_color(theme.primary),
+                )
+                .child(
+                    v_flex()
+                        .id("ai-proposal-text")
+                        .flex_1()
+                        .min_w_0()
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .font_family(mono)
+                                .text_sm()
+                                .text_color(if s.dangerous() {
+                                    theme.danger
+                                } else {
+                                    theme.popover_foreground
+                                })
+                                .child(s.command.clone()),
+                        )
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(if typed {
+                                    t!("terminal.ai_bar.typed")
+                                } else if s.explanation.is_empty() {
+                                    t!("terminal.ai_bar.review")
+                                } else {
+                                    s.explanation.clone().into()
+                                }),
+                        ),
+                )
+                .child(ui::pill(risk_label, risk_color).flex_none())
+                .when(!typed, |this| {
+                    this.child(
+                        Button::new("ai-bar-insert")
+                            .xsmall()
+                            .map(|b| {
+                                if s.dangerous() {
+                                    b.danger()
+                                } else {
+                                    b.primary()
+                                }
+                            })
+                            .icon(ui::icon(IconName::CornerDownLeft))
+                            .label(if s.dangerous() {
+                                t!("terminal.ai_bar.insert_anyway")
+                            } else {
+                                t!("terminal.ai_bar.insert")
+                            })
+                            .tooltip(if mac {
+                                t!("terminal.ai_bar.insert_tooltip", key = "↵")
+                            } else {
+                                t!("terminal.ai_bar.insert_tooltip", key = "Enter")
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.accept_proposal(window, cx);
+                                this.focus.focus(window, cx);
+                            })),
+                    )
+                })
+                .child(close)
+            }
+        };
+        Some(el.into_any_element())
     }
 
     // ----- Painting -----
@@ -3422,6 +4276,8 @@ impl Render for TerminalView {
             .or_else(|| self.render_ended(cx))
             .or_else(|| self.render_overlay(cx));
         let suggestions = self.render_suggestions(cx);
+        let proposal = self.render_proposal(cx);
+        let failed_chip = self.render_failed_chip(cx);
         self.update_find_highlights();
         let find = self.render_find(cx);
         let context_menu = self.context_menu.as_ref().map(|(menu, position, _)| {
@@ -3467,6 +4323,10 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::on_find_next))
                     .on_action(cx.listener(Self::on_find_previous))
                     .on_action(cx.listener(Self::on_clear))
+                    .on_action(cx.listener(Self::on_ask_ai_selection))
+                    .on_action(cx.listener(Self::on_explain_selection))
+                    .on_action(cx.listener(Self::on_explain_selection_error))
+                    .on_action(cx.listener(Self::on_ai_command_from_line))
                     // Motion and release are registered by the element for the whole window.
                     .on_any_mouse_down(cx.listener(Self::mouse_down))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
@@ -3488,6 +4348,8 @@ impl Render for TerminalView {
                         palette,
                     ))
                     .children(suggestions)
+                    .children(proposal)
+                    .children(failed_chip)
                     .children(overlay)
                     .children(find)
                     .children(context_menu),
@@ -3597,6 +4459,15 @@ impl EntityInputHandler for TerminalView {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+/// Label and color of the risk of a command the AI proposes.
+fn risk_badge(risk: &str, cx: &App) -> (SharedString, gpui::Hsla) {
+    match risk {
+        "dangerous" => (t!("terminal.ai.risk_dangerous"), cx.theme().danger),
+        "write" => (t!("terminal.ai.risk_write"), cx.theme().warning),
+        _ => (t!("terminal.ai.risk_read"), cx.theme().success),
     }
 }
 

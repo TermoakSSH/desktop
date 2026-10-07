@@ -69,6 +69,9 @@ pub struct Settings {
     /// Suggest how to finish the command while typing in the terminal (and
     /// keep each host's commands on this device).
     pub autocomplete: bool,
+    /// When a command fails in the terminal, a small chip offers to explain
+    /// or fix it with the AI.
+    pub ai_failed_chip: bool,
     /// Interface language (BCP 47 code); `None` follows the system language.
     pub language: Option<String>,
     /// Where the AI runs on this device and with what (Settings → AI).
@@ -132,6 +135,7 @@ impl Default for Settings {
             font_family: String::new(),
             scrollback: 10_000,
             autocomplete: true,
+            ai_failed_chip: true,
             language: None,
             ai: AiSettings::default(),
             ctrl_v_pastes: false,

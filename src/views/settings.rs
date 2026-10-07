@@ -213,6 +213,14 @@ impl SettingsView {
         });
     }
 
+    fn set_ai_failed_chip(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.model.update(cx, |m, cx| {
+            let mut s = m.settings.clone();
+            s.ai_failed_chip = on;
+            m.save_settings(s, cx);
+        });
+    }
+
     fn set_autocomplete(&mut self, on: bool, cx: &mut Context<Self>) {
         self.model.update(cx, |m, cx| {
             let mut s = m.settings.clone();
@@ -787,6 +795,26 @@ impl SettingsView {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(t!("settings.autocomplete.hint")),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("ai-failed-chip")
+                            .label(t!("settings.ai_failed_chip.label"))
+                            .checked(settings.ai_failed_chip)
+                            .on_click(
+                                cx.listener(|this, v: &bool, _, cx| {
+                                    this.set_ai_failed_chip(*v, cx)
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("settings.ai_failed_chip.hint")),
                     ),
             )
     }

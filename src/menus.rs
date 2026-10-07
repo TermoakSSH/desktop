@@ -310,6 +310,8 @@ pub fn shortcuts() -> Vec<(&'static str, &'static str, &'static str)> {
         ("shortcuts.zoom", "⌘= · ⌘- · ⌘0", "Ctrl+= · Ctrl+- · Ctrl+0"),
         ("shortcuts.full_screen", "⌃⌘F", "F11"),
         ("shortcuts.copilot", "⌘I", "Ctrl+Shift+I"),
+        ("shortcuts.ai_explain_selection", "⌘⇧E", "Ctrl+Shift+E"),
+        ("shortcuts.ai_command", "# … ⌘↵", "# … Ctrl+Enter"),
         ("shortcuts.host_menu", "⇧F10", "Shift+F10 · Menu"),
         (
             "shortcuts.scroll",

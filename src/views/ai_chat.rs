@@ -29,7 +29,9 @@ use crate::local_ai::copilot::{LocalAiGlobal, LocalConversation, prepare};
 use crate::local_ai::tasks::{AiBackend, choose_backend};
 use crate::runtime;
 use crate::state::{AiFailure, AppModel, ModelEvent};
-use crate::terminal::TerminalView;
+use crate::terminal::ai_assist::{ChipKind, ContextChip, context_block};
+use crate::terminal::redact::redact;
+use crate::terminal::{ExplainRequest, TerminalView};
 use crate::ui::{self, IconName};
 
 #[derive(Clone)]
@@ -205,7 +207,7 @@ fn tail(s: &str, max: usize) -> &str {
 /// Screen of a terminal the AI cannot read on its own, in front of the
 /// user's message.
 fn with_screen(label: &str, screen: &str, text: &str) -> String {
-    let screen = tail(screen.trim_end(), 4000);
+    let screen = redact(tail(screen.trim_end(), 4000));
     if screen.trim().is_empty() {
         return text.to_string();
     }
@@ -309,7 +311,24 @@ pub struct AiChat {
     local: Option<Arc<LocalConversation>>,
     _local_events: Option<Task<()>>,
     scroll: ScrollHandle,
+    /// Terminal context sent with the next message (copilot), removable.
+    chips: Vec<ContextChip>,
+    /// Quick explanation asked from the terminal (a failed command, the
+    /// selection), shown above the conversation.
+    quick: Option<QuickAnswer>,
+    /// Quick explanations asked so far (an old answer is ignored).
+    quick_gen: u64,
     _subs: Vec<Subscription>,
+}
+
+/// A quick explanation in the copilot (`/ai/explain`, no task).
+struct QuickAnswer {
+    title: String,
+    /// What was explained (as sent: secrets hidden).
+    quoted: String,
+    /// `None` while the AI answers.
+    answer: Option<Result<String, String>>,
+    provider: String,
 }
 
 impl EventEmitter<AiChatEvent> for AiChat {}
@@ -380,8 +399,82 @@ impl AiChat {
             local: None,
             _local_events: None,
             scroll: ScrollHandle::new(),
+            chips: Vec::new(),
+            quick: None,
+            quick_gen: 0,
             _subs: subs,
         }
+    }
+
+    /// Takes the terminal's context again (host, directory, last command,
+    /// selection) as chips for the next message.
+    pub fn load_terminal_context(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.terminal.as_ref().and_then(|t| t.upgrade()) {
+            self.chips = t.read(cx).copilot_chips(cx);
+            cx.notify();
+        }
+    }
+
+    /// The `<context>` block of the chips, for the next message.
+    fn chips_block(&self, cx: &App) -> String {
+        let label = self
+            .terminal
+            .as_ref()
+            .and_then(|t| t.upgrade())
+            .map(|t| t.read(cx).copilot_context(cx).label)
+            .unwrap_or_default();
+        context_block(&label, &self.chips)
+    }
+
+    /// Explains something from the terminal right here, with the quick
+    /// assistant (and keeps the terminal's context for a follow-up).
+    pub fn quick_explain(
+        &mut self,
+        req: ExplainRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal = self.terminal.as_ref().and_then(|t| t.upgrade());
+        let assist = terminal.as_ref().and_then(|t| t.read(cx).assist(cx));
+        self.quick_gen += 1;
+        let generation = self.quick_gen;
+        self.quick = Some(QuickAnswer {
+            title: req.title,
+            quoted: req.text.clone(),
+            answer: None,
+            provider: String::new(),
+        });
+        cx.notify();
+        let (Some(terminal), Some(assist)) = (terminal, assist) else {
+            if let Some(q) = self.quick.as_mut() {
+                q.answer = Some(Err(t!("terminal.ai.not_signed_in").to_string()));
+            }
+            return;
+        };
+        let context = terminal.read(cx).ai_context(cx);
+        runtime::run_in(
+            cx,
+            window,
+            assist.explain(req.text, Some(req.question), context),
+            move |this, res, _, cx| {
+                if this.quick_gen != generation {
+                    return;
+                }
+                if let Some(q) = this.quick.as_mut() {
+                    match res {
+                        Ok(v) => {
+                            q.answer = Some(Ok(v["answer"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| t!("terminal.ai.no_answer").to_string())));
+                            q.provider = v["provider"].as_str().unwrap_or("").to_string();
+                        }
+                        Err(e) => q.answer = Some(Err(e)),
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     /// Where this conversation's task is: the copilot on the server only
@@ -563,6 +656,8 @@ impl AiChat {
         if session.is_some() {
             self.bound_session = session;
         }
+        // The terminal's context the user left (secrets already hidden).
+        let prompt = format!("{}{prompt}", self.chips_block(cx));
         self.sending = true;
         cx.notify();
         match self.task {
@@ -575,6 +670,7 @@ impl AiChat {
                     match ai_result(res) {
                         Ok(_) => {
                             this.blocked = None;
+                            this.chips.clear();
                             this.input.update(cx, |i, cx| i.set_value("", window, cx));
                             this.load(id, window, cx);
                             this.scroll.scroll_to_bottom();
@@ -615,6 +711,7 @@ impl AiChat {
                         match ai_result(res) {
                             Ok(v) => {
                                 this.blocked = None;
+                                this.chips.clear();
                                 this.input.update(cx, |i, cx| i.set_value("", window, cx));
                                 if let Some(t) = TaskSummary::from(&v) {
                                     cx.emit(AiChatEvent::Summary(t.clone()));
@@ -706,6 +803,8 @@ impl AiChat {
             return;
         };
         let settings = self.model.read(cx).settings.ai.clone();
+        // The terminal's context the user left (secrets already hidden).
+        let text = format!("{}{text}", self.chips_block(cx));
         self.sending = true;
         cx.notify();
         let id = conv.id;
@@ -724,6 +823,7 @@ impl AiChat {
                 match res.map_err(|e| (false, e)).and_then(|r| r) {
                     Ok(()) => {
                         this.blocked = None;
+                        this.chips.clear();
                         this.input.update(cx, |i, cx| i.set_value("", window, cx));
                         this.load(id, window, cx);
                         this.scroll.scroll_to_bottom();
@@ -1408,6 +1508,197 @@ impl AiChat {
     }
 }
 
+impl AiChat {
+    /// The quick explanation asked from the terminal, above the conversation.
+    fn render_quick(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let q = self.quick.as_ref()?;
+        let theme = cx.theme();
+        let quoted: String = {
+            let lines: Vec<&str> = q.quoted.lines().collect();
+            lines[lines.len().saturating_sub(12)..].join("\n")
+        };
+        let body = match &q.answer {
+            None => h_flex()
+                .gap_2()
+                .items_center()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(Spinner::new().small())
+                .child(t!("terminal.ai.asking"))
+                .into_any_element(),
+            Some(Ok(answer)) => div()
+                .text_sm()
+                .child(
+                    TextView::markdown("copilot-quick-answer", SharedString::from(answer.clone()))
+                        .selectable(true),
+                )
+                .into_any_element(),
+            Some(Err(e)) => div()
+                .text_sm()
+                .text_color(theme.danger)
+                .child(t!("terminal.ai.failed", error = e))
+                .into_any_element(),
+        };
+        let done = q.answer.as_ref().is_some_and(Result::is_ok);
+        Some(
+            v_flex()
+                .id("copilot-quick")
+                .m_3()
+                .p_3()
+                .gap_2()
+                .max_h(px(420.))
+                .flex_shrink_0()
+                .overflow_y_scrollbar()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            ui::icon(IconName::BookOpen)
+                                .size(px(14.))
+                                .text_color(theme.primary),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_semibold()
+                                .child(q.title.clone()),
+                        )
+                        .child(
+                            Button::new("copilot-quick-close")
+                                .xsmall()
+                                .ghost()
+                                .icon(ui::icon(IconName::X))
+                                .tooltip(t!("common.close"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.quick = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(!quoted.trim().is_empty(), |this| {
+                    this.child(
+                        div()
+                            .p_2()
+                            .rounded(theme.radius)
+                            .bg(theme.muted)
+                            .font_family(ui::mono_family(cx))
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(quoted),
+                    )
+                })
+                .child(body)
+                .when(!q.provider.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("terminal.ai.provider", provider = q.provider.clone())),
+                    )
+                })
+                .when(done, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("ai_chat.quick.follow_up")),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The terminal's context that goes with the next message, as chips the
+    /// user can remove, and the note about secrets.
+    fn render_chips(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let chips = self.chips.iter().enumerate().map(|(i, chip)| {
+            let icon = match chip.kind {
+                ChipKind::Host => IconName::Server,
+                ChipKind::Directory => IconName::Folder,
+                ChipKind::LastCommand => IconName::SquareTerminal,
+                ChipKind::Selection => IconName::TextQuote,
+            };
+            let tip: SharedString = truncate(&chip.text, 600).into();
+            h_flex()
+                .id(("copilot-chip", i))
+                .gap_1()
+                .pl_2()
+                .items_center()
+                .max_w(px(240.))
+                .rounded(theme.radius)
+                .bg(theme.muted)
+                .text_xs()
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .child(
+                    ui::icon(icon)
+                        .size(px(12.))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(chip.label.clone()),
+                )
+                .child(
+                    Button::new(("copilot-chip-remove", i))
+                        .xsmall()
+                        .ghost()
+                        .icon(ui::icon(IconName::X))
+                        .tooltip(t!("ai_chat.context.remove"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if i < this.chips.len() {
+                                this.chips.remove(i);
+                            }
+                            cx.notify();
+                        })),
+                )
+        });
+        v_flex()
+            .px_3()
+            .pt_2()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .children(chips)
+                    .child(
+                        Button::new("copilot-context-reload")
+                            .xsmall()
+                            .ghost()
+                            .icon(ui::icon(IconName::RefreshCw))
+                            .when(self.chips.is_empty(), |b| {
+                                b.label(t!("ai_chat.context.add"))
+                            })
+                            .tooltip(t!("ai_chat.context.reload"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.load_terminal_context(cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("ai_chat.context.secrets_hidden")),
+            )
+            .into_any_element()
+    }
+}
+
 /// Output of a tool (monospace, truncated).
 fn output_block(text: &str, ok: bool, cx: &App) -> AnyElement {
     let theme = cx.theme();
@@ -1441,11 +1732,14 @@ impl Render for AiChat {
             .as_deref()
             .map(|text| fix_banner(text, open_settings, cx));
         let header = copilot.then(|| self.render_copilot_header(cx));
+        let quick = self.render_quick(cx);
+        let chips = copilot.then(|| self.render_chips(cx));
         let running = self.summary().is_some_and(TaskSummary::running);
         let theme = cx.theme();
         v_flex()
             .size_full()
             .children(header)
+            .children(quick)
             .child(div().flex_1().min_h_0().child(body))
             .when(copilot && running, |this| {
                 this.child(
@@ -1470,11 +1764,19 @@ impl Render for AiChat {
             .when_some(banner, |this, banner| {
                 this.child(div().px_3().pt_2().child(banner))
             })
+            .when_some(chips, |this, chips| {
+                this.child(
+                    div()
+                        .when(!running, |this| this.border_t_1())
+                        .border_color(theme.border)
+                        .child(chips),
+                )
+            })
             .child(
                 h_flex()
                     .p_3()
                     .gap_2()
-                    .when(!(copilot && running), |this| this.border_t_1())
+                    .when(!copilot, |this| this.border_t_1())
                     .border_color(theme.border)
                     .child(div().flex_1().min_w_0().child(Input::new(&self.input)))
                     .child(
