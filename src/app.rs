@@ -1749,6 +1749,31 @@ impl AppView {
         self.tabs.iter().position(|t| t.id == id)
     }
 
+    /// Files dropped on a tab: the terminal on screen in it uploads them,
+    /// an SFTP browser too (to its server folder).
+    fn drop_files_on_tab(
+        &mut self,
+        tab_id: usize,
+        paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.tab_index(tab_id) else {
+            return;
+        };
+        match &self.tabs[ix].content {
+            TabContent::Terminal(p) => {
+                let t = p.focused().clone();
+                t.update(cx, |t, cx| t.drop_paths(paths, window, cx));
+            }
+            TabContent::Sftp(s) => {
+                let s = s.clone();
+                s.update(cx, |s, cx| s.drop_paths(paths, cx));
+            }
+            TabContent::Dormant { .. } => {}
+        }
+    }
+
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
@@ -3140,6 +3165,13 @@ impl AppView {
                         }
                         cx.notify();
                     }))
+                    // Files from the system file manager: to its terminal
+                    // (upload) or SFTP browser.
+                    .on_drop(
+                        cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                            this.drop_files_on_tab(tab_id, paths.paths().to_vec(), window, cx);
+                        }),
+                    )
                     .when(bar_before, |this| this.child(bar().left(px(-3.))))
                     .when(bar_after, |this| this.child(bar().right(px(-3.))))
                     .context_menu(move |menu, window, cx| {

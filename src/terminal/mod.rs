@@ -5,11 +5,13 @@
 
 pub mod backend;
 pub mod complete;
+mod drop_upload;
 mod element;
 pub mod input;
 pub mod latency;
 pub mod model;
 pub mod mouse;
+mod osc7;
 pub mod paste;
 pub mod serial;
 mod share_ui;
@@ -308,6 +310,8 @@ pub struct TerminalView {
     latency_task: Option<Task<()>>,
     /// Termoak server of a server session (for the latency tooltip).
     latency_server: Option<String>,
+    /// Files dropped on it being uploaded.
+    uploads: drop_upload::Uploads,
     _reader: Option<Task<()>>,
 }
 
@@ -368,6 +372,7 @@ impl TerminalView {
             latency: latency::Probe::default(),
             latency_task: None,
             latency_server: None,
+            uploads: drop_upload::Uploads::default(),
             _reader: None,
         }
     }
@@ -3097,6 +3102,16 @@ impl Render for TerminalView {
                     // Motion and release are registered by the element for the whole window.
                     .on_any_mouse_down(cx.listener(Self::mouse_down))
                     .on_scroll_wheel(cx.listener(Self::scroll_wheel))
+                    // Files from the system file manager: uploaded (SSH) or
+                    // their paths typed (local shell).
+                    .drag_over::<gpui::ExternalPaths>(|s, _, _, cx| {
+                        s.border_2().border_color(cx.theme().drop_target)
+                    })
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            this.drop_paths(paths.paths().to_vec(), window, cx)
+                        }),
+                    )
                     .child(TerminalElement::new(
                         entity,
                         self.focus.clone(),
