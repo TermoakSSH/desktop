@@ -685,7 +685,8 @@ mod tests {
             failure: Some(Failure::Exit(22)),
         };
         let text = last.for_ai();
-        assert!(text.starts_with("$ curl -H 'Authorization: Bearer [redacted]' x\n"));
+        assert!(text.starts_with("$ curl -H 'Authorization: [redacted]' x\n"));
+        assert!(!text.contains("abcdefgh12345"));
         assert!(text.contains("password=[redacted]\ncurl: (22) 401\n(exit status 22)"));
         assert!(!text.contains("hunter2"));
 
