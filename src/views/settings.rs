@@ -399,6 +399,45 @@ impl SettingsView {
                             .child(hint(t!("settings.notifications.ai_hint"))),
                     ),
             )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("notifications-commands")
+                            .label(t!("settings.notifications.commands"))
+                            .checked(prefs.commands)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                let v = *v;
+                                this.set_notifications(cx, |p| p.commands = v)
+                            })),
+                    )
+                    .child(hint(t!("settings.notifications.commands_hint")))
+                    .child(
+                        h_flex()
+                            .pt_1()
+                            .gap_1()
+                            .items_center()
+                            .flex_wrap()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .pr_1()
+                                    .child(t!("settings.notifications.commands_after")),
+                            )
+                            .children(crate::notifications::COMMAND_SECS_CHOICES.map(|secs| {
+                                Button::new(("command-secs", secs as usize))
+                                    .xsmall()
+                                    .label(crate::notifications::format_duration(
+                                        std::time::Duration::from_secs(secs),
+                                    ))
+                                    .when(prefs.command_secs == secs, |b| b.primary())
+                                    .disabled(!prefs.commands)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.set_notifications(cx, |p| p.command_secs = secs)
+                                    }))
+                            })),
+                    ),
+            )
     }
 
     fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {

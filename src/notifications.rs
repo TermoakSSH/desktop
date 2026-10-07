@@ -1,7 +1,8 @@
 //! Notifications of the operating system (Notification Center on macOS,
 //! toasts on Windows, the freedesktop notification server on Linux) for the
 //! notices that also show up as toasts in the window: requests on your
-//! shared sessions, sessions shared with you and the AI tasks.
+//! shared sessions, sessions shared with you, the AI tasks and long
+//! commands that ended in a terminal you were not looking at.
 //!
 //! They are only posted when the window is not focused (in the background
 //! or minimized); with the window in front, the toast in the window is
@@ -56,6 +57,11 @@ pub struct NotificationPrefs {
     pub ai: bool,
     /// A session was shared with you, or you got or lost its keyboard.
     pub shared_with_me: bool,
+    /// A long command ended in a terminal you were not looking at (a toast
+    /// in the window; a notification of the system in the background).
+    pub commands: bool,
+    /// How long a command must run to be "long", in seconds.
+    pub command_secs: u64,
 }
 
 impl Default for NotificationPrefs {
@@ -65,9 +71,16 @@ impl Default for NotificationPrefs {
             sharing: true,
             ai: true,
             shared_with_me: true,
+            commands: true,
+            command_secs: DEFAULT_COMMAND_SECS,
         }
     }
 }
+
+/// A command is long from this many seconds on (Settings → Notifications).
+pub const DEFAULT_COMMAND_SECS: u64 = 10;
+/// The choices of Settings → Notifications for a long command.
+pub const COMMAND_SECS_CHOICES: [u64; 5] = [5, 10, 30, 60, 300];
 
 impl NotificationPrefs {
     pub fn allows(&self, category: Category) -> bool {
@@ -76,7 +89,13 @@ impl NotificationPrefs {
                 Category::Sharing => self.sharing,
                 Category::Ai => self.ai,
                 Category::SharedWithMe => self.shared_with_me,
+                Category::Commands => self.commands,
             }
+    }
+
+    /// How long a command must run to be notified (at least a second).
+    pub fn command_threshold(&self) -> Duration {
+        Duration::from_secs(self.command_secs.max(1))
     }
 }
 
@@ -86,6 +105,8 @@ pub enum Category {
     Sharing,
     Ai,
     SharedWithMe,
+    /// A long command ended.
+    Commands,
 }
 
 /// Where a click on the notification leads.
@@ -352,6 +373,85 @@ impl AiNotice {
     }
 }
 
+/// A long command that ended in a terminal (see `terminal::command_watch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDone {
+    /// Name of the host (or "Local terminal").
+    pub host: String,
+    /// The command line, when known.
+    pub command: Option<String>,
+    pub duration: Duration,
+    /// Exit status, when the shell said it (shell integration).
+    pub exit: Option<i32>,
+}
+
+impl CommandDone {
+    /// It ended with an error status.
+    pub fn failed(&self) -> bool {
+        self.exit.is_some_and(|code| code != 0)
+    }
+
+    pub fn title(&self) -> String {
+        if self.failed() {
+            t!("notifications.command_failed_title", host = self.host)
+        } else {
+            t!("notifications.command_done_title", host = self.host)
+        }
+        .to_string()
+    }
+
+    /// The command (if known), how long it took and its exit status.
+    pub fn body(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(command) = self
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
+            parts.push(clip(command, MAX_COMMAND));
+        }
+        parts.push(
+            t!(
+                "notifications.command_took",
+                duration = format_duration(self.duration)
+            )
+            .to_string(),
+        );
+        if let Some(code) = self.exit {
+            parts.push(t!("notifications.command_exit", code = code).to_string());
+        }
+        parts.join(" · ")
+    }
+
+    /// The notice of the terminal `terminal` (`seq` makes each one new).
+    pub fn notice(&self, terminal: EntityId, seq: u64) -> Notice {
+        Notice {
+            category: Category::Commands,
+            key: format!("command:{terminal}:{seq}"),
+            title: self.title(),
+            body: self.body(),
+            target: Target::Terminal(terminal),
+        }
+    }
+}
+
+/// Longest command line shown in a notice.
+const MAX_COMMAND: usize = 80;
+
+/// A duration as people read it: "45 s", "2 min 13 s", "1 h 5 min".
+pub fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    match (h, m, s) {
+        (0, 0, s) => format!("{s} s"),
+        (0, m, 0) => format!("{m} min"),
+        (0, m, s) => format!("{m} min {s} s"),
+        (h, 0, _) => format!("{h} h"),
+        (h, m, _) => format!("{h} h {m} min"),
+    }
+}
+
 /// Up to `max` characters (with an ellipsis when cut).
 fn clip(text: &str, max: usize) -> String {
     let text = text.trim();
@@ -447,6 +547,71 @@ mod tests {
         };
         assert!(!should_notify(&no_sharing, Category::Sharing, false));
         assert!(should_notify(&no_sharing, Category::Ai, false));
+
+        assert!(should_notify(&all, Category::Commands, false));
+        let no_commands = NotificationPrefs {
+            commands: false,
+            ..all
+        };
+        assert!(!should_notify(&no_commands, Category::Commands, false));
+        assert!(!should_notify(&off, Category::Commands, false));
+    }
+
+    #[test]
+    fn long_commands() {
+        let prefs = NotificationPrefs::default();
+        assert!(prefs.commands);
+        assert_eq!(prefs.command_threshold(), Duration::from_secs(10));
+        let zero = NotificationPrefs {
+            command_secs: 0,
+            ..prefs
+        };
+        assert_eq!(zero.command_threshold(), Duration::from_secs(1));
+        assert!(COMMAND_SECS_CHOICES.contains(&DEFAULT_COMMAND_SECS));
+
+        assert_eq!(format_duration(Duration::from_secs(9)), "9 s");
+        assert_eq!(format_duration(Duration::from_secs(120)), "2 min");
+        assert_eq!(format_duration(Duration::from_secs(133)), "2 min 13 s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1 h");
+        assert_eq!(format_duration(Duration::from_secs(3900 + 7)), "1 h 5 min");
+
+        let ok = CommandDone {
+            host: "web-1".into(),
+            command: Some("make build".into()),
+            duration: Duration::from_secs(133),
+            exit: Some(0),
+        };
+        assert!(!ok.failed());
+        assert!(ok.title().contains("web-1"));
+        let body = ok.body();
+        assert!(body.starts_with("make build · "), "{body}");
+        assert!(body.contains("2 min 13 s") && body.contains('0'), "{body}");
+        let failed = CommandDone {
+            exit: Some(2),
+            ..ok.clone()
+        };
+        assert!(failed.failed());
+        assert_ne!(failed.title(), ok.title());
+        // Without shell integration: no exit status, maybe no command.
+        let unknown = CommandDone {
+            command: None,
+            exit: None,
+            ..ok.clone()
+        };
+        assert!(!unknown.failed());
+        assert!(!unknown.body().contains(" · "));
+        let long = CommandDone {
+            command: Some("x".repeat(500)),
+            ..ok.clone()
+        };
+        assert!(long.body().chars().count() < 200);
+
+        let id = EntityId::from(7u64);
+        let a = ok.notice(id, 1);
+        assert_eq!(a.category, Category::Commands);
+        assert_eq!(a.target, Target::Terminal(id));
+        // Each command is a notice of its own.
+        assert_ne!(a.key, ok.notice(id, 2).key);
     }
 
     #[test]
@@ -454,6 +619,7 @@ mod tests {
         assert!(NotificationPrefs::default().enabled);
         let p: NotificationPrefs = serde_json::from_value(json!({"ai": false})).unwrap();
         assert!(p.enabled && p.sharing && p.shared_with_me && !p.ai);
+        assert!(p.commands && p.command_secs == DEFAULT_COMMAND_SECS);
     }
 
     #[test]

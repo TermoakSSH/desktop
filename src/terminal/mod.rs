@@ -4,6 +4,7 @@
 //! AI actions. Used for SSH, server sessions and the local terminal.
 
 pub mod backend;
+pub mod command_watch;
 pub mod complete;
 mod element;
 pub mod find;
@@ -210,6 +211,10 @@ pub enum TerminalEvent {
         you_drive: bool,
         text: SharedString,
     },
+    /// A long command ended (on in Settings → Notifications, longer than
+    /// its threshold, not a full-screen program). The window tells about it
+    /// if the terminal is out of sight.
+    CommandFinished(crate::notifications::CommandDone),
 }
 
 /// User input repeated in the other panes while broadcasting. It is kept as
@@ -339,6 +344,13 @@ pub struct TerminalView {
     latency_task: Option<Task<()>>,
     /// Termoak server of a server session (for the latency tooltip).
     latency_server: Option<String>,
+    /// Commands typed here: when they start and end.
+    commands: command_watch::CommandWatch,
+    /// Shell-integration marks in the output.
+    marks: command_watch::MarkScanner,
+    /// Checks for the prompt while a command runs (without shell
+    /// integration).
+    command_tick: Option<Task<()>>,
     _reader: Option<Task<()>>,
 }
 
@@ -399,6 +411,9 @@ impl TerminalView {
             latency: latency::Probe::default(),
             latency_task: None,
             latency_server: None,
+            commands: command_watch::CommandWatch::default(),
+            marks: command_watch::MarkScanner::default(),
+            command_tick: None,
             _reader: None,
         }
     }
@@ -617,6 +632,7 @@ impl TerminalView {
         self.mouse_held = None;
         self.clear_line();
         self.model.reset();
+        self.forget_commands();
         self.reset_share();
         self.latency.stop();
         self.latency_task = None;
@@ -793,11 +809,17 @@ impl TerminalView {
                     {
                         let _ = tap.send(bytes.clone());
                     }
+                    let marks = self.marks.scan(&bytes);
                     let events = self.model.feed(&bytes);
                     if let Some(b) = &self.backend {
                         b.consumed(bytes.len());
                     }
                     self.schedule_find_refresh(cx);
+                    let alt = self.model.mode().contains(TermMode::ALT_SCREEN);
+                    if let Some(done) = self.commands.output(std::time::Instant::now(), &marks, alt)
+                    {
+                        self.command_finished(done, cx);
+                    }
                     self.handle_term_events(events, cx);
                     // When leaving vim, less... the shell paints a new line.
                     let alt = self.model.mode().contains(TermMode::ALT_SCREEN);
@@ -828,6 +850,8 @@ impl TerminalView {
                     self.ime_marked = None;
                     self.mouse_held = None;
                     self.share.waiting = None;
+                    // A command cut off by the end of the session did not finish.
+                    self.forget_commands();
                     // The connection closing right after the reason (status,
                     // end code) does not erase it.
                     let keep =
@@ -940,8 +964,80 @@ impl TerminalView {
         if !self.can_write || !matches!(self.state, TermState::Running) || self.backend.is_none() {
             return;
         }
-        self.track_input(&bytes, cx);
+        let alt = self.model.mode().contains(TermMode::ALT_SCREEN);
+        // Enter at a shell line (a multi-line paste in bracketed mode does
+        // not run anything by itself).
+        let enter = !alt && bytes.contains(&b'\r') && !bytes.starts_with(b"\x1b[200~");
+        // What is in front of the cursor before the line goes: the prompt
+        // and the typed command.
+        let before = enter.then(|| self.model.text_around_cursor(300).0);
+        let sent = self.track_input(&bytes, cx);
+        if let Some(before) = before {
+            let prompt = sent
+                .as_deref()
+                .and_then(|line| before.strip_suffix(line))
+                .map(str::to_string);
+            self.commands.enter(std::time::Instant::now(), sent, prompt);
+            self.watch_for_prompt(cx);
+        }
         self.write(bytes, cx);
+    }
+
+    // ----- Long commands -----
+
+    /// While a command runs without shell integration, looks for the
+    /// prompt every half second (until it comes back).
+    fn watch_for_prompt(&mut self, cx: &mut Context<Self>) {
+        if self.command_tick.is_some() || !self.commands.waiting_for_prompt() {
+            return;
+        }
+        self.command_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let waiting = this.update(cx, |this, cx| {
+                    let alt = this.model.mode().contains(TermMode::ALT_SCREEN);
+                    let (before, after_blank) = this.model.text_around_cursor(300);
+                    let now = std::time::Instant::now();
+                    if let Some(done) = this.commands.idle(now, alt, &before, after_blank) {
+                        this.command_finished(done, cx);
+                    }
+                    let waiting = this.commands.waiting_for_prompt();
+                    if !waiting {
+                        this.command_tick = None;
+                    }
+                    waiting
+                });
+                if !matches!(waiting, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// A command ended: the window is told if it was long (and these
+    /// notices are on).
+    fn command_finished(&mut self, done: command_watch::Finished, cx: &mut Context<Self>) {
+        let prefs = self.app.read(cx).settings.notifications;
+        if !prefs.commands || !done.worth_notifying(prefs.command_threshold()) {
+            return;
+        }
+        cx.emit(TerminalEvent::CommandFinished(
+            crate::notifications::CommandDone {
+                host: self.label(cx),
+                command: done.command,
+                duration: done.duration,
+                exit: done.exit,
+            },
+        ));
+    }
+
+    /// Forgets the command running (new connection, session closed).
+    fn forget_commands(&mut self) {
+        self.commands.reset();
+        self.marks = command_watch::MarkScanner::default();
+        self.command_tick = None;
     }
 
     /// Special keys, Ctrl and Alt. Normal text is not handled here: it goes
@@ -1193,22 +1289,26 @@ impl TerminalView {
 
     /// Tracks what is typed: saves the line sent with Enter in the history
     /// and looks for suggestions for the new one.
-    fn track_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    /// Returns the line sent with Enter, if it was known and on screen.
+    fn track_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> Option<String> {
         if self.model.mode().contains(TermMode::ALT_SCREEN) {
             // Inside vim, less... there is no shell line.
             self.line.forget();
             self.suggestions = None;
-            return;
+            return None;
         }
         let pending = self.line.current();
         let echoed = pending.as_deref().is_some_and(|l| self.line_on_screen(l));
+        let mut submitted = None;
         if let Some(sent) = self.line.feed(bytes)
             && echoed
             && pending.as_deref() == Some(sent.as_str())
         {
-            self.record_command(sent, cx);
+            self.record_command(sent.clone(), cx);
+            submitted = Some(sent);
         }
         self.refresh_suggestions(cx);
+        submitted
     }
 
     /// Saves a command in the host history (on this device only).

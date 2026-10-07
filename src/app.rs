@@ -64,6 +64,8 @@ use crate::views::teams::TeamsView;
 use crate::views::vaults;
 use crate::windows;
 
+mod command_notice;
+
 actions!(
     termoak,
     [
@@ -1536,6 +1538,7 @@ impl AppView {
     ) {
         match ev {
             TerminalEvent::TitleChanged => cx.notify(),
+            TerminalEvent::CommandFinished(done) => self.on_command_finished(id, done, window, cx),
             TerminalEvent::ShareRequest(req) => self.on_share_request(id, req, window, cx),
             TerminalEvent::ShareRequestDone { kind, participant } => {
                 window.remove_notification1::<ShareRequestToast>(
