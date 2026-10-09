@@ -55,6 +55,10 @@ scripts/release-local.sh publish desktop
   `publish desktop` add macOS to the release you already published from
   Linux. Until a platform is in `latest.json`, its apps stay on the previous
   version.
+- Before tagging, add the `<release>` to
+  `assets/linux/com.termoak.Termoak.metainfo.xml` (AppStream: AppImage,
+  Flatpak, software centers). After publishing, update the Flatpak manifest
+  to the new tag ([flatpak/README.md](../flatpak/README.md#new-release)).
 - `TERMOAK_UPDATE_URL` makes the app look for updates on your server instead
   (see "Updates and downloads through the server" in the
   [server's deployment guide](https://github.com/TermoakSSH/server/blob/main/docs/DEPLOYMENT.md)).

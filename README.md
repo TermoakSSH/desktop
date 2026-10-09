@@ -287,6 +287,8 @@ console.
 3. If the installation is managed by the system (`.deb`, `.rpm`, `/usr`,
    `/opt`, Program Files...), it only notifies: "A new version (X) is
    available", with a download link.
+4. As a Flatpak there are no checks at all: Flatpak updates it, and
+   Settings → Updates says so (`src/flatpak.rs`).
 
 Updates are only enabled if the binary was built with the public key:
 
@@ -358,6 +360,7 @@ src/
   state.rs           model: data, server session, sync, port forwards
   prompts.rs         authentication prompts (AuthPrompter) with dialogs
   update.rs          automatic updates
+  flatpak.rs         running as a Flatpak: no self-updates, host shell
   ui.rs              reusable UI pieces
   qr.rs              QR codes painted with squares
   logos.rs           host logos (system logos in assets/logos, generic icons)
@@ -369,6 +372,11 @@ src/
                      server sessions, sharing, teams, administration,
                      two-step verification, serial port and settings
 ```
+
+Linux desktop integration lives in `assets/linux/`: the desktop entry, the
+AppStream metadata and the icons of `com.termoak.Termoak`, used by the
+AppImage, the Linux tar.gz (`share/`) and the Flatpak (`flatpak/`, see
+[flatpak/README.md](flatpak/README.md)).
 
 ## Working on core at the same time
 
@@ -388,7 +396,8 @@ termoak-ai = { path = "../core/crates/termoak-ai" }
 
 `scripts/release-local.sh` builds Linux and Windows in Docker and macOS on a
 Mac, signs the updates and publishes the `desktop-vX.Y.Z` GitHub release:
-see [docs/RELEASING.md](docs/RELEASING.md).
+see [docs/RELEASING.md](docs/RELEASING.md). The Flatpak is built from
+source from the tag: see [flatpak/README.md](flatpak/README.md).
 
 ## The Termoak repositories
 

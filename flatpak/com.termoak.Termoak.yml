@@ -1,0 +1,80 @@
+# Flatpak of the Termoak desktop app, built from source (the desktop-vX.Y.Z
+# tag) with the crates of Cargo.lock vendored from cargo-sources.json, offline.
+# Used for the Termoak repository (pkg.termoak.com/flatpak, built by
+# TermoakSSH/packages scripts/flatpak.sh) and for the Flathub submission
+# (flatpak/README.md).
+#
+# New release: update tag and commit, regenerate cargo-sources.json
+# (flatpak/update-sources.sh desktop-vX.Y.Z), add the <release> to
+# assets/linux/com.termoak.Termoak.metainfo.xml and drop the patch below once
+# the tag already contains it.
+id: com.termoak.Termoak
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: termoak-desktop
+
+finish-args:
+  # Window: Wayland, or X11 where there is no Wayland; GPU (Vulkan) rendering.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # SSH, SFTP, Telnet, the Termoak server and the AI providers.
+  - --share=network
+  # The SSH agent of the session (keys of ssh-agent / gpg-agent / KeePassXC).
+  - --socket=ssh-auth
+  # The local vault key lives in the keychain (Secret Service: GNOME
+  # Keyring, KWallet), read with the keyring crate over D-Bus.
+  - --talk-name=org.freedesktop.secrets
+  # Notifications while the window is in the background (sharing requests,
+  # AI tasks, long commands): GPUI posts them with notify-rust.
+  - --talk-name=org.freedesktop.Notifications
+  # Local terminal: the user's shell on the host (flatpak-spawn --host), as
+  # in other terminal emulators; the sandbox only has the runtime's tools.
+  - --talk-name=org.freedesktop.Flatpak
+  # SFTP downloads. Other folders are reached through the file chooser
+  # portal (GPUI's dialogs use xdg-desktop-portal).
+  - --filesystem=xdg-download
+  # Read-only: "Import ~/.ssh/config" reads the config and the IdentityFile
+  # keys it points to, which have to be read from their paths.
+  - --filesystem=~/.ssh:ro
+
+modules:
+  - name: termoak-desktop
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/termoak-desktop/cargo
+        CARGO_NET_OFFLINE: 'true'
+      # No TERMOAK_UPDATE_PUBKEY: the app's own updater is not built in (and
+      # it turns itself off anyway when it runs as a Flatpak).
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      # Release profile of Cargo.toml (opt-level s, fat LTO, stripped).
+      - cargo --offline build --release --locked --jobs "$FLATPAK_BUILDER_N_JOBS"
+      - install -Dm755 target/release/termoak-desktop -t /app/bin/
+      - install -Dm644 assets/linux/com.termoak.Termoak.desktop -t /app/share/applications/
+      - install -Dm644 assets/linux/com.termoak.Termoak.metainfo.xml -t /app/share/metainfo/
+      - cp -r assets/linux/icons /app/share/
+    sources:
+      - type: git
+        url: https://github.com/TermoakSSH/desktop.git
+        tag: desktop-v0.6.0
+        commit: cbb11329fd53866cc9d988d294f56a01c0e874aa
+        # Flathub's external data checker opens a PR for new tags.
+        x-checker-data:
+          type: git
+          tag-pattern: ^desktop-v([\d.]+)$
+      # Crates of Cargo.lock (flatpak-builder-tools' flatpak-cargo-generator).
+      - cargo-sources.json
+      # Flatpak support that 0.6.0 does not have yet (updater off in the
+      # sandbox, host shell, --version, the desktop entry, AppStream metadata
+      # and icons in assets/linux/), from the main branch. Drop it with the
+      # next release.
+      - type: patch
+        path: patches/desktop-v0.6.0-flatpak.patch
+        use-git: true

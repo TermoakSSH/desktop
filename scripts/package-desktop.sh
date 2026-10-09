@@ -28,6 +28,8 @@ case "$platform" in
     mkdir -p "$appdir/usr/bin"
     cp "$bin_dir/termoak-desktop" "$appdir/usr/bin/"
     cp -r "$share" "$appdir/usr/share"
+    # appimagetool looks for the AppStream file under its old name.
+    ln -s "$id.metainfo.xml" "$appdir/usr/share/metainfo/$id.appdata.xml"
     cp "$linux/$id.desktop" "$appdir/$id.desktop"
     cp "$linux/icons/hicolor/512x512/apps/$id.png" "$appdir/$id.png"
     ln -s "$id.png" "$appdir/.DirIcon"
