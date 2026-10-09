@@ -987,7 +987,9 @@ impl SettingsView {
         let u = self.updates.read(cx);
         let status = u.status.clone();
         let text = u.status_text();
-        let enabled = status != UpdateStatus::Disabled;
+        // Without an updater of its own (a Flatpak, or a build without
+        // updates) there is nothing to check: only the status is shown.
+        let checks = u.checks();
         let ready = u.ready_version().is_some();
         let busy = matches!(
             status,
@@ -1009,40 +1011,42 @@ impl SettingsView {
                             .child(text),
                     ),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("check-updates")
-                            .icon(ui::icon(IconName::RefreshCw))
-                            .label(t!("settings.updates.check"))
-                            .loading(busy)
-                            .disabled(!enabled || ready)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.updates.update(cx, |u, cx| u.check_now(cx));
-                            })),
-                    )
-                    .when(ready, |this| {
-                        this.child(
-                            Button::new("restart-update")
-                                .primary()
-                                .label(t!("settings.updates.restart"))
+            .when(checks, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("check-updates")
+                                .icon(ui::icon(IconName::RefreshCw))
+                                .label(t!("settings.updates.check"))
+                                .loading(busy)
+                                .disabled(ready)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.updates.read(cx).restart_now();
+                                    this.updates.update(cx, |u, cx| u.check_now(cx));
                                 })),
                         )
-                    })
-                    .when(available, |this| {
-                        this.child(
-                            Button::new("open-releases")
-                                .icon(ui::icon(IconName::ExternalLink))
-                                .label(t!("settings.updates.download"))
-                                .on_click(|_: &ClickEvent, _, cx| {
-                                    cx.open_url(update::RELEASES_PAGE)
-                                }),
-                        )
-                    }),
-            )
+                        .when(ready, |this| {
+                            this.child(
+                                Button::new("restart-update")
+                                    .primary()
+                                    .label(t!("settings.updates.restart"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.updates.read(cx).restart_now();
+                                    })),
+                            )
+                        })
+                        .when(available, |this| {
+                            this.child(
+                                Button::new("open-releases")
+                                    .icon(ui::icon(IconName::ExternalLink))
+                                    .label(t!("settings.updates.download"))
+                                    .on_click(|_: &ClickEvent, _, cx| {
+                                        cx.open_url(update::RELEASES_PAGE)
+                                    }),
+                            )
+                        }),
+                )
+            })
     }
 
     fn render_about(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

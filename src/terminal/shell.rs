@@ -249,9 +249,18 @@ fn run(
     .into_iter()
     .chain(utf8_locale(|k| std::env::var(k).ok()))
     .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect();
+    .collect::<std::collections::HashMap<_, _>>();
+    // Flatpak: the user's shell on the host, not the sandbox's.
+    #[cfg(unix)]
+    let (program, args) = if crate::flatpak::active() {
+        crate::flatpak::host_shell(&env)
+    } else {
+        (shell.program.clone(), shell.args.clone())
+    };
+    #[cfg(windows)]
+    let (program, args) = (shell.program.clone(), shell.args.clone());
     let options = Options {
-        shell: Some(Shell::new(shell.program.clone(), shell.args.clone())),
+        shell: Some(Shell::new(program, args)),
         working_directory: home_dir(),
         drain_on_exit: true,
         env,

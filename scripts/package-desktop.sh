@@ -16,28 +16,30 @@ mkdir -p "$dist"
 
 case "$platform" in
   linux-x86_64)
+    # Desktop entry, AppStream metadata and icons: assets/linux/ (the same
+    # files as the Flatpak, flatpak/com.termoak.Termoak.yml).
+    linux="$root/assets/linux"
+    id=com.termoak.Termoak
+    share="$(mktemp -d)/share"
+    install -Dm644 "$linux/$id.desktop" "$share/applications/$id.desktop"
+    install -Dm644 "$linux/$id.metainfo.xml" "$share/metainfo/$id.metainfo.xml"
+    cp -r "$linux/icons" "$share/icons"
     appdir="$(mktemp -d)/Termoak.AppDir"
-    mkdir -p "$appdir/usr/bin" "$appdir/usr/share/icons/hicolor/512x512/apps"
+    mkdir -p "$appdir/usr/bin"
     cp "$bin_dir/termoak-desktop" "$appdir/usr/bin/"
-    rsvg-convert -w 512 -h 512 "$root/assets/icon.svg" -o "$appdir/termoak.png"
-    cp "$appdir/termoak.png" "$appdir/usr/share/icons/hicolor/512x512/apps/termoak.png"
-    cat > "$appdir/termoak.desktop" <<DESKTOP
-[Desktop Entry]
-Type=Application
-Name=Termoak
-Comment=SSH client with AI
-Exec=termoak-desktop %u
-Icon=termoak
-Categories=Network;System;TerminalEmulator;
-Terminal=false
-MimeType=x-scheme-handler/termoak;x-scheme-handler/aceitunoak;
-DESKTOP
+    cp -r "$share" "$appdir/usr/share"
+    cp "$linux/$id.desktop" "$appdir/$id.desktop"
+    cp "$linux/icons/hicolor/512x512/apps/$id.png" "$appdir/$id.png"
+    ln -s "$id.png" "$appdir/.DirIcon"
     ln -s usr/bin/termoak-desktop "$appdir/AppRun"
     tool="$(mktemp -d)/appimagetool"
     curl -fsSL -o "$tool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
     chmod +x "$tool"
     ARCH=x86_64 "$tool" --appimage-extract-and-run "$appdir" "$dist/Termoak-linux-x86_64.AppImage"
-    tar czf "$dist/termoak-desktop-$tag-linux-x86_64.tar.gz" -C "$bin_dir" termoak-desktop
+    # The binary at the top (as before) and share/ to copy into a prefix
+    # (/usr, /usr/local or ~/.local).
+    tar czf "$dist/termoak-desktop-$tag-linux-x86_64.tar.gz" -C "$bin_dir" termoak-desktop \
+      -C "$(dirname "$share")" share
     ;;
   macos-universal)
     work="$(mktemp -d)"

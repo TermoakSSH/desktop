@@ -8,7 +8,10 @@
 //!   is only notified.
 //!
 //! Updates are signed (Ed25519). Without a compiled-in public key
-//! (`TERMOAK_UPDATE_PUBKEY`) there are no updates.
+//! (`TERMOAK_UPDATE_PUBKEY`) there are no updates. As a Flatpak there are
+//! none either, whatever the build: Flatpak updates the app itself
+//! (`flatpak update`, the software center) and the installation in `/app`
+//! cannot be replaced.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,11 +36,41 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Builds the updater if a public key was compiled in.
+/// Who updates this installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Updates<'a> {
+    /// The app, with this compiled-in public key.
+    App(&'a str),
+    /// Flatpak.
+    Flatpak,
+    /// Nobody: no public key in this build.
+    Off,
+}
+
+fn updates(public_key: Option<&str>, flatpak: bool) -> Updates<'_> {
+    if flatpak {
+        return Updates::Flatpak;
+    }
+    match public_key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => Updates::App(key),
+        None => Updates::Off,
+    }
+}
+
+/// Builds the updater if a public key was compiled in and the app is not a
+/// Flatpak.
 pub fn build(data_dir: &Path) -> Option<Arc<Updater>> {
-    let key = option_env!("TERMOAK_UPDATE_PUBKEY")
-        .map(str::trim)
-        .filter(|k| !k.is_empty())?;
+    let key = match updates(
+        option_env!("TERMOAK_UPDATE_PUBKEY"),
+        crate::flatpak::active(),
+    ) {
+        Updates::App(key) => key,
+        Updates::Flatpak => {
+            tracing::info!("running as a Flatpak: Flatpak updates the app");
+            return None;
+        }
+        Updates::Off => return None,
+    };
     let Some(public_key) = termoak_update::public_key_from_base64(key) else {
         tracing::warn!("TERMOAK_UPDATE_PUBKEY is not valid: updates disabled");
         return None;
@@ -86,6 +119,8 @@ fn relaunch(install: &Install) {
 pub enum UpdateStatus {
     /// No public key: updates disabled in this build.
     Disabled,
+    /// A Flatpak: Flatpak updates it (no checks of our own).
+    Flatpak,
     Idle,
     Checking,
     UpToDate,
@@ -116,11 +151,7 @@ impl EventEmitter<UpdateEvent> for UpdateModel {}
 
 impl UpdateModel {
     pub fn new(updater: Option<Arc<Updater>>, cx: &mut Context<Self>) -> Self {
-        let status = if updater.is_some() {
-            UpdateStatus::Idle
-        } else {
-            UpdateStatus::Disabled
-        };
+        let status = initial_status(updater.is_some(), crate::flatpak::active());
         let task = updater.as_ref().map(|_| {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(FIRST_CHECK).await;
@@ -138,6 +169,12 @@ impl UpdateModel {
             announced: None,
             _loop: task,
         }
+    }
+
+    /// Whether this app looks for updates itself (Settings shows "Check for
+    /// updates" only then).
+    pub fn checks(&self) -> bool {
+        self.updater.is_some()
     }
 
     /// Version it can relaunch with right now, if one was downloaded.
@@ -216,6 +253,7 @@ impl UpdateModel {
     pub fn status_text(&self) -> String {
         let text = match &self.status {
             UpdateStatus::Disabled => t!("update.status.disabled"),
+            UpdateStatus::Flatpak => t!("update.status.flatpak"),
             UpdateStatus::Idle => t!("update.status.idle"),
             UpdateStatus::Checking => t!("update.status.checking"),
             UpdateStatus::UpToDate => t!("update.status.up_to_date"),
@@ -225,5 +263,39 @@ impl UpdateModel {
             UpdateStatus::Failed(e) => t!("update.status.failed", error = e),
         };
         text.to_string()
+    }
+}
+
+/// State before the first check.
+fn initial_status(has_updater: bool, flatpak: bool) -> UpdateStatus {
+    match (has_updater, flatpak) {
+        (true, _) => UpdateStatus::Idle,
+        (false, true) => UpdateStatus::Flatpak,
+        (false, false) => UpdateStatus::Disabled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "zwbxnEY2xFDcaICtxAW8BVhccqXWdjXae4bsDB+Kkt4=";
+
+    #[test]
+    fn a_flatpak_never_updates_itself() {
+        // Even with the official public key compiled in.
+        assert_eq!(updates(Some(KEY), true), Updates::Flatpak);
+        assert_eq!(updates(None, true), Updates::Flatpak);
+        assert_eq!(updates(Some(KEY), false), Updates::App(KEY));
+        assert_eq!(updates(Some(" \n"), false), Updates::Off);
+        assert_eq!(updates(None, false), Updates::Off);
+        assert!(termoak_update::public_key_from_base64(KEY).is_some());
+    }
+
+    #[test]
+    fn status_without_updater() {
+        assert_eq!(initial_status(true, false), UpdateStatus::Idle);
+        assert_eq!(initial_status(false, true), UpdateStatus::Flatpak);
+        assert_eq!(initial_status(false, false), UpdateStatus::Disabled);
     }
 }

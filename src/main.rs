@@ -30,6 +30,7 @@ mod app;
 mod app_lock;
 mod dock;
 mod drag;
+mod flatpak;
 mod host_status;
 mod importers;
 mod links;
@@ -71,6 +72,15 @@ use crate::state::{AppModel, Settings};
 use crate::update::UpdateModel;
 
 fn main() {
+    // `termoak-desktop --version`: for scripts and packaging checks, without
+    // opening a window.
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--version" || a == "-V")
+    {
+        println!("termoak-desktop {}", update::current_version());
+        return;
+    }
     init_tracing();
     let data_dir = termoak_client::vault::data_dir();
 

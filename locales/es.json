@@ -2150,6 +2150,7 @@
   "update.status.disabled": "Las actualizaciones automáticas no están activadas en esta compilación.",
   "update.status.downloading": "Descargando la versión %{version}…",
   "update.status.failed": "No se pudo comprobar: %{error}",
+  "update.status.flatpak": "Flatpak mantiene esta instalación al día: ejecuta flatpak update o usa tu centro de software.",
   "update.status.idle": "Se comprobará en segundo plano cada 6 horas.",
   "update.status.ready": "Actualización %{version} lista: se aplicará al reiniciar.",
   "update.status.up_to_date": "Tienes la última versión.",

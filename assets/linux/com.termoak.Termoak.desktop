@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Termoak
+GenericName=SSH Client
+GenericName[es]=Cliente SSH
+Comment=SSH client with persistent sessions, an encrypted vault and AI
+Comment[es]=Cliente SSH con sesiones persistentes, bóveda cifrada e IA
+Exec=termoak-desktop %u
+Icon=com.termoak.Termoak
+Terminal=false
+Categories=Network;RemoteAccess;System;TerminalEmulator;
+Keywords=ssh;telnet;terminal;sftp;serial;console;shell;remote;server;
+Keywords[es]=ssh;telnet;terminal;sftp;serie;consola;shell;remoto;servidor;
+MimeType=x-scheme-handler/termoak;x-scheme-handler/aceitunoak;
+StartupWMClass=com.termoak.Termoak
+SingleMainWindow=false

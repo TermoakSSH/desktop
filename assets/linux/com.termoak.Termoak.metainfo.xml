@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 Ohz Digital SL -->
+<component type="desktop-application">
+  <id>com.termoak.Termoak</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+
+  <name>Termoak</name>
+  <summary>SSH client with persistent sessions</summary>
+  <summary xml:lang="es">Cliente SSH con sesiones persistentes</summary>
+
+  <developer id="com.termoak">
+    <name>Ohz Digital SL</name>
+  </developer>
+
+  <description>
+    <p>Termoak is a native SSH client (no web views) with the same sessions, hosts and keys on your computer and on your phone.</p>
+    <p xml:lang="es">Termoak es un cliente SSH nativo (sin webviews) con las mismas sesiones, servidores y claves en tu ordenador y en tu móvil.</p>
+    <p>Sessions that never drop: open the terminal on the Termoak server and pick it up where you left it, from this computer or from another device, with its history and its processes.</p>
+    <p xml:lang="es">Sesiones que no se cortan: abre la terminal en el servidor de Termoak y sigue donde la dejaste, desde este ordenador o desde otro dispositivo, con su historial y sus procesos.</p>
+    <ul>
+      <li>SSH with passwords, keys (Ed25519, RSA, ECDSA) and reusable identities; jump hosts, proxy, agent forwarding and keep-alive</li>
+      <li xml:lang="es">SSH con contraseña, claves (Ed25519, RSA, ECDSA) e identidades reutilizables; jump hosts, proxy, agent forwarding y keep-alive</li>
+      <li>Tabs and split view with up to 16 terminals, and broadcast typing to all of them</li>
+      <li xml:lang="es">Pestañas y vista dividida con hasta 16 terminales, y escritura simultánea en todas</li>
+      <li>SFTP browser with a transfer queue, drag and drop, and editing remote files on this computer</li>
+      <li xml:lang="es">Explorador SFTP con cola de transferencias, arrastrar y soltar, y edición de archivos remotos en este ordenador</li>
+      <li>Local terminal, Telnet and serial port</li>
+      <li xml:lang="es">Terminal local, Telnet y puerto serie</li>
+      <li>Snippets to run commands on one or many servers at once, and port forwarding</li>
+      <li xml:lang="es">Snippets para lanzar comandos en uno o varios servidores a la vez, y reenvío de puertos</li>
+      <li>Import from ~/.ssh/config, PuTTY, MobaXterm, SecureCRT, Termius, ZOC and CSV</li>
+      <li xml:lang="es">Importación desde ~/.ssh/config, PuTTY, MobaXterm, SecureCRT, Termius, ZOC y CSV</li>
+    </ul>
+    <p>Encrypted, synced vault: hosts, keys, identities and snippets encrypted and synced across all your devices. Organize them in vaults: a personal one, others shared with people or your team, with Editor or Use-only permissions (connect without seeing passwords).</p>
+    <p xml:lang="es">Bóveda cifrada y sincronizada: servidores, claves, identidades y snippets cifrados y sincronizados entre todos tus dispositivos. Organízalos en vaults: uno personal, otros compartidos con personas o con tu equipo, con permisos de Editor o Solo uso (conectar sin ver contraseñas).</p>
+    <p>Share your terminal: invite a person, your team or create a link. By default they can only watch; they can ask for the keyboard and you decide when to give it and for how long.</p>
+    <p xml:lang="es">Comparte tu terminal: invita a una persona, a tu equipo o crea un enlace. Por defecto solo pueden mirar; pueden pedirte el teclado y tú decides cuándo darlo y durante cuánto tiempo.</p>
+    <p>AI in the terminal and in the background: explain or fix a failed command, or ask the AI to investigate a failure or prepare a deployment. It asks for your approval before running anything sensitive and works with your own API keys.</p>
+    <p xml:lang="es">IA en la terminal y en segundo plano: explica o corrige un comando que ha fallado, o pide a la IA que investigue un fallo o prepare un despliegue. Te pide permiso antes de ejecutar algo delicado y funciona con tus propias claves de API.</p>
+    <p>Use the official server termoak.com or your own Termoak server, even several at once. Two-step verification, encrypted secrets and open source (AGPL-3.0), so you can audit it or run your own server. Free, no ads, no card required.</p>
+    <p xml:lang="es">Usa el servidor oficial termoak.com o tu propio servidor de Termoak, incluso varios a la vez. Verificación en dos pasos, secretos cifrados y código abierto (AGPL-3.0) para que puedas auditarlo o instalar tu propio servidor. Gratis, sin anuncios y sin tarjeta.</p>
+  </description>
+
+  <launchable type="desktop-id">com.termoak.Termoak.desktop</launchable>
+
+  <url type="homepage">https://termoak.com</url>
+  <url type="bugtracker">https://github.com/TermoakSSH/desktop/issues</url>
+  <url type="vcs-browser">https://github.com/TermoakSSH/desktop</url>
+  <url type="contribute">https://github.com/TermoakSSH/desktop/blob/main/CONTRIBUTING.md</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Split view with four SSH terminals and broadcast input</caption>
+      <caption xml:lang="es">Vista dividida con cuatro terminales SSH y escritura simultánea</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/split-view.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Hosts by group, with tags, favorites and the detected system</caption>
+      <caption xml:lang="es">Servidores por grupo, con etiquetas, favoritos y el sistema detectado</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/hosts.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The host editor: address first, credentials, group, tags and color</caption>
+      <caption xml:lang="es">El editor de servidores: primero la dirección, credenciales, grupo, etiquetas y color</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/host-editor.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Host menu: connect, split view, SFTP, favorites, move to group</caption>
+      <caption xml:lang="es">Menú del servidor: conectar, vista dividida, SFTP, favoritos, mover a un grupo</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/context-menu.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Settings: where the AI runs, with your own API keys or a local agent</caption>
+      <caption xml:lang="es">Ajustes: dónde se ejecuta la IA, con tus propias claves de API o un agente local</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/settings.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The light theme</caption>
+      <caption xml:lang="es">El tema claro</caption>
+      <image type="source" width="1440" height="900">https://raw.githubusercontent.com/TermoakSSH/desktop/desktop-v0.6.0/docs/hosts-light.png</image>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.6.0" date="2026-10-08">
+      <url type="details">https://github.com/TermoakSSH/desktop/releases/tag/desktop-v0.6.0</url>
+      <description>
+        <ul>
+          <li>AI in the terminal: explain and fix failed commands, AI tasks with approvals that show what will run, multi-host tasks and redaction of secrets</li>
+          <li>Telnet hosts and host logos</li>
+          <li>Import and export: Termoak JSON, CSV, ssh config, Termius, PuTTY, MobaXterm, SecureCRT and ZOC</li>
+          <li>SFTP transfer queue, drag and drop, and files dropped on a terminal are uploaded</li>
+          <li>Command palette, find in the terminal, workspaces, host status, app lock and notifications when a long command ends</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-10-06">
+      <url type="details">https://github.com/TermoakSSH/desktop/releases/tag/desktop-v0.4.0</url>
+      <description>
+        <ul>
+          <li>Several accounts and vaults: personal, shared with people or with your team, with Editor or Use-only permissions</li>
+          <li>Live session sharing: participants, one driver at a time, waiting room and join by link</li>
+          <li>Desktop notifications, File → New window and smaller binaries</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.2" date="2026-10-05">
+      <url type="details">https://github.com/TermoakSSH/desktop/releases/tag/desktop-v0.2.2</url>
+      <description>
+        <p>Split view with broadcast input, host and tab menus, selecting several hosts, paste options and a new host editor.</p>
+      </description>
+    </release>
+    <release version="0.2.1" date="2026-10-04">
+      <url type="details">https://github.com/TermoakSSH/desktop/releases/tag/desktop-v0.2.1</url>
+      <description>
+        <p>First release as Termoak.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#c8d98f</color>
+    <color type="primary" scheme_preference="dark">#2c3a22</color>
+  </branding>
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <recommends>
+    <internet>always</internet>
+  </recommends>
+
+  <provides>
+    <binary>termoak-desktop</binary>
+  </provides>
+
+  <categories>
+    <category>Network</category>
+    <category>RemoteAccess</category>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+
+  <keywords>
+    <keyword>ssh</keyword>
+    <keyword>sftp</keyword>
+    <keyword>telnet</keyword>
+    <keyword>terminal</keyword>
+    <keyword>serial</keyword>
+    <keyword>server</keyword>
+    <keyword xml:lang="es">servidor</keyword>
+    <keyword xml:lang="es">consola</keyword>
+  </keywords>
+</component>
