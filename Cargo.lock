@@ -8293,8 +8293,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.7.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.2#980caf3bc5d12203d8b26ff01c90ac950612ea72"
+version = "0.7.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.3#1548fc085315dfb53cdc9b9eda82d621f13e8eb5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8319,8 +8319,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.7.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.2#980caf3bc5d12203d8b26ff01c90ac950612ea72"
+version = "0.7.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.3#1548fc085315dfb53cdc9b9eda82d621f13e8eb5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8349,8 +8349,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.7.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.2#980caf3bc5d12203d8b26ff01c90ac950612ea72"
+version = "0.7.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.3#1548fc085315dfb53cdc9b9eda82d621f13e8eb5"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -8376,7 +8376,7 @@ dependencies = [
 
 [[package]]
 name = "termoak-desktop"
-version = "0.7.0-next.1"
+version = "0.7.0-next.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8426,8 +8426,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.7.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.2#980caf3bc5d12203d8b26ff01c90ac950612ea72"
+version = "0.7.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.3#1548fc085315dfb53cdc9b9eda82d621f13e8eb5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8449,8 +8449,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.7.0-next.2"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.2#980caf3bc5d12203d8b26ff01c90ac950612ea72"
+version = "0.7.0-next.3"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.3#1548fc085315dfb53cdc9b9eda82d621f13e8eb5"
 dependencies = [
  "base64 0.22.1",
  "chrono",

@@ -1786,6 +1786,12 @@ impl Render for HostEditor {
 
         // Address (big) and label.
         let address_error = self.error_for(Field::Address);
+        // A host in a tailnet: what its address looks like.
+        let tailnet_hint = self.network.as_ref().and_then(|state| {
+            let chosen = ui::chosen(state, cx).flatten();
+            let group = ui::chosen(&self.group, cx).flatten();
+            super::networks::tailnet_address_hint(&self.model, self.place, chosen, group, cx)
+        });
         let identity_block = v_flex()
             .gap_3()
             .child(
@@ -1803,6 +1809,14 @@ impl Render for HostEditor {
                             .large()
                             .prefix(ui::icon(IconName::Server).size(px(16.))),
                     )
+                    .when_some(tailnet_hint, |this, hint| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(hint),
+                        )
+                    })
                     .when_some(address_error, |this, e| this.child(error_text(e, cx))),
             )
             .child(

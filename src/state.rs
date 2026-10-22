@@ -1807,6 +1807,17 @@ impl AppModel {
             .is_some_and(|a| a.active() && crate::networks::supported(&a.info.features))
     }
 
+    /// The account's server can join networks of `kind`
+    /// (`features.network_kinds`; WireGuard only on servers without it).
+    pub fn network_kind_supported(
+        &self,
+        account: Id,
+        kind: &termoak_core::model::NetworkKind,
+    ) -> bool {
+        self.account(account)
+            .is_some_and(|a| a.active() && crate::networks::kind_supported(&a.info.features, kind))
+    }
+
     /// Accounts in sight whose server has private networks (empty: the
     /// networks are hidden everywhere).
     pub fn network_accounts(&self) -> Vec<Id> {

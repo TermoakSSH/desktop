@@ -11,16 +11,21 @@
 //! - Add or edit: WireGuard with a pasted or imported `.conf`, or with the
 //!   private key generated on the server ("Generate key on the server").
 //!   The private key is never shown again: it is a secret like a password.
-//!   Tailscale and ZeroTier come later (shown, not offered).
+//!   Tailscale/Headscale (when the server lists it in
+//!   `features.network_kinds`): the control server, an optional auth key
+//!   (kept, replaced or removed when editing), hostname, tags and
+//!   "ephemeral"; its state says what a login needs (the login page for
+//!   Editors, then the state every 2 s until it is up), and its devices can
+//!   be added as hosts by their MagicDNS name. ZeroTier comes later.
 //!
 //! Changes go through the REST API (the plan's limit and the public key
 //! are the server's) and reach the local stores by sync.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AppContext, ClickEvent, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
+    App, AppContext, ClickEvent, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
@@ -45,6 +50,13 @@ use crate::ui::{self, Choice, ChoiceState, IconName};
 /// Time between state checks of the networks on screen.
 const POLL: Duration = Duration::from_secs(15);
 
+/// A Tailscale login or approval: its state this often...
+const LOGIN_POLL: Duration = Duration::from_secs(2);
+/// ...for this long at most.
+const LOGIN_WAIT: Duration = Duration::from_secs(5 * 60);
+/// Test of a Tailscale network: how long it may stay "starting".
+const TAILNET_SETTLE: Duration = Duration::from_secs(30);
+
 /// A network as the screen shows it (from the local store, or just created
 /// here and not synced yet).
 #[derive(Clone)]
@@ -61,7 +73,11 @@ fn state_color(state: NetState, cx: &gpui::App) -> gpui::Hsla {
     let theme = cx.theme();
     match state {
         NetState::Up => theme.success,
-        NetState::Waiting | NetState::Starting | NetState::NeedsAuth => theme.warning,
+        NetState::Waiting
+        | NetState::Starting
+        | NetState::NeedsAuth
+        | NetState::NeedsLogin
+        | NetState::NeedsApproval => theme.warning,
         NetState::Error => theme.danger,
         NetState::Down | NetState::Unknown => theme.muted_foreground,
     }
@@ -166,6 +182,9 @@ pub struct NetworksView {
     loading_peers: bool,
     busy: bool,
     poll: Option<Task<()>>,
+    /// A Tailscale network waiting for its login or approval: its state
+    /// every 2 s until it settles.
+    watching: Option<(Id, Task<()>)>,
     /// The detail panel (back to its top when another network is chosen).
     detail_scroll: gpui::ScrollHandle,
     _subs: Vec<Subscription>,
@@ -208,6 +227,7 @@ impl NetworksView {
             loading_peers: false,
             busy: false,
             poll: None,
+            watching: None,
             detail_scroll: gpui::ScrollHandle::new(),
             _subs: subs,
         }
@@ -342,13 +362,79 @@ impl NetworksView {
         let id = row.network.id;
         let kind = row.network.kind.clone();
         let name = row.network.name.clone();
+        let tailnet = kind == NetworkKind::Tailscale;
+        let n2 = name.clone();
+        let row2 = row.clone();
         runtime::run_in(
             cx,
             window,
-            async move { api::up(&api, id).await.map_err(networks::error_text) },
+            async move {
+                if !tailnet {
+                    return api::up(&api, id).await.map_err(networks::error_text);
+                }
+                // `up` waits up to 10 s; joining can take a little longer.
+                let mut st = api::up(&api, id)
+                    .await
+                    .map_err(|e| networks::tailscale_error_text(e, &n2))?;
+                let until = Instant::now() + TAILNET_SETTLE;
+                while st.state == "starting" && Instant::now() < until {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Ok(s) = api::status(&api, id).await {
+                        st = s;
+                    }
+                }
+                Ok(st)
+            },
             move |this, res, window, cx| {
                 this.busy = false;
                 match res {
+                    Ok(status) if tailnet => {
+                        let state = status.state(&kind);
+                        let summary = networks::tailnet_summary(&status, true);
+                        let message = status.message.clone().unwrap_or_default();
+                        let node = status
+                            .node
+                            .as_ref()
+                            .and_then(|n| n.name.clone())
+                            .unwrap_or_default();
+                        this.book.update(cx, |b, cx| b.set_status(id, status, cx));
+                        match state {
+                            NetState::Up => ui::success(
+                                window,
+                                cx,
+                                t!("networks.ts.up_done", name = name, summary = summary),
+                            ),
+                            NetState::NeedsLogin => {
+                                ui::notify(
+                                    window,
+                                    cx,
+                                    ToastKind::Warning,
+                                    t!("networks.ts.test.login", name = name),
+                                );
+                                this.watch_login(&row2, window, cx);
+                            }
+                            NetState::NeedsApproval => {
+                                ui::notify(
+                                    window,
+                                    cx,
+                                    ToastKind::Warning,
+                                    t!("networks.ts.test.approval", name = name, node = node),
+                                );
+                                this.watch_login(&row2, window, cx);
+                            }
+                            NetState::Error => ui::error(
+                                window,
+                                cx,
+                                t!("networks.ts.test.error", name = name, error = message),
+                            ),
+                            other => ui::notify(
+                                window,
+                                cx,
+                                ToastKind::Warning,
+                                format!("{} · {}", other.label_for(&kind), other.hint()),
+                            ),
+                        }
+                    }
                     Ok(status) => {
                         let state = status.state(&kind);
                         this.book.update(cx, |b, cx| b.set_status(id, status, cx));
@@ -398,6 +484,131 @@ impl NetworksView {
                 cx.notify();
             },
         );
+    }
+
+    /// Follows a Tailscale login or approval: the state every 2 s until it
+    /// is no longer pending (5 minutes at most, while this view lives).
+    fn watch_login(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let id = row.network.id;
+        if self.watching.as_ref().is_some_and(|(w, _)| *w == id) {
+            return;
+        }
+        let kind = row.network.kind.clone();
+        let name = row.network.name.clone();
+        let account = row.account;
+        let deadline = Instant::now() + LOGIN_WAIT;
+        let task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LOGIN_POLL).await;
+                let go_on = this.update_in(cx, |this, window, cx| {
+                    let state = this
+                        .book
+                        .read(cx)
+                        .status(id)
+                        .map(|s| s.state(&kind))
+                        .unwrap_or(NetState::Unknown);
+                    if !state.pending() && state != NetState::Unknown {
+                        if state == NetState::Up {
+                            let summary = this
+                                .book
+                                .read(cx)
+                                .status(id)
+                                .map(|s| networks::tailnet_summary(s, true))
+                                .unwrap_or_default();
+                            ui::success(
+                                window,
+                                cx,
+                                t!("networks.ts.up_done", name = name, summary = summary),
+                            );
+                        }
+                        return false;
+                    }
+                    if Instant::now() > deadline {
+                        return false;
+                    }
+                    if let Some(api) = this.model.read(cx).api_of(Some(account)) {
+                        this.book.update(cx, |b, cx| b.refresh(api, id, true, cx));
+                    }
+                    true
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.watching.as_ref().is_some_and(|(w, _)| *w == id) {
+                    this.watching = None;
+                }
+                cx.notify();
+            });
+        });
+        self.watching = Some((id, task));
+        cx.notify();
+    }
+
+    /// "Open the login page": the browser, then the state every 2 s.
+    fn open_login(&mut self, row: Row, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(&url);
+        self.watch_login(&row, window, cx);
+    }
+
+    /// Adds every device of a tailnet that is not a host yet (port 22, by
+    /// its MagicDNS name).
+    fn add_all_devices(
+        &mut self,
+        row: Row,
+        devices: Vec<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = devices.len();
+        let tasks: Vec<_> = devices
+            .into_iter()
+            .map(|(label, address)| {
+                let host = Host {
+                    id: Id::nil(),
+                    label,
+                    address,
+                    group_id: None,
+                    tags: Vec::new(),
+                    settings: HostSettings {
+                        network_id: Some(row.network.id),
+                        ..Default::default()
+                    },
+                    notes: String::new(),
+                    color: None,
+                    os: None,
+                    os_version: None,
+                    favorite: false,
+                    protocol: Default::default(),
+                    icon: None,
+                };
+                let target = SaveTarget::Account {
+                    account: row.account,
+                    vault: row.vault,
+                };
+                self.model.update(cx, |m, cx| {
+                    m.save_host(host, None, None, Some(SyncMode::Synced), Some(target), cx)
+                })
+            })
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut errors = Vec::new();
+            for t in tasks {
+                if let Err(e) = t.await {
+                    errors.push(e.to_string());
+                }
+            }
+            let _ = this.update_in(cx, |_, window, cx| {
+                if errors.is_empty() {
+                    ui::success(window, cx, tn!("networks.ts.devices.added_all", count));
+                } else {
+                    ui::error(window, cx, errors.join("; "));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn generate_key(
@@ -524,10 +735,20 @@ impl NetworksView {
         self.loading_peers = true;
         cx.notify();
         let id = row.network.id;
+        let name = row.network.name.clone();
+        let tailnet = row.network.kind == NetworkKind::Tailscale;
         runtime::run_in(
             cx,
             window,
-            async move { api::peers(&api, id).await.map_err(networks::error_text) },
+            async move {
+                api::peers(&api, id).await.map_err(|e| {
+                    if tailnet {
+                        networks::tailscale_error_text(e, &name)
+                    } else {
+                        networks::error_text(e)
+                    }
+                })
+            },
             move |this, res, _, cx| {
                 this.loading_peers = false;
                 if this.selected == Some(id) {
@@ -557,9 +778,14 @@ impl NetworksView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let tailnet = row.network.kind == NetworkKind::Tailscale;
         let addr = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("10.0.0.5")
+                .placeholder(if tailnet && address.exact {
+                    "nas.tail1234.ts.net"
+                } else {
+                    "10.0.0.5"
+                })
                 .default_value(address.address.clone())
         });
         let name = cx.new(|cx| {
@@ -570,11 +796,15 @@ impl NetworksView {
         ui::focus_later(if address.exact { &name } else { &addr }, window, cx);
         let (a2, n2) = (addr.clone(), name.clone());
         let model = self.model.clone();
-        let hint = t!(
-            "networks.add_host.address_hint",
-            source = address.source,
-            network = row.network.name
-        );
+        let hint = if tailnet && address.exact {
+            t!("networks.ts.address_hint")
+        } else {
+            t!(
+                "networks.add_host.address_hint",
+                source = address.source,
+                network = row.network.name
+            )
+        };
         ui::open_form_dialog(
             window,
             cx,
@@ -646,9 +876,17 @@ impl NetworksView {
         );
     }
 
-    /// Add (`None`) or edit a network.
-    fn open_form(&mut self, editing: Option<Row>, window: &mut Window, cx: &mut Context<Self>) {
-        let form = cx.new(|cx| NetworkForm::new(self.model.clone(), editing.clone(), window, cx));
+    /// Add (`None`) or edit a network (`key_mode`: the Tailscale key
+    /// choice to start with, "Use another key").
+    fn open_form(
+        &mut self,
+        editing: Option<Row>,
+        key_mode: Option<TsKeyMode>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let form = cx
+            .new(|cx| NetworkForm::new(self.model.clone(), editing.clone(), key_mode, window, cx));
         if form.read(cx).destinations.is_empty() && editing.is_none() {
             ui::error(window, cx, t!("networks.form.no_vault"));
             return;
@@ -693,15 +931,25 @@ impl NetworksView {
         let generate = plan.generate;
         let replace = plan.replace;
         let creating = plan.vault.is_some();
+        // A new tailnet network, or a new key: join it at once (Test).
+        let join =
+            plan.network.kind == NetworkKind::Tailscale && (creating || plan.secret.is_some());
         let task = runtime::spawn(cx, async move {
             let res = match plan.vault {
                 Some(vault) => api::create(&api, vault, &plan.network, plan.secret.as_ref()).await,
-                None => api::update(&api, &plan.network, plan.secret.as_ref()).await,
+                None => {
+                    let change = match (&plan.secret, plan.clear_secret) {
+                        (Some(s), _) => api::SecretChange::Set(s),
+                        (None, true) => api::SecretChange::Clear,
+                        (None, false) => api::SecretChange::Keep,
+                    };
+                    api::update(&api, &plan.network, change).await
+                }
             };
             if let Some(s) = plan.secret.as_mut() {
                 s.zeroize();
             }
-            let rec = res.map_err(networks::error_text)?;
+            let rec = res.map_err(networks::save_error_text)?;
             // The server makes the private key and keeps it.
             let key = if generate {
                 match api::generate_key(&api, rec.data.id, replace).await {
@@ -752,7 +1000,11 @@ impl NetworksView {
                             },
                         );
                         if let Some(row) = this.pending.get(&id).cloned() {
-                            this.refresh_state(&row, true, cx);
+                            if join {
+                                this.up(row, window, cx);
+                            } else {
+                                this.refresh_state(&row, true, cx);
+                            }
                         }
                         this.changed(account, cx);
                     }
@@ -835,6 +1087,12 @@ impl NetworksView {
     fn render_list(&self, rows: &[Row], cx: &mut Context<Self>) -> gpui::AnyElement {
         let book = self.book.read(cx);
         let states: Vec<NetState> = rows.iter().map(|r| state_of(book, &r.network)).collect();
+        let joinable: Vec<bool> = {
+            let m = self.model.read(cx);
+            rows.iter()
+                .map(|r| m.network_kind_supported(r.account, &r.network.kind))
+                .collect()
+        };
         let vaults: Vec<String> = rows
             .iter()
             .map(|r| {
@@ -904,7 +1162,16 @@ impl NetworksView {
                                     .child(sub),
                             ),
                     )
-                    .child(state_pill_short(("network-state", i), states[i], cx))
+                    .map(|this| {
+                        if joinable[i] {
+                            this.child(state_pill_short(("network-state", i), states[i], cx))
+                        } else {
+                            this.child(ui::pill(
+                                t!("networks.state.cannot_join"),
+                                theme.muted_foreground,
+                            ))
+                        }
+                    })
             }))
             .into_any_element()
     }
@@ -926,6 +1193,31 @@ impl NetworksView {
         let busy = self.busy;
         let editable = row.can_write;
         let wireguard = row.network.kind == NetworkKind::Wireguard;
+        let tailnet = row.network.kind == NetworkKind::Tailscale;
+        // The server can join it (a Tailscale network synced from a server
+        // that can, seen through one that cannot).
+        let available = self
+            .model
+            .read(cx)
+            .network_kind_supported(row.account, &row.network.kind);
+        let watching = self
+            .watching
+            .as_ref()
+            .is_some_and(|(id, _)| *id == row.network.id);
+        let hosts_all: Vec<(Id, String, String, Option<Id>)> = {
+            let m = self.model.read(cx);
+            m.hosts
+                .iter()
+                .map(|h| {
+                    (
+                        h.data.id,
+                        h.data.label.clone(),
+                        h.data.address.clone(),
+                        h.data.settings.network_id,
+                    )
+                })
+                .collect()
+        };
         let wg = row.network.wireguard.clone().unwrap_or_default();
         let public_key = self
             .generated
@@ -950,6 +1242,7 @@ impl NetworksView {
             row.clone(),
             row.clone(),
         );
+        let (r_login, r_key) = (row.clone(), row.clone());
 
         let header =
             h_flex()
@@ -995,7 +1288,7 @@ impl NetworksView {
                             .icon(ui::icon(IconName::Pencil))
                             .label(t!("common.edit"))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.open_form(Some(r_edit.clone()), window, cx)
+                                this.open_form(Some(r_edit.clone()), None, window, cx)
                             })),
                     )
                     .child(
@@ -1022,6 +1315,55 @@ impl NetworksView {
                     },
                 ));
             }
+            if tailnet && s.state == "up" {
+                facts.push((
+                    t!("networks.ts.detail.summary"),
+                    networks::tailnet_summary(s, true),
+                ));
+            }
+            if tailnet {
+                facts.push((
+                    t!("networks.ts.detail.control"),
+                    networks::control_server_label(
+                        s.control_url.as_deref().or(row
+                            .network
+                            .tailscale
+                            .as_ref()
+                            .and_then(|t| t.control_url.as_deref())),
+                    ),
+                ));
+                if let Some(v) = s.tailnet.clone().filter(|v| !v.is_empty()) {
+                    facts.push((t!("networks.ts.detail.tailnet"), v));
+                }
+                if let Some(v) = s.magic_dns_suffix.clone().filter(|v| !v.is_empty()) {
+                    facts.push((t!("networks.ts.detail.magic_dns"), v));
+                }
+                if let Some(node) = &s.node {
+                    let mut names: Vec<String> = Vec::new();
+                    names.extend(node.name.clone());
+                    if let Some(d) = node.dns_name.as_deref().map(|d| d.trim_end_matches('.'))
+                        && !names.iter().any(|n| n == d)
+                    {
+                        names.push(d.to_string());
+                    }
+                    if !names.is_empty() {
+                        facts.push((t!("networks.ts.detail.node"), names.join(" · ")));
+                    }
+                    if let Some(idn) = node.node_id.clone() {
+                        facts.push((t!("networks.ts.detail.node_id"), idn));
+                    }
+                }
+                if let Some(e) = s.ephemeral {
+                    facts.push((
+                        t!("networks.ts.detail.ephemeral"),
+                        if e {
+                            t!("networks.ts.detail.ephemeral_yes").to_string()
+                        } else {
+                            t!("networks.ts.detail.ephemeral_no").to_string()
+                        },
+                    ));
+                }
+            }
             if let Some(node) = &s.node
                 && !node.addresses.is_empty()
             {
@@ -1047,7 +1389,101 @@ impl NetworksView {
         let message = status
             .as_ref()
             .and_then(|s| s.message.clone())
-            .filter(|m| !m.trim().is_empty());
+            .filter(|m| !m.trim().is_empty())
+            // A tailnet's login and approval are said below, in words.
+            .filter(|_| {
+                !(tailnet && matches!(state, NetState::NeedsLogin | NetState::NeedsApproval))
+            });
+        let last_error = status
+            .as_ref()
+            .filter(|_| tailnet && state == NetState::Error)
+            .and_then(|s| s.last_error.clone())
+            .filter(|e| !message.as_deref().unwrap_or("").contains(e.as_str()));
+        let auth_url = status
+            .as_ref()
+            .and_then(|s| s.node.as_ref()?.auth_url.clone())
+            .filter(|u| !u.trim().is_empty());
+        let node_name = status
+            .as_ref()
+            .and_then(|s| s.node.as_ref()?.name.clone())
+            .unwrap_or_else(|| "—".to_string());
+        // What a Tailscale login or approval needs, and "Use another key".
+        let tailnet_box: Option<gpui::AnyElement> = (tailnet && available).then(|| match state {
+            NetState::NeedsLogin => {
+                let can_open = editable && auth_url.is_some();
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.warning)
+                    .child(div().font_semibold().child(t!("networks.ts.login.title")))
+                    .child(div().text_sm().child(if can_open {
+                        t!("networks.ts.login.text")
+                    } else {
+                        t!("networks.ts.login.use_only")
+                    }))
+                    .when(watching, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("networks.ts.login.waiting")),
+                        )
+                    })
+                    .when_some(auth_url.clone().filter(|_| can_open), |this, url| {
+                        this.child(
+                            h_flex().child(
+                                Button::new("tailnet-login")
+                                    .small()
+                                    .primary()
+                                    .icon(ui::icon(IconName::ExternalLink))
+                                    .label(t!("networks.ts.login.open"))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.open_login(
+                                                r_login.clone(),
+                                                url.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            ),
+                        )
+                    })
+                    .into_any_element()
+            }
+            NetState::NeedsApproval => v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.warning)
+                .child(
+                    div()
+                        .font_semibold()
+                        .child(t!("networks.ts.approval.title")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .child(t!("networks.ts.approval.text", node = node_name)),
+                )
+                .into_any_element(),
+            NetState::Error if editable => h_flex()
+                .child(
+                    Button::new("tailnet-new-key")
+                        .small()
+                        .icon(ui::icon(IconName::KeyRound))
+                        .label(t!("networks.ts.error.other_key"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_form(Some(r_key.clone()), Some(TsKeyMode::New), window, cx)
+                        })),
+                )
+                .into_any_element(),
+            _ => div().into_any_element(),
+        });
         let state_card = ui::card(cx)
             .p_4()
             .gap_3()
@@ -1077,7 +1513,7 @@ impl NetworksView {
                                 this.refresh_state(&r_ref, true, cx)
                             })),
                     )
-                    .when(editable, |this| {
+                    .when(editable && available, |this| {
                         this.child(
                             Button::new("network-up")
                                 .small()
@@ -1106,7 +1542,13 @@ impl NetworksView {
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(state.hint()),
+                    .child(if available {
+                        state.hint_for(&row.network.kind)
+                    } else if tailnet {
+                        t!("networks.ts.unsupported").to_string()
+                    } else {
+                        t!("networks.unsupported_kind").to_string()
+                    }),
             )
             .when_some(message, |this, m| {
                 this.child(
@@ -1120,6 +1562,16 @@ impl NetworksView {
                         .child(m),
                 )
             })
+            .when_some(last_error, |this, e| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .font_family(mono.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(t!("networks.ts.error.details", error = e)),
+                )
+            })
+            .children(tailnet_box)
             .children(facts.into_iter().map(|(k, v)| {
                 h_flex()
                     .gap_2()
@@ -1306,6 +1758,73 @@ impl NetworksView {
                 }))
         });
 
+        // Tailscale settings (no secrets).
+        let tailscale_card = tailnet.then(|| {
+            let ts = row.network.tailscale.clone().unwrap_or_default();
+            let mut lines: Vec<(SharedString, String)> = vec![
+                (
+                    t!("networks.ts.detail.control"),
+                    match &ts.control_url {
+                        Some(u) => format!("Headscale · {u}"),
+                        None => "Tailscale".to_string(),
+                    },
+                ),
+                (
+                    t!("networks.ts.form.hostname"),
+                    ts.hostname.clone().unwrap_or_else(|| {
+                        networks::default_tailscale_hostname(Some(row.network.id))
+                    }),
+                ),
+                (
+                    t!("networks.ts.form.tags"),
+                    if ts.tags.is_empty() {
+                        t!("networks.ts.detail.key_tags").to_string()
+                    } else {
+                        ts.tags.join(", ")
+                    },
+                ),
+                (
+                    t!("networks.ts.detail.ephemeral"),
+                    match ts.ephemeral {
+                        Some(true) => t!("networks.ts.detail.ephemeral_yes").to_string(),
+                        Some(false) => t!("networks.ts.detail.ephemeral_no").to_string(),
+                        None => t!("networks.ts.detail.ephemeral_default").to_string(),
+                    },
+                ),
+            ];
+            if editable {
+                lines.push((
+                    t!("networks.ts.form.key"),
+                    if row.has_secret {
+                        t!("networks.ts.detail.with_key").to_string()
+                    } else {
+                        t!("networks.ts.detail.without_key").to_string()
+                    },
+                ));
+            }
+            ui::card(cx)
+                .p_4()
+                .gap_2()
+                .child(
+                    div()
+                        .font_semibold()
+                        .child(t!("networks.detail.configuration")),
+                )
+                .children(lines.into_iter().map(|(k, v)| {
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .flex_shrink_0()
+                                .text_color(theme.muted_foreground)
+                                .child(k),
+                        )
+                        .child(div().min_w_0().child(v))
+                }))
+        });
+
         // Hosts that use it.
         let hosts_card = ui::card(cx)
             .p_4()
@@ -1332,7 +1851,7 @@ impl NetworksView {
             );
 
         // Devices of the network, to add hosts at.
-        let peers_card = editable.then(|| {
+        let peers_card = (editable && available && !tailnet).then(|| {
             let peers = self
                 .peers
                 .as_ref()
@@ -1453,6 +1972,225 @@ impl NetworksView {
                 })
         });
 
+        // Tailscale: the tailnet's devices the server's node sees, to add
+        // as hosts by their MagicDNS name (marked once added).
+        let devices_card = (editable && available && tailnet).then(|| {
+            let peers = self
+                .peers
+                .as_ref()
+                .filter(|(id, _)| *id == row.network.id)
+                .map(|(_, p)| p.clone());
+            let net_id = row.network.id;
+            let fresh: Vec<(String, String)> = match &peers {
+                Some(Ok(list)) => list
+                    .iter()
+                    .filter(|p| p.imported_in(net_id, &hosts_all).is_none())
+                    .filter_map(|p| {
+                        let address = p.device_address()?;
+                        Some((p.name.clone().unwrap_or_else(|| address.clone()), address))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let r_all = row.clone();
+            let r_load = row.clone();
+            ui::card(cx)
+                .p_4()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_semibold()
+                                .child(t!("networks.ts.devices.title")),
+                        )
+                        .when(fresh.len() > 1, |this| {
+                            let n = fresh.len();
+                            let fresh = fresh.clone();
+                            this.child(
+                                Button::new("tailnet-add-all")
+                                    .small()
+                                    .primary()
+                                    .icon(ui::icon(IconName::ServerPlus))
+                                    .label(tn!("networks.ts.devices.add_all", n))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.add_all_devices(
+                                                r_all.clone(),
+                                                fresh.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    )),
+                            )
+                        })
+                        .child(
+                            Button::new("network-peers")
+                                .small()
+                                .icon(ui::icon(IconName::Import))
+                                .label(if peers.is_some() {
+                                    t!("common.refresh")
+                                } else {
+                                    t!("networks.peers.show")
+                                })
+                                .disabled(self.loading_peers)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.load_peers(&r_load, window, cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("networks.ts.devices.hint")),
+                )
+                .map(|this| match peers {
+                    None => this,
+                    Some(Err(e)) => this.child(div().text_sm().text_color(theme.danger).child(e)),
+                    Some(Ok(list)) if list.is_empty() => this.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(t!("networks.ts.devices.empty")),
+                    ),
+                    Some(Ok(list)) => this.children(list.into_iter().enumerate().map(|(i, p)| {
+                        let online = p.online.unwrap_or(false);
+                        let title = p.title();
+                        let imported = p
+                            .imported_in(net_id, &hosts_all)
+                            .map(|(_, label, _, _)| label.clone());
+                        let address = p.device_address();
+                        let routes = p.host_routes();
+                        let mut meta: Vec<String> = Vec::new();
+                        meta.extend(address.clone().filter(|a| *a != title));
+                        if !p.addresses.is_empty() {
+                            meta.push(p.addresses.join(", "));
+                        }
+                        meta.extend(p.os.clone());
+                        if !online && let Some(at) = p.last_seen {
+                            meta.push(t!("networks.peers.seen", ago = ago(at)).to_string());
+                        }
+                        if !routes.is_empty() {
+                            meta.push(
+                                t!("networks.ts.devices.routes", routes = routes.join(", "))
+                                    .to_string(),
+                            );
+                        }
+                        let row_a = row.clone();
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .flex_wrap()
+                            .p_2()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(div().size(px(8.)).rounded_full().bg(if online {
+                                theme.success
+                            } else {
+                                theme.muted_foreground
+                            }))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .flex_wrap()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .mr_1()
+                                                    .child(title.clone()),
+                                            )
+                                            .children(
+                                                p.tags
+                                                    .iter()
+                                                    .map(|tag| ui::pill(tag.clone(), theme.info)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(meta.join(" · ")),
+                                    ),
+                            )
+                            .map(|this| match (&imported, &address) {
+                                (Some(label), _) => this.child(ui::pill(
+                                    t!("networks.ts.devices.imported", name = label),
+                                    theme.success,
+                                )),
+                                (None, Some(addr)) => {
+                                    let a = networks::HostAddress {
+                                        address: addr.clone(),
+                                        exact: true,
+                                        source: addr.clone(),
+                                    };
+                                    let (row, title) = (row_a.clone(), title.clone());
+                                    this.child(
+                                        Button::new(("device-add", i))
+                                            .xsmall()
+                                            .icon(ui::icon(IconName::ServerPlus))
+                                            .label(t!("networks.ts.devices.add"))
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    this.add_host(
+                                                        row.clone(),
+                                                        a.clone(),
+                                                        title.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
+                                    )
+                                }
+                                (None, None) => this,
+                            })
+                            .children(routes.into_iter().enumerate().map(|(j, r)| {
+                                let row = row_a.clone();
+                                let a = networks::host_addresses(&NetPeer {
+                                    addresses: vec![r.clone()],
+                                    ..Default::default()
+                                })
+                                .into_iter()
+                                .next()
+                                .unwrap_or(
+                                    networks::HostAddress {
+                                        address: String::new(),
+                                        exact: false,
+                                        source: r.clone(),
+                                    },
+                                );
+                                Button::new(("device-route", i * 100 + j))
+                                    .xsmall()
+                                    .icon(ui::icon(IconName::ServerPlus))
+                                    .label(t!("networks.peers.add_in", subnet = r))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.add_host(
+                                                row.clone(),
+                                                a.clone(),
+                                                String::new(),
+                                                window,
+                                                cx,
+                                            )
+                                        },
+                                    ))
+                            }))
+                    })),
+                })
+        });
+
         let _ = window;
         v_flex()
             .gap_4()
@@ -1461,8 +2199,10 @@ impl NetworksView {
             .child(state_card)
             .children(key_card)
             .children(config_card)
+            .children(tailscale_card)
             .child(hosts_card)
             .children(peers_card)
+            .children(devices_card)
             .when(!editable, |this| {
                 this.child(
                     div()
@@ -1588,7 +2328,7 @@ impl Render for NetworksView {
                             .label(t!("networks.add"))
                             .disabled(!supported || !can_add || self.busy)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.open_form(None, window, cx)
+                                this.open_form(None, None, window, cx)
                             })),
                     ),
                 cx,
@@ -1607,6 +2347,8 @@ struct SavePlan {
     network: Network,
     /// `None`: keep (editing) or none yet.
     secret: Option<NetworkSecret>,
+    /// Remove the stored secret (Tailscale: "Remove the key").
+    clear_secret: bool,
     /// Ask the server for the private key afterwards.
     generate: bool,
     /// ...replacing the stored one.
@@ -1621,10 +2363,24 @@ struct Destination {
     vault: Id,
 }
 
+/// What an edit does with a Tailscale auth key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TsKeyMode {
+    /// Keep the stored key (or none, if there is none).
+    Keep,
+    /// A new key (creating: the optional key).
+    New,
+    /// Remove the stored key (the next start needs a login).
+    Remove,
+}
+
 struct NetworkForm {
     editing: Option<Row>,
     destinations: Vec<Destination>,
     destination: Option<ChoiceState<usize>>,
+    /// Accounts whose server joins Tailscale networks.
+    tailscale_accounts: Vec<Id>,
+    kind: NetworkKind,
     name: Entity<InputState>,
     description: Entity<InputState>,
     conf: Entity<TextareaState>,
@@ -1634,6 +2390,17 @@ struct NetworkForm {
     generate: bool,
     /// Whether the last parsed `.conf` had a private key.
     conf_has_key: Option<bool>,
+    // Tailscale / Headscale.
+    ts_headscale: bool,
+    ts_url: Entity<InputState>,
+    ts_key: Entity<InputState>,
+    ts_key_mode: TsKeyMode,
+    ts_hostname: Entity<InputState>,
+    ts_tags: Entity<InputState>,
+    /// The stored `ephemeral` (`None`: the default).
+    ts_ephemeral: Option<bool>,
+    /// The switch, once the user changed it.
+    ts_ephemeral_set: Option<bool>,
     _subs: Vec<Subscription>,
 }
 
@@ -1641,11 +2408,17 @@ impl NetworkForm {
     fn new(
         model: Entity<AppModel>,
         editing: Option<Row>,
+        key_mode: Option<TsKeyMode>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let m = model.read(cx);
         let multi = m.network_accounts().len() > 1;
+        let tailscale_accounts: Vec<Id> = m
+            .network_accounts()
+            .into_iter()
+            .filter(|a| m.network_kind_supported(*a, &NetworkKind::Tailscale))
+            .collect();
         let mut destinations = Vec::new();
         let mut choices = Vec::new();
         if editing.is_none() {
@@ -1706,11 +2479,57 @@ impl NetworkForm {
                 .placeholder(CONF_TEMPLATE)
                 .default_value(conf_value)
         });
-        ui::focus_later(&name, window, cx);
+        let ts = net
+            .as_ref()
+            .and_then(|n| n.tailscale.clone())
+            .unwrap_or_default();
+        let ts_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://headscale.example.com")
+                .default_value(ts.control_url.clone().unwrap_or_default())
+        });
+        let ts_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("tskey-auth-… · hskey-auth-…")
+        });
+        let net_id = net.as_ref().map(|n| n.id);
+        let ts_hostname = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!(
+                    "networks.ts.form.hostname_auto",
+                    name = networks::default_tailscale_hostname(net_id)
+                ))
+                .default_value(ts.hostname.clone().unwrap_or_default())
+        });
+        let ts_tags = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("tag:termoak")
+                .default_value(ts.tags.join(", "))
+        });
+        let kind = net
+            .as_ref()
+            .map(|n| n.kind.clone())
+            .unwrap_or(NetworkKind::Wireguard);
+        let ts_key_mode = match (&editing, key_mode) {
+            (_, Some(m)) => m,
+            (Some(_), None) => TsKeyMode::Keep,
+            (None, None) => TsKeyMode::New,
+        };
+        if key_mode == Some(TsKeyMode::New) {
+            ui::focus_later(&ts_key, window, cx);
+        } else {
+            ui::focus_later(&name, window, cx);
+        }
         let subs = vec![
             cx.subscribe_in(&conf, window, |this, _, ev: &InputEvent, _, cx| {
                 if let InputEvent::Change = ev {
                     this.reparse(cx);
+                }
+            }),
+            cx.subscribe_in(&ts_key, window, |_, _, ev: &InputEvent, _, cx| {
+                if let InputEvent::Change = ev {
+                    cx.notify();
                 }
             }),
         ];
@@ -1718,12 +2537,22 @@ impl NetworkForm {
             editing,
             destinations,
             destination,
+            tailscale_accounts,
+            kind,
             name,
             description,
             conf,
             parsed: None,
             generate: true,
             conf_has_key: None,
+            ts_headscale: ts.control_url.is_some(),
+            ts_url,
+            ts_key,
+            ts_key_mode,
+            ts_hostname,
+            ts_tags,
+            ts_ephemeral: ts.ephemeral,
+            ts_ephemeral_set: None,
             _subs: subs,
         };
         form.reparse(cx);
@@ -1786,46 +2615,68 @@ impl NetworkForm {
             .detach();
     }
 
-    /// The request to send, or why not.
-    fn plan(&mut self, cx: &mut Context<Self>) -> Result<SavePlan, String> {
-        self.reparse(cx);
-        let name = self.name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            return Err(t!("networks.form.error_name").to_string());
-        }
-        let description = self.description.read(cx).value().trim().to_string();
-        let parsed = match self.parsed.clone() {
-            Some(Ok(c)) => c,
-            Some(Err(e)) => return Err(e),
-            None => return Err(t!("networks.form.error_conf").to_string()),
-        };
-        let (account, vault, mut network) = match &self.editing {
-            Some(r) => (r.account, None, r.network.clone()),
+    /// The destination chosen (creating), or the network's account
+    /// (editing).
+    fn target(&self, cx: &App) -> Result<(Id, Option<Id>), String> {
+        match &self.editing {
+            Some(r) => Ok((r.account, None)),
             None => {
                 let ix = self
                     .destination
                     .as_ref()
                     .and_then(|d| ui::chosen(d, cx))
                     .unwrap_or(0);
-                let d = self
-                    .destinations
+                self.destinations
                     .get(ix)
-                    .cloned()
-                    .ok_or_else(|| t!("networks.form.no_vault").to_string())?;
-                (
-                    d.account,
-                    Some(d.vault),
-                    Network {
-                        id: Id::nil(),
-                        name: String::new(),
-                        kind: NetworkKind::Wireguard,
-                        description: String::new(),
-                        wireguard: None,
-                        tailscale: None,
-                        zerotier: None,
-                    },
-                )
+                    .map(|d| (d.account, Some(d.vault)))
+                    .ok_or_else(|| t!("networks.form.no_vault").to_string())
             }
+        }
+    }
+
+    /// Whether the network will have an auth key after saving (for the
+    /// default of "ephemeral").
+    fn ts_key_after(&self, cx: &App) -> bool {
+        let has_secret = self.editing.as_ref().is_some_and(|r| r.has_secret);
+        match self.ts_key_mode {
+            TsKeyMode::Keep => has_secret,
+            TsKeyMode::Remove => false,
+            TsKeyMode::New => {
+                self.editing.is_some() || !self.ts_key.read(cx).value().trim().is_empty()
+            }
+        }
+    }
+
+    /// The request to send, or why not.
+    fn plan(&mut self, cx: &mut Context<Self>) -> Result<SavePlan, String> {
+        let name = self.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return Err(t!("networks.form.error_name").to_string());
+        }
+        let description = self.description.read(cx).value().trim().to_string();
+        let (account, vault) = self.target(cx)?;
+        let mut network = match &self.editing {
+            Some(r) => r.network.clone(),
+            None => Network {
+                id: Id::nil(),
+                name: String::new(),
+                kind: self.kind.clone(),
+                description: String::new(),
+                wireguard: None,
+                tailscale: None,
+                zerotier: None,
+            },
+        };
+        network.name = name;
+        network.description = description;
+        if self.kind == NetworkKind::Tailscale {
+            return self.plan_tailscale(account, vault, network, cx);
+        }
+        self.reparse(cx);
+        let parsed = match self.parsed.clone() {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => return Err(e),
+            None => return Err(t!("networks.form.error_conf").to_string()),
         };
         if parsed.private_key.is_none()
             && parsed.preshared_key.is_some()
@@ -1833,8 +2684,6 @@ impl NetworkForm {
         {
             return Err(t!("networks.form.error_psk_needs_key").to_string());
         }
-        network.name = name;
-        network.description = description;
         network.kind = NetworkKind::Wireguard;
         let mut config = parsed.config.clone();
         // The server derives it from the private key.
@@ -1859,24 +2708,63 @@ impl NetworkForm {
             vault,
             network,
             secret,
+            clear_secret: false,
             generate: self.generate,
             replace: self.generate && has_secret,
         })
     }
-}
 
-impl Render for NetworkForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn plan_tailscale(
+        &mut self,
+        account: Id,
+        vault: Option<Id>,
+        mut network: Network,
+        cx: &mut Context<Self>,
+    ) -> Result<SavePlan, String> {
+        if !self.tailscale_accounts.contains(&account) {
+            return Err(t!("networks.ts.unsupported").to_string());
+        }
+        let stored = network.tailscale.clone().unwrap_or_default();
+        let url = self
+            .ts_url
+            .read(cx)
+            .value()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let hostname = self.ts_hostname.read(cx).value().trim().to_string();
+        let config = termoak_core::model::TailscaleConfig {
+            control_url: self.ts_headscale.then_some(url),
+            hostname: Some(hostname).filter(|h| !h.is_empty()),
+            tags: networks::parse_tags(&self.ts_tags.read(cx).value()),
+            ephemeral: self.ts_ephemeral_set.or(stored.ephemeral),
+        };
+        let key = self.ts_key.read(cx).value().trim().to_string();
+        let new_key = self.ts_key_mode == TsKeyMode::New && !key.is_empty();
+        if self.ts_key_mode == TsKeyMode::New && key.is_empty() && self.editing.is_some() {
+            return Err(t!("networks.ts.error.key_missing").to_string());
+        }
+        networks::tailscale_problem(&config, new_key.then_some(key.as_str()))?;
+        network.kind = NetworkKind::Tailscale;
+        network.tailscale = Some(config);
+        Ok(SavePlan {
+            account,
+            vault,
+            network,
+            secret: new_key.then(|| NetworkSecret {
+                auth_key: Some(key),
+                ..Default::default()
+            }),
+            clear_secret: self.ts_key_mode == TsKeyMode::Remove,
+            generate: false,
+            replace: false,
+        })
+    }
+
+    fn render_wireguard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let editing = self.editing.is_some();
         let has_secret = self.editing.as_ref().is_some_and(|r| r.has_secret);
         let theme = cx.theme();
-        let kind_button = |id: &'static str, label: &'static str, on: bool| {
-            Button::new(id)
-                .small()
-                .label(label)
-                .map(|b| if on { b.primary() } else { b.ghost() })
-                .disabled(!on)
-        };
         let summary: gpui::AnyElement = match &self.parsed {
             None => div()
                 .text_xs()
@@ -1920,49 +2808,6 @@ impl Render for NetworkForm {
         let conf_has_key = matches!(&self.parsed, Some(Ok(c)) if c.private_key.is_some());
         v_flex()
             .gap_3()
-            .when(!editing, |this| {
-                this.child(ui::field(
-                    t!("networks.form.kind"),
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .flex_wrap()
-                        .child(kind_button("kind-wireguard", "WireGuard", true))
-                        .child(kind_button(
-                            "kind-tailscale",
-                            "Tailscale / Headscale",
-                            false,
-                        ))
-                        .child(kind_button("kind-zerotier", "ZeroTier", false))
-                        .child(ui::pill(
-                            t!("networks.form.coming_soon"),
-                            theme.muted_foreground,
-                        )),
-                    cx,
-                ))
-            })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_start()
-                    .child(div().flex_1().min_w_0().child(ui::field(
-                        t!("common.name"),
-                        Input::new(&self.name),
-                        cx,
-                    )))
-                    .when_some(self.destination.clone(), |this, d| {
-                        this.child(div().w(px(220.)).flex_shrink_0().child(ui::field(
-                            t!("networks.form.vault"),
-                            Select::new(&d),
-                            cx,
-                        )))
-                    }),
-            )
-            .child(ui::field(
-                t!("networks.form.description"),
-                Input::new(&self.description),
-                cx,
-            ))
             .child(
                 v_flex()
                     .gap_1()
@@ -2017,12 +2862,303 @@ impl Render for NetworkForm {
                         })),
                 )
             })
+            .into_any_element()
+    }
+
+    fn render_tailscale(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let editing = self.editing.is_some();
+        let has_secret = self.editing.as_ref().is_some_and(|r| r.has_secret);
+        let headscale = self.ts_headscale;
+        let key_mode = self.ts_key_mode;
+        let key_after = self.ts_key_after(cx);
+        let ephemeral = self
+            .ts_ephemeral_set
+            .or(self.ts_ephemeral)
+            .unwrap_or(key_after);
+        let ephemeral_note = if self.ts_ephemeral_set.is_some() || self.ts_ephemeral.is_some() {
+            t!("networks.ts.form.ephemeral_set")
+        } else if key_after {
+            t!("networks.ts.form.ephemeral_default_on")
+        } else {
+            t!("networks.ts.form.ephemeral_default_off")
+        };
+        let net_id = self.editing.as_ref().map(|r| r.network.id);
+        let theme = cx.theme();
+        let toggle = |id: &'static str, label: SharedString, on: bool| {
+            Button::new(id)
+                .small()
+                .label(label)
+                .map(|b| if on { b.primary() } else { b.ghost() })
+        };
+        let key_hint = v_flex()
+            .gap_0p5()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(t!("networks.ts.form.key_hint"))
+            .child(if headscale {
+                t!("networks.ts.form.key_hint_headscale")
+            } else {
+                t!("networks.ts.form.key_hint_tailscale")
+            })
+            .child(t!("networks.ts.form.key_hint_none"));
+        let modes: Vec<(TsKeyMode, &'static str, SharedString)> = if !editing {
+            Vec::new()
+        } else if has_secret {
+            vec![
+                (
+                    TsKeyMode::Keep,
+                    "ts-key-keep",
+                    t!("networks.ts.form.key_keep"),
+                ),
+                (TsKeyMode::New, "ts-key-new", t!("networks.ts.form.key_new")),
+                (
+                    TsKeyMode::Remove,
+                    "ts-key-remove",
+                    t!("networks.ts.form.key_remove"),
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    TsKeyMode::Keep,
+                    "ts-key-none",
+                    t!("networks.ts.form.key_none"),
+                ),
+                (TsKeyMode::New, "ts-key-add", t!("networks.ts.form.key_add")),
+            ]
+        };
+        let mode_hint = match (key_mode, has_secret) {
+            (TsKeyMode::Keep, true) => t!("networks.ts.form.key_keep_hint"),
+            (TsKeyMode::Keep, false) => t!("networks.ts.form.key_none_hint"),
+            (TsKeyMode::Remove, _) => t!("networks.ts.form.key_remove_hint"),
+            (TsKeyMode::New, _) => t!("networks.ts.form.key_new_hint"),
+        };
+        v_flex()
+            .gap_3()
+            .child(ui::field(
+                t!("networks.ts.form.control"),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        toggle("ts-control-tailscale", "Tailscale".into(), !headscale).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.ts_headscale = false;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        toggle("ts-control-headscale", "Headscale".into(), headscale).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.ts_headscale = true;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+                cx,
+            ))
+            .when(headscale, |this| {
+                this.child(ui::field_with_hint(
+                    t!("networks.ts.form.control_url"),
+                    Input::new(&self.ts_url),
+                    t!("networks.ts.form.control_url_hint"),
+                    cx,
+                ))
+            })
+            .when(!modes.is_empty(), |this| {
+                this.child(
+                    ui::field(
+                        t!("networks.ts.form.key"),
+                        h_flex().gap_2().flex_wrap().children(modes.into_iter().map(
+                            |(mode, id, label)| {
+                                toggle(id, label, key_mode == mode).on_click(cx.listener(
+                                    move |this, _: &ClickEvent, window, cx| {
+                                        this.ts_key_mode = mode;
+                                        if mode == TsKeyMode::New {
+                                            this.ts_key.update(cx, |k, cx| k.focus(window, cx));
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            },
+                        )),
+                        cx,
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(mode_hint),
+                    ),
+                )
+            })
+            .when(key_mode == TsKeyMode::New, |this| {
+                this.child(
+                    ui::field(
+                        if editing {
+                            t!("networks.ts.form.key_new_label")
+                        } else {
+                            t!("networks.ts.form.key_optional")
+                        },
+                        Input::new(&self.ts_key).mask_toggle(),
+                        cx,
+                    )
+                    .child(key_hint),
+                )
+            })
             .child(
                 div()
+                    .pt_1()
                     .text_xs()
+                    .font_semibold()
                     .text_color(theme.muted_foreground)
-                    .child(t!("networks.form.secret_note")),
+                    .child(t!("networks.ts.form.advanced")),
             )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(ui::field_with_hint(
+                        t!("networks.ts.form.hostname"),
+                        Input::new(&self.ts_hostname),
+                        t!(
+                            "networks.ts.form.hostname_hint",
+                            name = networks::default_tailscale_hostname(net_id)
+                        ),
+                        cx,
+                    )))
+                    .child(div().flex_1().min_w_0().child(ui::field_with_hint(
+                        t!("networks.ts.form.tags"),
+                        Input::new(&self.ts_tags),
+                        t!("networks.ts.form.tags_hint"),
+                        cx,
+                    ))),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Switch::new("ts-ephemeral")
+                            .label(t!("networks.ts.form.ephemeral"))
+                            .checked(ephemeral)
+                            .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                this.ts_ephemeral_set = Some(*v);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(ephemeral_note),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for NetworkForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editing = self.editing.is_some();
+        let kind = self.kind.clone();
+        let tailscale_ok = !self.tailscale_accounts.is_empty();
+        let body = if kind == NetworkKind::Tailscale {
+            self.render_tailscale(cx)
+        } else {
+            self.render_wireguard(cx)
+        };
+        let theme = cx.theme();
+        let kind_button = |id: &'static str, label: SharedString, on: bool, enabled: bool| {
+            Button::new(id)
+                .small()
+                .label(label)
+                .map(|b| if on { b.primary() } else { b.ghost() })
+                .disabled(!enabled)
+        };
+        v_flex()
+            .gap_3()
+            .when(!editing, |this| {
+                this.child(ui::field(
+                    t!("networks.form.kind"),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            kind_button(
+                                "kind-wireguard",
+                                "WireGuard".into(),
+                                kind == NetworkKind::Wireguard,
+                                true,
+                            )
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| {
+                                    this.kind = NetworkKind::Wireguard;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            kind_button(
+                                "kind-tailscale",
+                                if tailscale_ok {
+                                    "Tailscale / Headscale".into()
+                                } else {
+                                    t!("networks.form.kind_unavailable", kind = "Tailscale")
+                                },
+                                kind == NetworkKind::Tailscale,
+                                tailscale_ok,
+                            )
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| {
+                                    this.kind = NetworkKind::Tailscale;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(kind_button(
+                            "kind-zerotier",
+                            "ZeroTier".into(),
+                            false,
+                            false,
+                        ))
+                        .child(ui::pill(
+                            t!("networks.form.zerotier_soon"),
+                            theme.muted_foreground,
+                        )),
+                    cx,
+                ))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().flex_1().min_w_0().child(ui::field(
+                        t!("common.name"),
+                        Input::new(&self.name),
+                        cx,
+                    )))
+                    .when_some(self.destination.clone(), |this, d| {
+                        this.child(div().w(px(220.)).flex_shrink_0().child(ui::field(
+                            t!("networks.form.vault"),
+                            Select::new(&d),
+                            cx,
+                        )))
+                    }),
+            )
+            .child(ui::field(
+                t!("networks.form.description"),
+                Input::new(&self.description),
+                cx,
+            ))
+            .child(body)
+            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                if kind == NetworkKind::Tailscale {
+                    t!("networks.ts.form.secret_note")
+                } else {
+                    t!("networks.form.secret_note")
+                },
+            ))
     }
 }
 
@@ -2120,4 +3256,27 @@ pub fn network_field_hint(
             }
         }
     }
+}
+
+/// Hint under a host's address when its network (chosen, or its group's)
+/// is a Tailscale one: what a tailnet address looks like.
+pub fn tailnet_address_hint(
+    model: &Entity<AppModel>,
+    place: (Scope, Option<Id>),
+    chosen: Option<Id>,
+    group: Option<Id>,
+    cx: &App,
+) -> Option<SharedString> {
+    let m = model.read(cx);
+    let id = chosen.or_else(|| {
+        let groups: Vec<&termoak_core::model::Group> = m
+            .groups
+            .iter()
+            .filter(|g| g.scope == place.0 && m.vault_of(g) == place.1)
+            .map(|g| &g.data)
+            .collect();
+        networks::inherited_network(group, &groups)
+    })?;
+    let net = m.network_record(id)?;
+    (net.data.kind == NetworkKind::Tailscale).then(|| t!("networks.ts.address_hint"))
 }
