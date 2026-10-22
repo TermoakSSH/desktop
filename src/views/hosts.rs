@@ -25,6 +25,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::select::Select;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use termoak_client::Scope;
@@ -39,7 +40,7 @@ use crate::host_status::{self, HostStatus, Probe, Shown, Skip};
 use crate::runtime;
 use crate::state::{AppModel, Item, ToastKind};
 use crate::theme;
-use crate::ui::{self, IconName};
+use crate::ui::{self, Choice, IconName};
 use crate::workspaces::{self, SavedWorkspace, Workspaces};
 
 /// Margin to tell a click from a double click.
@@ -233,6 +234,8 @@ pub struct HostsView {
     shown: HashMap<Id, Shown>,
     /// Saved workspaces ("Add to workspace").
     workspaces: Entity<Workspaces>,
+    /// Private networks: their states and the hosts tested through them.
+    net_book: Entity<crate::networks::NetBook>,
 }
 
 impl EventEmitter<OpenRequest> for HostsView {}
@@ -243,8 +246,10 @@ impl HostsView {
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("hosts.search_placeholder")));
         let status = HostStatus::global(&model, cx);
         let workspaces = Workspaces::global(&model, cx);
+        let net_book = crate::networks::NetBook::global(cx);
         let subs = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe(&net_book, |_, _, cx| cx.notify()),
             cx.observe(&status, |_, _, cx| cx.notify()),
             cx.observe(&workspaces, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
@@ -269,6 +274,7 @@ impl HostsView {
             status,
             shown: HashMap::new(),
             workspaces,
+            net_book,
         }
     }
 
@@ -311,6 +317,81 @@ impl HostsView {
         }
         let probes = self.probes(&ids, cx);
         self.status.update(cx, |s, cx| s.check_now(probes, cx));
+    }
+
+    /// Tests a host in a private network from the server ("via Office ·
+    /// 23 ms"): only the server reaches it.
+    fn test_through_network(
+        &mut self,
+        id: Id,
+        trust: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (api, net) = {
+            let m = self.model.read(cx);
+            (m.api_for_host(id), m.host_network(id))
+        };
+        let (Some(api), Some(net)) = (api, net) else {
+            ui::error(window, cx, t!("error.network_unavailable"));
+            return;
+        };
+        let label = self.model.read(cx).host_label(id);
+        let handle = window.window_handle();
+        let view = cx.entity().downgrade();
+        self.net_book.update(cx, |b, cx| {
+            b.test_host(api, id, trust, cx, move |res, cx| {
+                let _ = handle.update(cx, |_, window, cx| match res {
+                    // The server does not know the host's key yet: ask.
+                    Ok(t) if t.error_code.as_deref() == Some("host_key_unknown") && !trust => {
+                        let fingerprint = t.fingerprint.clone().unwrap_or_default();
+                        ui::confirm(
+                            window,
+                            cx,
+                            t!("hosts.network_test.trust_title"),
+                            t!(
+                                "hosts.network_test.trust_message",
+                                host = label,
+                                fingerprint = fingerprint
+                            ),
+                            t!("hosts.network_test.trust_ok"),
+                            false,
+                            move |window, cx| {
+                                if let Some(v) = view.upgrade() {
+                                    v.update(cx, |v, cx| {
+                                        v.test_through_network(id, true, window, cx)
+                                    });
+                                }
+                            },
+                        );
+                    }
+                    Ok(t) if t.ok => {
+                        let via = crate::networks::via_text(
+                            &t.network
+                                .as_ref()
+                                .map(|n| n.name.clone())
+                                .unwrap_or_else(|| net.label()),
+                            Some(format!("{} ms", t.latency_ms)),
+                        );
+                        ui::success(
+                            window,
+                            cx,
+                            t!("hosts.network_test.ok", host = label, via = via),
+                        )
+                    }
+                    Ok(t) => ui::error(
+                        window,
+                        cx,
+                        t!(
+                            "hosts.network_test.failed",
+                            host = label,
+                            error = crate::networks::host_test_error(&t)
+                        ),
+                    ),
+                    Err(e) => ui::error(window, cx, e),
+                });
+            })
+        });
     }
 
     /// Turns the check off or on for one host (on this device).
@@ -571,6 +652,33 @@ impl HostsView {
         ui::focus_later(&name, window, cx);
         let model = self.model.clone();
         let editing = group.is_some();
+        // Private network of the group (0.7), from its vault.
+        let (place, net_choices, current_net, shown) = {
+            let m = self.model.read(cx);
+            let place = match &group {
+                Some(g) => m
+                    .locate_loaded(g.id)
+                    .map(|(_, scope, vault)| (scope, vault))
+                    .unwrap_or((Scope::Device, None)),
+                None => m.place_of_target(m.new_item_target()),
+            };
+            let current = group.as_ref().and_then(|g| g.settings.network_id);
+            let mut choices = super::networks::network_choices(m, place);
+            let shown = super::networks::network_field_shown(m, place, current);
+            if let Some(id) = current
+                && !choices.iter().any(|c| c.value == Some(id))
+            {
+                choices.push(Choice::new(
+                    t!("networks.field.unavailable_short"),
+                    Some(id),
+                ));
+            }
+            (place, choices, current, shown)
+        };
+        let network = shown.then(|| ui::choice_state(net_choices, Some(&current_net), window, cx));
+        let net_book = crate::networks::NetBook::global(cx);
+        let net2 = network.clone();
+        let model_hint = self.model.clone();
         let (n2, u2, p2) = (name.clone(), user.clone(), port.clone());
         ui::open_form_dialog(
             window,
@@ -597,6 +705,31 @@ impl HostsView {
                         Input::new(&port),
                         cx,
                     ))
+                    .when_some(network.clone(), |this, state| {
+                        let chosen = ui::chosen(&state, cx).flatten();
+                        let hint = match chosen {
+                            Some(_) => {
+                                super::networks::network_field_hint(
+                                    &model_hint,
+                                    &net_book,
+                                    place,
+                                    chosen,
+                                    None,
+                                    cx,
+                                )
+                                .to_string()
+                                    + " "
+                                    + &t!("networks.field.group_hint")
+                            }
+                            None => t!("networks.field.direct_hint").to_string(),
+                        };
+                        this.child(ui::field_with_hint(
+                            t!("networks.field.label"),
+                            Select::new(&state),
+                            hint,
+                            cx,
+                        ))
+                    })
                     .into_any_element()
             },
             move |window, cx| {
@@ -629,6 +762,9 @@ impl HostsView {
                 g.name = name;
                 g.settings.username = username;
                 g.settings.port = port;
+                if let Some(network) = net2.as_ref().and_then(|n| ui::chosen(n, cx)) {
+                    g.settings.network_id = network;
+                }
                 let task = model.update(cx, |m, cx| m.save(g, SecretUpdate::Keep, None, cx));
                 window
                     .spawn(cx, async move |cx| {
@@ -1054,6 +1190,20 @@ impl HostsView {
                 )
             });
         let menu = Self::workspace_submenu(menu, view.clone(), ws_ids, window, cx);
+        // Private network: tested by the server, the only one that reaches it.
+        let network = this.read(cx).model.read(cx).host_network(id);
+        let menu = menu.when(server && ssh && network.is_some(), |menu| {
+            let name = network.as_ref().map(|n| n.label()).unwrap_or_default();
+            menu.item(
+                PopupMenuItem::new(t!("hosts.menu.test_network", network = name))
+                    .icon(ui::icon(IconName::Network))
+                    .on_click(act(|v, ids, window, cx| {
+                        if let Some(id) = ids.first() {
+                            v.test_through_network(*id, false, window, cx);
+                        }
+                    })),
+            )
+        });
         let menu = menu
             .when(status_on && !status_off, |menu| {
                 menu.item(
@@ -1547,6 +1697,13 @@ impl HostsView {
             .shown
             .get(&host.id)
             .map(|s| (*s, self.status.read(cx).is_running(host.id)));
+        // Private network: "via Office", with the server's test if any.
+        let network = self.model.read(cx).host_network(host.id).map(|n| {
+            let book = self.net_book.read(cx);
+            let test = book.test(host.id).cloned();
+            let testing = book.is_testing(host.id);
+            (n, test, testing)
+        });
         let theme = cx.theme();
         let selected = self.editor.as_ref().and_then(|e| e.read(cx).host_id()) == Some(host.id);
         let telnet = host.protocol.is_telnet();
@@ -1808,7 +1965,7 @@ impl HostsView {
                     ),
             )
             .when(
-                vault_chip.is_some() || account_badge.is_some() || use_only,
+                vault_chip.is_some() || account_badge.is_some() || use_only || network.is_some(),
                 |this| {
                     this.child(
                         h_flex()
@@ -1829,6 +1986,50 @@ impl HostsView {
                                 )
                             })
                             .children(vault_chip)
+                            .when_some(network.clone(), |this, (net, test, testing)| {
+                                let theme = cx.theme();
+                                let latency = test
+                                    .as_ref()
+                                    .filter(|t| t.ok)
+                                    .map(|t| format!("{} ms", t.latency_ms));
+                                let color = match (&test, net.name.is_some()) {
+                                    (_, false) => theme.danger,
+                                    (Some(t), _) if t.ok => theme.success,
+                                    (Some(_), _) => theme.danger,
+                                    (None, _) => theme.info,
+                                };
+                                let tip = match (&test, testing) {
+                                    (_, true) => t!("hosts.network_test.running").to_string(),
+                                    (Some(t), _) if !t.ok => crate::networks::host_test_error(t),
+                                    _ if net.name.is_none() => {
+                                        t!("error.network_not_found").to_string()
+                                    }
+                                    _ if net.inherited => {
+                                        t!("hosts.network_chip_inherited").to_string()
+                                    }
+                                    _ => t!("hosts.network_chip").to_string(),
+                                };
+                                this.child(
+                                    h_flex()
+                                        .id(("host-network", ix))
+                                        .gap_1()
+                                        .items_center()
+                                        .max_w(px(200.))
+                                        .text_color(color)
+                                        .child(
+                                            ui::icon(IconName::Network)
+                                                .size(px(11.))
+                                                .flex_shrink_0(),
+                                        )
+                                        .child(ui::pill(
+                                            crate::networks::via_text(&net.label(), latency),
+                                            color,
+                                        ))
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tip.clone()).build(window, cx)
+                                        }),
+                                )
+                            })
                             .when(use_only, |this| {
                                 this.child(
                                     h_flex()

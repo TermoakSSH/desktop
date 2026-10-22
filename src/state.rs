@@ -26,8 +26,8 @@ use termoak_client::{
 };
 use termoak_core::Id;
 use termoak_core::model::{
-    Entity as CoreEntity, EntityKind, Group, Host, HostSecret, Identity, KnownHost, PortForward,
-    Record, SecretUpdate, Snippet, SshKey, SyncMode, Team, TeamRole, User,
+    Entity as CoreEntity, EntityKind, Group, Host, HostSecret, Identity, KnownHost, Network,
+    PortForward, Record, SecretUpdate, Snippet, SshKey, SyncMode, Team, TeamRole, User,
 };
 use termoak_core::transfer::{Dependencies, TransferMode, TransferResult};
 use termoak_ssh::{Connection, ForwardHandle, ForwardSpec, ForwardStats};
@@ -358,7 +358,17 @@ pub fn error_code(e: &ClientError) -> Option<String> {
 /// this device (Use-only, read-only vaults) are always translated.
 pub fn api_error(e: ClientError) -> String {
     match e {
-        ClientError::Api { code, message, .. } => {
+        ClientError::Api {
+            code,
+            message,
+            details,
+            ..
+        } => {
+            // Private networks: always the app's text, with the details
+            // (the plan's number, what netd found).
+            if let Some(text) = crate::networks::api_error_text(&code, &details) {
+                return text;
+            }
             let translated = (!crate::i18n::current().starts_with("en"))
                 .then(|| translated_api_code(&code))
                 .flatten();
@@ -377,6 +387,15 @@ pub fn api_error(e: ClientError) -> String {
             t!("error.network").to_string()
         }
         ClientError::SessionExpired => t!("error.session_expired").to_string(),
+        // A host in a private network that cannot be reached: what
+        // happened, then the details of the server or netd.
+        ClientError::Ssh(termoak_ssh::SshError::Network { code, message }) => {
+            match crate::i18n::api_error_text(code) {
+                Some(text) if !message.trim().is_empty() => format!("{text} ({message})"),
+                Some(text) => text,
+                None => message,
+            }
+        }
         ClientError::NotLoggedIn => t!("error.not_logged_in").to_string(),
         other => other.to_string(),
     }
@@ -504,6 +523,25 @@ impl AccountModel {
     }
 }
 
+/// The private network of a host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostNetwork {
+    pub id: Id,
+    /// Its name (`None`: not in the host's vault: deleted or not synced;
+    /// connecting fails with `network_not_found`).
+    pub name: Option<String>,
+    /// It comes from a group.
+    pub inherited: bool,
+}
+
+impl HostNetwork {
+    pub fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| t!("networks.missing").to_string())
+    }
+}
+
 /// Running tunnel.
 pub struct RunningForward {
     pub handle: Arc<ForwardHandle>,
@@ -537,6 +575,7 @@ struct Data {
     snippets: Vec<Item<Snippet>>,
     forwards: Vec<Item<PortForward>>,
     known_hosts: Vec<Item<KnownHost>>,
+    networks: Vec<Item<Network>>,
     /// Per account: its vaults and its pending changes.
     accounts: Vec<(Id, Vec<termoak_core::model::Vault>, usize)>,
 }
@@ -637,6 +676,9 @@ pub struct AppModel {
     pub snippets: Vec<Item<Snippet>>,
     pub forwards: Vec<Item<PortForward>>,
     pub known_hosts: Vec<Item<KnownHost>>,
+    /// Private networks of the accounts in sight (0.7; never on This
+    /// device). Managed through the REST API, read here by the editors.
+    pub networks: Vec<Item<Network>>,
     pub loaded: bool,
     /// The current account is syncing.
     pub syncing: bool,
@@ -709,6 +751,7 @@ impl AppModel {
             snippets: Vec::new(),
             forwards: Vec::new(),
             known_hosts: Vec::new(),
+            networks: Vec::new(),
             loaded: false,
             syncing: false,
             last_sync: None,
@@ -976,6 +1019,7 @@ impl AppModel {
                     snippets: list(&ws, &filter, first).await?,
                     forwards: list(&ws, &filter, first).await?,
                     known_hosts: list(&ws, &filter, first).await?,
+                    networks: list(&ws, &filter, first).await?,
                     accounts,
                 })
             },
@@ -989,6 +1033,8 @@ impl AppModel {
                     m.snippets = d.snippets;
                     m.forwards = d.forwards;
                     m.known_hosts = d.known_hosts;
+                    m.networks = d.networks;
+                    m.networks.sort_by_key(|n| n.data.name.to_lowercase());
                     m.hosts.sort_by_key(|h| h.data.label.to_lowercase());
                     m.groups.sort_by_key(|g| g.data.name.to_lowercase());
                     m.refresh_accounts();
@@ -1045,6 +1091,7 @@ impl AppModel {
             EntityKind::Snippet => find(&self.snippets, id),
             EntityKind::Forward => find(&self.forwards, id),
             EntityKind::KnownHost => find(&self.known_hosts, id),
+            EntityKind::Network => find(&self.networks, id),
             EntityKind::Memory => None,
         }
     }
@@ -1067,6 +1114,7 @@ impl AppModel {
             .or_else(|| find(self, &self.snippets, id))
             .or_else(|| find(self, &self.forwards, id))
             .or_else(|| find(self, &self.known_hosts, id))
+            .or_else(|| find(self, &self.networks, id))
     }
 
     /// The vault an item is in (rows without one are the personal vault).
@@ -1750,6 +1798,68 @@ impl AppModel {
             .unwrap_or_else(|| id.to_string())
     }
 
+    // ----- Private networks -----
+
+    /// The account is signed in and its server can reach private networks
+    /// (`features.networks`, see docs/NETWORKS.md of the server).
+    pub fn networks_supported(&self, account: Id) -> bool {
+        self.account(account)
+            .is_some_and(|a| a.active() && crate::networks::supported(&a.info.features))
+    }
+
+    /// Accounts in sight whose server has private networks (empty: the
+    /// networks are hidden everywhere).
+    pub fn network_accounts(&self) -> Vec<Id> {
+        self.accounts_in_view()
+            .into_iter()
+            .map(AccountModel::id)
+            .filter(|id| self.networks_supported(*id))
+            .collect()
+    }
+
+    /// Networks a host or group in `place` can use: those of its own vault
+    /// (never This device).
+    pub fn networks_in(&self, place: (Scope, Option<Id>)) -> Vec<&Item<Network>> {
+        if place.0 == Scope::Device {
+            return Vec::new();
+        }
+        self.networks
+            .iter()
+            .filter(|n| n.scope == place.0 && self.vault_of(n) == place.1)
+            .collect()
+    }
+
+    pub fn network_record(&self, id: Id) -> Option<&Item<Network>> {
+        self.networks.iter().find(|n| n.data.id == id)
+    }
+
+    /// The private network a host's connections go through (its own or
+    /// its groups'), as the core resolves it: only from the host's vault.
+    pub fn host_network(&self, host_id: Id) -> Option<HostNetwork> {
+        let rec = self.host_record(host_id)?;
+        if rec.scope == Scope::Device {
+            return None;
+        }
+        let place = (rec.scope, self.vault_of(rec));
+        let groups: Vec<&Group> = self
+            .groups
+            .iter()
+            .filter(|g| g.scope == place.0 && self.vault_of(g) == place.1)
+            .map(|g| &g.data)
+            .collect();
+        let id = crate::networks::network_id_of(&rec.data, &groups)?;
+        let name = self
+            .networks_in(place)
+            .into_iter()
+            .find(|n| n.data.id == id)
+            .map(|n| n.data.name.clone());
+        Some(HostNetwork {
+            id,
+            name,
+            inherited: rec.data.settings.network_id.is_none(),
+        })
+    }
+
     // ----- Server -----
 
     /// The current account is signed in.
@@ -1850,6 +1960,27 @@ impl AppModel {
         if let Some(a) = self.account_mut(id) {
             a.syncing = true;
         }
+        self.refresh_server_info(id, cx);
+    }
+
+    /// Reads the server's `/info` (and `/me`) of an account again: its
+    /// features may have changed since it was cached (a server that got
+    /// private networks, or lost them).
+    pub fn refresh_server_info(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Some(acc) = self.ws.account(id).filter(|a| a.is_signed_in()) else {
+            return;
+        };
+        runtime::run(
+            cx,
+            async move { acc.refresh_info().await },
+            |m, res, cx| match res {
+                Ok(_) => {
+                    m.refresh_accounts();
+                    cx.notify();
+                }
+                Err(e) => tracing::debug!(error = %e, "server info"),
+            },
+        );
     }
 
     fn stop_account(&mut self, id: Id) {

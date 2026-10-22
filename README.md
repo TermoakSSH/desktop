@@ -50,7 +50,8 @@ to every pane with the antenna lit (here, all but the log tail on
   logo (automatic: the detected system's; or one of the system and generic
   logos); user, port and credentials
   (password, key, identity) with a Connect button at the top; and an
-  Advanced section with ProxyJump hops, proxy, agent forwarding, keep-alive,
+  Advanced section with the private network (when the account's server has
+  them), ProxyJump hops, proxy, agent forwarding, keep-alive,
   startup snippet, environment variables, recording, terminal type and
   terminal theme. Errors show under each field; Enter saves and Ctrl+Enter
   (⌘↩) saves and connects.
@@ -155,6 +156,17 @@ to every pane with the antenna lit (here, all but the log tail on
   create, rename and delete teams, add members by email, change their role
   (member, admin, owner), remove them and leave. Only what your role allows
   is offered.
+- **Private networks** (needs a server with private networks, 0.7): your
+  WireGuard networks, which the Termoak server joins to reach their hosts
+  (your computer needs no VPN). Add one by pasting or importing its `.conf`,
+  or let the server generate its key and copy the public key to add as a
+  peer; its state in the server (waiting for the handshake, connected,
+  error), bring it up or down, the hosts that use it and its devices to add
+  hosts at, and the plan's usage. Hosts and groups pick a network in their
+  editor ("Direct", or the group's); a host in a network connects through
+  the server relay (SSH stays end to end) and shows "via Office · 23 ms" in
+  its card (tested from the server) and in the terminal bar. Tailscale and
+  ZeroTier come later.
 - **Administration** (server administrators only): users (create, enable or
   disable, grant or remove administrator, change the password, remove
   two-step verification, list and revoke devices), invitations (create with
@@ -361,6 +373,7 @@ src/
   prompts.rs         authentication prompts (AuthPrompter) with dialogs
   update.rs          automatic updates
   flatpak.rs         running as a Flatpak: no self-updates, host shell
+  networks.rs        private networks: .conf parsing, server calls and states
   ui.rs              reusable UI pieces
   qr.rs              QR codes painted with squares
   logos.rs           host logos (system logos in assets/logos, generic icons)
@@ -369,7 +382,8 @@ src/
                      or Telnet, server, local shell or serial port)
   views/             hosts, ssh_config import, host editor, SFTP, keychain,
                      snippets, port forwards, known hosts, AI and copilot,
-                     server sessions, sharing, teams, administration,
+                     server sessions, sharing, teams, private networks,
+                     administration,
                      two-step verification, serial port and settings
 ```
 

@@ -102,6 +102,11 @@ pub fn item_name(model: &AppModel, kind: EntityKind, id: Id) -> String {
             .iter()
             .find(|k| k.data.id == id)
             .map(|k| k.data.host.clone()),
+        EntityKind::Network => model
+            .networks
+            .iter()
+            .find(|k| k.data.id == id)
+            .map(|k| k.data.name.clone()),
         EntityKind::Memory => None,
     };
     found.unwrap_or_else(|| id.to_string()[..8].to_string())

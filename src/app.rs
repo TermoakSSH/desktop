@@ -57,6 +57,7 @@ use crate::views::host_picker::{HostPicker, PickMode};
 use crate::views::hosts::HostsView;
 use crate::views::keychain::KeychainView;
 use crate::views::known_hosts::KnownHostsView;
+use crate::views::networks::NetworksView;
 use crate::views::server_sessions::ServerSessionsView;
 use crate::views::settings::{SettingsPage, SettingsView};
 use crate::views::sftp::SftpView;
@@ -253,6 +254,8 @@ pub enum Section {
     Ai,
     ServerSessions,
     Teams,
+    /// Private networks (0.7; only with a server that has them).
+    Networks,
     Admin,
     Settings,
 }
@@ -268,6 +271,7 @@ impl Section {
             Section::Ai => t!("app.section.ai"),
             Section::ServerSessions => t!("app.section.server_sessions"),
             Section::Teams => t!("app.section.teams"),
+            Section::Networks => t!("app.section.networks"),
             Section::Admin => t!("app.section.admin"),
             Section::Settings => t!("app.section.settings"),
         }
@@ -283,6 +287,7 @@ impl Section {
             Section::Ai => IconName::Sparkles,
             Section::ServerSessions => IconName::Cloud,
             Section::Teams => IconName::Users,
+            Section::Networks => IconName::Network,
             Section::Admin => IconName::ShieldUser,
             Section::Settings => IconName::Settings,
         }
@@ -463,6 +468,7 @@ pub struct AppView {
     ai: Entity<AiView>,
     server_sessions: Entity<ServerSessionsView>,
     teams: Entity<TeamsView>,
+    networks: Entity<NetworksView>,
     admin: Entity<AdminView>,
     settings: Entity<SettingsView>,
     /// Copilot visible (to the right of the terminals).
@@ -525,6 +531,7 @@ impl AppView {
         let ai = cx.new(|cx| AiView::new(model.clone(), window, cx));
         let server_sessions = cx.new(|cx| ServerSessionsView::new(model.clone(), window, cx));
         let teams = cx.new(|cx| TeamsView::new(model.clone(), window, cx));
+        let networks = cx.new(|cx| NetworksView::new(model.clone(), window, cx));
         let admin = cx.new(|cx| AdminView::new(model.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(model.clone(), updates.clone(), window, cx));
         let workspaces = Workspaces::global(&model, cx);
@@ -535,6 +542,12 @@ impl AppView {
                 // The administration section disappears if you are no longer
                 // an administrator (or you sign out).
                 if this.section == Section::Admin && !model.read(cx).is_admin() {
+                    this.select_section(Section::Hosts, window, cx);
+                }
+                // Private networks too, without an account whose server
+                // has them (This device, signed out, an older server).
+                if this.section == Section::Networks && model.read(cx).network_accounts().is_empty()
+                {
                     this.select_section(Section::Hosts, window, cx);
                 }
                 this.try_restore(window, cx);
@@ -653,6 +666,7 @@ impl AppView {
             ai,
             server_sessions,
             teams,
+            networks,
             admin,
             settings,
             copilot_open: false,
@@ -2505,6 +2519,7 @@ impl AppView {
                 .update(cx, |v, cx| v.refresh(window, cx)),
             Section::Ai => self.ai.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Teams => self.teams.update(cx, |v, cx| v.refresh(window, cx)),
+            Section::Networks => self.networks.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Admin => self.admin.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Settings => self.settings.update(cx, |v, cx| v.refresh(window, cx)),
             _ => {}
@@ -4291,6 +4306,7 @@ impl AppView {
         let model = self.model.read(cx);
         let logged_in = model.logged_in();
         let is_admin = model.is_admin();
+        let has_networks = !model.network_accounts().is_empty();
         let user = model.current_account_name();
         let syncing = model.syncing;
         let events_online = model.events_online;
@@ -4457,6 +4473,11 @@ impl AppView {
                     .child(item(Section::Ai, cx))
                     .child(item(Section::ServerSessions, cx))
                     .child(item(Section::Teams, cx));
+                let menu = if has_networks {
+                    menu.child(item(Section::Networks, cx))
+                } else {
+                    menu
+                };
                 if is_admin {
                     menu.child(item(Section::Admin, cx))
                 } else {
@@ -4983,6 +5004,7 @@ impl AppView {
             Section::Ai => self.ai.clone().into_any_element(),
             Section::ServerSessions => self.server_sessions.clone().into_any_element(),
             Section::Teams => self.teams.clone().into_any_element(),
+            Section::Networks => self.networks.clone().into_any_element(),
             Section::Admin => self.admin.clone().into_any_element(),
             Section::Settings => self.settings.clone().into_any_element(),
         }

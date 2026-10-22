@@ -283,6 +283,7 @@ pub(crate) fn parse_form(f: &FormText) -> Result<FormValues, Vec<FieldError>> {
 /// Does the host use anything of the "Advanced" section? (Then it starts open.)
 pub(crate) fn has_advanced(s: &HostSettings) -> bool {
     s.jump_host_ids.as_ref().is_some_and(|j| !j.is_empty())
+        || s.network_id.is_some()
         || s.proxy.is_some()
         || s.agent_forwarding == Some(true)
         || s.keepalive_secs.is_some()
@@ -434,6 +435,7 @@ struct KeptRefs {
     identity: Option<(Id, Unavailable)>,
     key: Option<(Id, Unavailable)>,
     snippet: Option<(Id, Unavailable)>,
+    network: Option<(Id, Unavailable)>,
     jumps: Vec<(Id, Unavailable)>,
 }
 
@@ -480,6 +482,9 @@ pub struct HostEditor {
     color: Option<String>,
     jumps: Vec<Id>,
     kept: KeptRefs,
+    /// Private network (0.7): only in an account whose server has them.
+    network: Option<ChoiceState<Option<Id>>>,
+    net_book: Entity<crate::networks::NetBook>,
     proxy_kind: ChoiceState<Option<ProxyKind>>,
     proxy_host: Entity<InputState>,
     proxy_port: Entity<InputState>,
@@ -603,6 +608,14 @@ impl HostEditor {
                 .filter(|j| **j != id && !jump_offered(m, **j, place))
                 .map(|j| (*j, Unavailable::of(host_name(*j))))
                 .collect();
+        }
+        // Private network: the networks of the same vault.
+        let network_shown = super::networks::network_field_shown(m, place, s.network_id);
+        let mut net_choices = super::networks::network_choices(m, place);
+        if network_shown {
+            kept.network = keep_unavailable(&mut net_choices, s.network_id, |id| {
+                m.network_record(id).map(|n| n.data.name.clone())
+            });
         }
         let themes = vec![
             Choice::new(t!("host_editor.theme.follow"), None),
@@ -747,6 +760,9 @@ impl HostEditor {
         let key = ui::choice_state(keys, Some(&s.key_id), window, cx);
         let snippet = ui::choice_state(snippets, Some(&s.startup_snippet_id), window, cx);
         let theme = ui::choice_state(themes, Some(&s.theme), window, cx);
+        let network =
+            network_shown.then(|| ui::choice_state(net_choices, Some(&s.network_id), window, cx));
+        let net_book = crate::networks::NetBook::global(cx);
         if original.is_none() {
             address.update(cx, |i, cx| i.focus(window, cx));
         }
@@ -811,6 +827,14 @@ impl HostEditor {
                 },
             ));
         }
+        subs.push(cx.observe(&net_book, |_, _, cx| cx.notify()));
+        if let Some(network) = &network {
+            subs.push(cx.subscribe_in(
+                network,
+                window,
+                |_, _, _: &SelectEvent<Vec<Choice<Option<Id>>>>, _, cx| cx.notify(),
+            ));
+        }
         subs.push(cx.subscribe_in(
             &protocol,
             window,
@@ -832,6 +856,8 @@ impl HostEditor {
             record: s.record_sessions.unwrap_or(false),
             jumps: s.jump_host_ids.clone().unwrap_or_default(),
             kept,
+            network,
+            net_book,
             advanced_open: has_advanced(&s),
             color: h.as_ref().and_then(|h| h.color.clone()),
             proxy_kind,
@@ -933,6 +959,22 @@ impl HostEditor {
                 s.set_items(items, window, cx);
                 s.set_selected_value(&None, window, cx);
             });
+        }
+        // Networks are the new vault's.
+        let (shown, choices) = {
+            let m = self.model.read(cx);
+            (
+                super::networks::network_field_shown(m, place, None),
+                super::networks::network_choices(m, place),
+            )
+        };
+        self.network = shown.then(|| ui::choice_state(choices, Some(&None), window, cx));
+        if let Some(network) = &self.network {
+            self._subs.push(cx.subscribe_in(
+                network,
+                window,
+                |_, _, _: &SelectEvent<Vec<Choice<Option<Id>>>>, _, cx| cx.notify(),
+            ));
         }
         // Jumps of another vault no longer apply.
         self.jumps.clear();
@@ -1057,6 +1099,10 @@ impl HostEditor {
         // A theme this version does not know (nothing selected) is kept.
         if let Some(theme) = ui::chosen(&self.theme, cx) {
             s.theme = theme;
+        }
+        // Nothing chosen (or no field): the loaded value stays.
+        if let Some(network) = self.network.as_ref().and_then(|n| ui::chosen(n, cx)) {
+            s.network_id = network;
         }
         s.proxy = match (proxy_kind, values.proxy) {
             (Some(kind), Some((host, port))) => Some(ProxySettings {
@@ -1483,11 +1529,29 @@ impl HostEditor {
         };
         let proxy_on = ui::chosen(&self.proxy_kind, cx).flatten().is_some();
         let ssh = fields_for(&self.chosen_protocol(cx)).ssh_only;
+        let network_field = self.network.clone().map(|state| {
+            let chosen = ui::chosen(&state, cx).flatten();
+            let group = ui::chosen(&self.group, cx).flatten();
+            let hint = super::networks::network_field_hint(
+                &self.model,
+                &self.net_book,
+                self.place,
+                chosen,
+                group,
+                cx,
+            );
+            ui::field_with_hint(t!("networks.field.label"), Select::new(&state), hint, cx)
+                .children(self.kept_warning(&state, &self.kept.network, cx))
+                .when(chosen.is_some() && proxy_on, |this| {
+                    this.child(warning_text(t!("networks.field.proxy_ignored"), cx))
+                })
+        });
 
         v_flex()
             .gap_4()
             // Connection: jumps and proxy.
             .child(sub_title(t!("host_editor.section.connection"), cx))
+            .children(network_field)
             .when(ssh, |this| {
                 this.child(
                     ui::field_with_hint(

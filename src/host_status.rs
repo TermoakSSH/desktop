@@ -7,8 +7,9 @@
 //! - Green: it answered (with the time the connection took, "23 ms").
 //! - Red: refused, timed out or the name does not resolve.
 //! - Gray: unknown. Not checked yet, or not checked at all: hosts behind
-//!   jump hosts (the path is inside SSH), hosts of Strict vaults (they are
-//!   only reached through the server), proxies that need a password the
+//!   jump hosts (the path is inside SSH), hosts in a private network (only
+//!   the server reaches them: "Test through the network" asks it), hosts of
+//!   Strict vaults (they are only reached through the server), proxies that need a password the
 //!   user cannot read (Use-only), and hosts with the check turned off.
 //!
 //! The hosts on screen are checked in the background, at most
@@ -62,6 +63,8 @@ pub enum Skip {
     Strict,
     /// Its proxy needs a password this user cannot read (Use-only).
     UseOnly,
+    /// In a private network: only the server reaches it.
+    Network,
 }
 
 /// A host to check.
@@ -139,6 +142,9 @@ pub fn target_of(
 ) -> Result<(Target, bool), Skip> {
     if off {
         return Err(Skip::Off);
+    }
+    if settings.network_id.is_some() {
+        return Err(Skip::Network);
     }
     if strict {
         return Err(Skip::Strict);
@@ -292,6 +298,7 @@ pub fn tooltip(shown: Shown) -> gpui::SharedString {
         Shown::Skipped(Skip::Jump) => t!("host_status.jump_tooltip"),
         Shown::Skipped(Skip::Strict) => t!("host_status.strict_tooltip"),
         Shown::Skipped(Skip::UseOnly) => t!("host_status.use_only_tooltip"),
+        Shown::Skipped(Skip::Network) => t!("host_status.network_tooltip"),
     }
 }
 
@@ -761,6 +768,21 @@ mod tests {
         proxied.proxy.as_mut().unwrap().host = " ".into();
         let (t, _) = target_of(&plain, &proxied, false, false, false).unwrap();
         assert!(t.proxy.is_none());
+        // A private network: only the server reaches it (also through
+        // jumps, and before Strict).
+        let networked = HostSettings {
+            network_id: Some(new_id()),
+            jump_host_ids: Some(vec![new_id()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            target_of(&plain, &networked, true, true, false),
+            Err(Skip::Network)
+        );
+        assert_eq!(
+            target_of(&plain, &networked, false, true, true),
+            Err(Skip::Off)
+        );
         // IPv6 in brackets.
         let mut v6 = host(None, HostSettings::default());
         v6.address = "[::1]".into();

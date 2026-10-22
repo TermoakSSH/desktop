@@ -1391,6 +1391,36 @@ impl TerminalView {
             latency::Level::Fair => theme.warning,
             latency::Level::Poor => theme.danger,
         };
+        // A host in a private network: "via Office · 23 ms" (from this
+        // computer through the server relay; server sessions: to the
+        // Termoak server, which reaches the host through the network).
+        let host = match &self.kind {
+            TermKind::Local { host_id } => Some(*host_id),
+            TermKind::Server { host_id, .. } => *host_id,
+            _ => None,
+        };
+        if let Some(net) = host.and_then(|h| self.app.read(cx).host_network(h)) {
+            let tooltip = match &self.kind {
+                TermKind::Local { .. } => t!(
+                    "terminal.latency.tooltip_network",
+                    host = self.label(cx),
+                    network = net.label()
+                ),
+                _ => t!(
+                    "terminal.latency.tooltip_server_network",
+                    server = self
+                        .latency_server
+                        .clone()
+                        .unwrap_or_else(|| self.label(cx)),
+                    network = net.label()
+                ),
+            };
+            return Some((
+                crate::networks::via_text(&net.label(), Some(latency::format(rtt))),
+                color,
+                tooltip.to_string().into(),
+            ));
+        }
         Some((latency::format(rtt), color, tooltip.to_string().into()))
     }
 

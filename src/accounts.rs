@@ -592,6 +592,7 @@ pub fn kind_name(kind: EntityKind) -> String {
         EntityKind::Forward => t!("kind.forward"),
         EntityKind::KnownHost => t!("kind.known_host"),
         EntityKind::Memory => t!("kind.memory"),
+        EntityKind::Network => t!("kind.network"),
     }
     .to_string()
 }

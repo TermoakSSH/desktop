@@ -17,6 +17,7 @@ pub mod import_export;
 pub mod join;
 pub mod keychain;
 pub mod known_hosts;
+pub mod networks;
 pub mod serial;
 pub mod server_sessions;
 pub mod settings;

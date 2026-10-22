@@ -268,14 +268,9 @@ async fn join_info(link: JoinLink) -> Result<JoinInfo, String> {
     let status = resp.status();
     let v: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(api_error(ClientError::Api {
-            status: status.as_u16(),
-            code: v["error"]["code"]
-                .as_str()
-                .unwrap_or("invalid_link")
-                .to_string(),
-            message: v["error"]["message"].as_str().unwrap_or("").to_string(),
-        }));
+        let code = v["error"]["code"].as_str().unwrap_or("invalid_link");
+        let message = v["error"]["message"].as_str().unwrap_or("");
+        return Err(api_error(ClientError::api(status.as_u16(), code, message)));
     }
     JoinInfo::from_json(&v).ok_or_else(|| t!("join.not_a_session").to_string())
 }

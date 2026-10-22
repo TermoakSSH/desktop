@@ -37,6 +37,7 @@ mod links;
 mod local_ai;
 mod logos;
 mod menus;
+mod networks;
 mod notifications;
 mod palette;
 mod panes;

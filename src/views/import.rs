@@ -68,6 +68,8 @@ impl Form {
             dry_run,
             group: Some(self.group.trim().to_string()).filter(|g| !g.is_empty()),
             device_only: self.device_only,
+            account: None,
+            vault: None,
         }
     }
 }

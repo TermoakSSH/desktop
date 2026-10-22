@@ -272,7 +272,17 @@ impl HostProvider for WorkspaceHosts {
             .ws
             .verifier_for(item.scope, None, HostKeyPolicy::Strict)
             .map_err(|e| e.to_string())?;
-        let opts = ConnectOptions::new(verifier).with_agent(use_agent);
+        // A host in a private network goes through its server's relay.
+        let dialer = match self.ws.network_dialer(item.scope, &resolved).await {
+            Ok(d) => d,
+            Err(e) => {
+                resolved.zeroize_secrets();
+                return Err(e.to_string());
+            }
+        };
+        let opts = ConnectOptions::new(verifier)
+            .with_agent(use_agent)
+            .with_dialer(dialer);
         let conn = Connection::connect(&resolved, &opts).await;
         resolved.zeroize_secrets();
         let conn = conn.map_err(|e| e.to_string())?;
