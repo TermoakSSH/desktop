@@ -749,7 +749,8 @@ pub fn host_test_error(test: &HostTest) -> String {
         && net.kind == "tailscale"
     {
         if let Some((_, rest)) = e.split_once("waits for authorization") {
-            return if rest.contains("logged in") || rest.contains("login") {
+            // "logged in but must be approved" is an approval, not a login.
+            return if !rest.contains("approv") && (rest.contains("logged in") || rest.contains("login")) {
                 t!("networks.ts.error.login", name = net.name).to_string()
             } else {
                 t!("networks.ts.error.approval", name = net.name).to_string()
@@ -1704,6 +1705,15 @@ mod tests {
         assert_eq!(
             host_test_error(&test),
             t!("networks.ts.error.login", name = "Office")
+        );
+        // Logged in but not approved yet: an approval, not a login.
+        let test = HostTest {
+            error: Some("the network \"Office\" waits for authorization: the node is logged in but must be approved: approve it in the tailnet's admin console (Machines) or with headscale".into()),
+            ..test
+        };
+        assert_eq!(
+            host_test_error(&test),
+            t!("networks.ts.error.approval", name = "Office")
         );
     }
 
