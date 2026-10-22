@@ -345,6 +345,15 @@ impl NetState {
         .to_string()
     }
 
+    /// Shorter, for lists ("Waiting").
+    pub fn short_label(self) -> String {
+        match self {
+            NetState::Waiting => t!("networks.state.waiting_short").to_string(),
+            NetState::NeedsAuth => t!("networks.state.needs_auth_short").to_string(),
+            other => other.label(),
+        }
+    }
+
     /// Explanation for a tooltip or the detail panel.
     pub fn hint(self) -> String {
         match self {

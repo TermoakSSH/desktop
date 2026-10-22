@@ -611,7 +611,7 @@ impl HostEditor {
         }
         // Private network: the networks of the same vault.
         let network_shown = super::networks::network_field_shown(m, place, s.network_id);
-        let mut net_choices = super::networks::network_choices(m, place);
+        let mut net_choices = super::networks::network_choices(m, place, true);
         if network_shown {
             kept.network = keep_unavailable(&mut net_choices, s.network_id, |id| {
                 m.network_record(id).map(|n| n.data.name.clone())
@@ -965,7 +965,7 @@ impl HostEditor {
             let m = self.model.read(cx);
             (
                 super::networks::network_field_shown(m, place, None),
-                super::networks::network_choices(m, place),
+                super::networks::network_choices(m, place, true),
             )
         };
         self.network = shown.then(|| ui::choice_state(choices, Some(&None), window, cx));

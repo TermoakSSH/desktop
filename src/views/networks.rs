@@ -97,6 +97,20 @@ pub fn state_pill(
         .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
 }
 
+/// The same, shorter (for the list).
+fn state_pill_short(
+    id: impl Into<gpui::ElementId>,
+    state: NetState,
+    cx: &gpui::App,
+) -> impl IntoElement {
+    let hint = format!("{}: {}", state.label(), state.hint());
+    h_flex()
+        .id(id.into())
+        .flex_shrink_0()
+        .child(ui::pill(state.short_label(), state_color(state, cx)))
+        .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+}
+
 /// The state of a network, from what the server said.
 pub fn state_of(book: &NetBook, network: &Network) -> NetState {
     book.status(network.id)
@@ -152,6 +166,8 @@ pub struct NetworksView {
     loading_peers: bool,
     busy: bool,
     poll: Option<Task<()>>,
+    /// The detail panel (back to its top when another network is chosen).
+    detail_scroll: gpui::ScrollHandle,
     _subs: Vec<Subscription>,
 }
 
@@ -192,6 +208,7 @@ impl NetworksView {
             loading_peers: false,
             busy: false,
             poll: None,
+            detail_scroll: gpui::ScrollHandle::new(),
             _subs: subs,
         }
     }
@@ -288,6 +305,7 @@ impl NetworksView {
         if self.selected != Some(id) {
             self.selected = Some(id);
             self.peers = None;
+            self.detail_scroll.set_offset(gpui::point(px(0.), px(0.)));
         }
         if let Some(row) = self.row(id, cx) {
             self.refresh_state(&row, false, cx);
@@ -886,7 +904,7 @@ impl NetworksView {
                                     .child(sub),
                             ),
                     )
-                    .child(state_pill(("network-state", i), states[i], cx))
+                    .child(state_pill_short(("network-state", i), states[i], cx))
             }))
             .into_any_element()
     }
@@ -1540,6 +1558,7 @@ impl Render for NetworksView {
                             .id("network-detail")
                             .size_full()
                             .overflow_y_scroll()
+                            .track_scroll(&self.detail_scroll)
                             .p_6()
                             .children(detail),
                     ),
@@ -2011,8 +2030,18 @@ impl Render for NetworkForm {
 
 /// Choices of the "Network" field for a host or group in `place`: Direct
 /// (or the group's, for hosts) and the networks of the same vault.
-pub fn network_choices(m: &AppModel, place: (Scope, Option<Id>)) -> Vec<Choice<Option<Id>>> {
-    let mut out = vec![Choice::new(t!("networks.field.direct"), None)];
+pub fn network_choices(
+    m: &AppModel,
+    place: (Scope, Option<Id>),
+    for_host: bool,
+) -> Vec<Choice<Option<Id>>> {
+    // A host without its own network takes its group's (like the proxy).
+    let none = if for_host {
+        t!("networks.field.inherit")
+    } else {
+        t!("networks.field.direct")
+    };
+    let mut out = vec![Choice::new(none, None)];
     out.extend(m.networks_in(place).into_iter().map(|n| {
         Choice::new(
             format!("{} ({})", n.data.name, kind_label(&n.data.kind)),

@@ -663,7 +663,7 @@ impl HostsView {
                 None => m.place_of_target(m.new_item_target()),
             };
             let current = group.as_ref().and_then(|g| g.settings.network_id);
-            let mut choices = super::networks::network_choices(m, place);
+            let mut choices = super::networks::network_choices(m, place, false);
             let shown = super::networks::network_field_shown(m, place, current);
             if let Some(id) = current
                 && !choices.iter().any(|c| c.value == Some(id))
