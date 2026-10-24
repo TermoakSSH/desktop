@@ -395,8 +395,14 @@ impl TerminalView {
         self.share.waiting = None;
         self.can_write = false;
         let (title, _) = sharing::end_message(&code);
+        // A plain end after the server said why (an access window that
+        // ended or was revoked): keep the why.
+        let explained =
+            code == "session_ended" && matches!(&self.state, TermState::Closed(Some(_)));
         self.share.ended = Some(code);
-        self.state = TermState::Closed(Some(title.to_string()));
+        if !explained {
+            self.state = TermState::Closed(Some(title.to_string()));
+        }
     }
 
     /// Sends an action of the shared session (through the relay for a

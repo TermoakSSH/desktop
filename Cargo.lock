@@ -8446,8 +8446,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.7.0-next.5"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
+version = "0.7.0-next.8"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8472,8 +8472,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.7.0-next.5"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
+version = "0.7.0-next.8"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8503,9 +8503,10 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.7.0-next.5"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
+version = "0.7.0-next.8"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
 dependencies = [
+ "aes-gcm",
  "argon2",
  "base64 0.22.1",
  "chacha20poly1305",
@@ -8513,7 +8514,9 @@ dependencies = [
  "data-encoding",
  "getrandom 0.4.3",
  "hex",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
+ "p256",
  "parking_lot",
  "qrcode",
  "rusqlite",
@@ -8530,7 +8533,7 @@ dependencies = [
 
 [[package]]
 name = "termoak-desktop"
-version = "0.7.0-next.3"
+version = "0.7.0-next.4"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8582,8 +8585,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.7.0-next.5"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
+version = "0.7.0-next.8"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8606,8 +8609,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.7.0-next.5"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.5#26028986273d661d66bb14d11cf3512187080663"
+version = "0.7.0-next.8"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
 dependencies = [
  "base64 0.22.1",
  "chrono",

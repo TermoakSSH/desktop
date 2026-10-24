@@ -3,6 +3,7 @@
 //! selection, copy/paste, session sharing, command autocompletion and quick
 //! AI actions. Used for SSH, server sessions and the local terminal.
 
+pub mod access_ui;
 pub mod ai_assist;
 pub mod backend;
 pub mod command_watch;
@@ -501,6 +502,13 @@ pub struct TerminalView {
     proposal: Option<Proposal>,
     /// Requests for proposals made so far (an old answer is ignored).
     proposal_gen: u64,
+    /// The host needs an approved access window (teams security): shown
+    /// with "Request access" instead of the error.
+    access_need: Option<crate::access::AccessNeed>,
+    /// Follows the access book (a window approved, ended or revoked).
+    access_sub: Option<gpui::Subscription>,
+    /// Repaints the access countdown.
+    access_tick: Option<Task<()>>,
     _reader: Option<Task<()>>,
 }
 
@@ -570,6 +578,9 @@ impl TerminalView {
             failed_chip: None,
             proposal: None,
             proposal_gen: 0,
+            access_need: None,
+            access_sub: None,
+            access_tick: None,
             _reader: None,
         }
     }
@@ -784,10 +795,12 @@ impl TerminalView {
     }
 
     /// (Re)connects.
-    pub fn connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(old) = self.backend.take() {
             old.send(Cmd::Close);
         }
+        self.access_need = None;
+        self.watch_access(window, cx);
         self.local = None;
         self.can_write = false;
         self.ime_marked = None;
@@ -1035,6 +1048,10 @@ impl TerminalView {
                     self.stop_relay(false, cx);
                 }
                 Out::Failed(e) => self.state = TermState::Failed(e),
+                Out::AccessRequired(need, e) => {
+                    self.access_need = Some(need);
+                    self.state = TermState::Failed(e);
+                }
             }
         }
         cx.notify();
@@ -3925,6 +3942,7 @@ impl TerminalView {
         let compact = pane.is_some();
         let participants = self.render_participants(cx);
         let latency_badge = self.latency_badge(cx);
+        let access_badge = self.access_badges(cx);
         let theme = cx.theme();
         // You own what this tab shows: sharing and ending it are yours.
         let owner = !is_server || self.is_share_owner();
@@ -3999,6 +4017,21 @@ impl TerminalView {
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
                 )
             })
+            // Teams security: the access window and "Recorded".
+            .children(
+                access_badge
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (text, color, tooltip))| {
+                        ui::pill(text, color)
+                            .id(("access-badge", i))
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tooltip.clone()).build(window, cx)
+                            })
+                    }),
+            )
             .when(
                 self.share_session.is_some() && self.relay.is_some() && !compact,
                 |this| this.child(ui::pill(t!("terminal.shared"), theme.success)),
@@ -4045,6 +4078,18 @@ impl TerminalView {
                         })
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.connect(window, cx);
+                        })),
+                )
+            })
+            .when(local_host.is_some() && running, |this| {
+                this.child(
+                    Button::new("conn-details")
+                        .small()
+                        .ghost()
+                        .icon(ui::icon(IconName::Info))
+                        .tooltip(t!("conn_details.tooltip"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.open_connection_details(window, cx)
                         })),
                 )
             })
@@ -4258,6 +4303,9 @@ impl TerminalView {
                     )
                     .into_any_element(),
             ),
+            TermState::Failed(e) if self.access_need.is_some() => {
+                Some(self.render_access_card(e.clone(), cx))
+            }
             TermState::Failed(e) => Some(
                 v_flex()
                     .absolute()

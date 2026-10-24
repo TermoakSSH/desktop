@@ -99,6 +99,8 @@ impl Permissions {
 enum TeamTab {
     Members,
     Vaults,
+    /// CA, policy, 2FA compliance (servers with teams security).
+    Security,
 }
 
 pub struct TeamsView {
@@ -113,6 +115,8 @@ pub struct TeamsView {
     /// Roles of the "Add" dropdown (they change if you are an owner).
     add_roles_owner: bool,
     busy: bool,
+    /// The Security tab of the selected team.
+    security: Option<(Id, Entity<super::team_security::TeamSecurity>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -165,6 +169,7 @@ impl TeamsView {
             add_role,
             add_roles_owner: false,
             busy: false,
+            security: None,
             _subs: subs,
         }
     }
@@ -215,9 +220,38 @@ impl TeamsView {
         }
     }
 
+    /// Creates the Security tab of the selected team.
+    fn ensure_security(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(team) = self.team(cx) else {
+            return;
+        };
+        if self.security.as_ref().is_some_and(|(id, _)| *id == team.id) {
+            return;
+        }
+        let manage = matches!(
+            self.my_role(&team, cx),
+            Some(TeamRole::Admin | TeamRole::Owner)
+        );
+        let model = self.model.clone();
+        let view = cx.new(|cx| {
+            super::team_security::TeamSecurity::new(
+                model,
+                team.id,
+                team.name.clone(),
+                manage,
+                window,
+                cx,
+            )
+        });
+        self.security = Some((team.id, view));
+    }
+
     fn select(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected != Some(id) {
             self.selected = Some(id);
+            if self.tab == TeamTab::Security {
+                self.security = None;
+            }
             self.members.clear();
             self.members_error = None;
             self.add_email
@@ -225,6 +259,9 @@ impl TeamsView {
         }
         self.load_members(window, cx);
         self.sync_selection(window, cx);
+        if self.tab == TeamTab::Security {
+            self.ensure_security(window, cx);
+        }
         cx.notify();
     }
 
@@ -1018,21 +1055,44 @@ impl TeamsView {
                 })
         });
 
+        let security = self
+            .model
+            .read(cx)
+            .current_account
+            .is_some_and(|a| self.model.read(cx).teams_security(a));
         let tabs = TabBar::new("team-tabs")
             .selected_index(match self.tab {
                 TeamTab::Members => 0,
                 TeamTab::Vaults => 1,
+                TeamTab::Security => 2,
             })
             .child(Tab::new().label(t!("teams.members")))
             .child(Tab::new().label(t!("teams.vaults")))
-            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                this.tab = if *ix == 1 {
-                    TeamTab::Vaults
-                } else {
-                    TeamTab::Members
+            .when(security, |this| {
+                this.child(Tab::new().label(t!("teams.security")))
+            })
+            .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                this.tab = match *ix {
+                    1 => TeamTab::Vaults,
+                    2 => TeamTab::Security,
+                    _ => TeamTab::Members,
                 };
+                if this.tab == TeamTab::Security {
+                    this.ensure_security(window, cx);
+                }
                 cx.notify();
             }));
+        if self.tab == TeamTab::Security
+            && let Some((id, view)) = &self.security
+            && *id == team.id
+        {
+            return v_flex()
+                .gap_5()
+                .child(header)
+                .child(tabs)
+                .child(view.clone())
+                .into_any_element();
+        }
         if self.tab == TeamTab::Vaults {
             let vaults = self.render_vaults(&team, perms.rename, cx);
             return v_flex()

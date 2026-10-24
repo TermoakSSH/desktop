@@ -36,7 +36,9 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 use termoak_client::{SaveTarget, Scope};
 use termoak_core::Id;
-use termoak_core::model::{Host, HostProtocol, HostSettings, ProxyKind, ProxySettings, SyncMode};
+use termoak_core::model::{
+    Host, HostAuth, HostProtocol, HostSettings, ProxyKind, ProxySettings, SyncMode,
+};
 use termoak_core::transfer::TransferMode;
 
 use super::OpenRequest;
@@ -439,6 +441,64 @@ struct KeptRefs {
     jumps: Vec<(Id, Unavailable)>,
 }
 
+/// Choices of the "Authentication" field (`for_host`: no setting means the
+/// group's).
+pub fn auth_choices(current: Option<&HostAuth>, for_host: bool) -> Vec<Choice<Option<HostAuth>>> {
+    let mut v = vec![
+        Choice::new(
+            if for_host {
+                t!("auth_field.inherit")
+            } else {
+                t!("auth_field.keys")
+            },
+            None,
+        ),
+        Choice::new(
+            t!("auth_field.team_certificate"),
+            Some(HostAuth::TeamCertificate),
+        ),
+    ];
+    if let Some(other @ HostAuth::Other(_)) = current {
+        v.push(Choice::new(
+            t!("auth_field.other", name = other.as_str().to_string()),
+            Some(other.clone()),
+        ));
+    }
+    v
+}
+
+/// Help under the "Authentication" field: what applies now.
+pub fn auth_hint(
+    m: &AppModel,
+    place: (Scope, Option<Id>),
+    chosen: Option<&HostAuth>,
+    group: Option<Id>,
+) -> (SharedString, bool) {
+    let has_ca = m
+        .vault_entry_of_place(place)
+        .is_some_and(|e| e.vault.policy.as_ref().is_some_and(|p| p.certificates));
+    let team = |text: SharedString| -> (SharedString, bool) {
+        if has_ca {
+            (text, false)
+        } else {
+            (t!("auth_field.no_ca"), true)
+        }
+    };
+    match chosen {
+        Some(HostAuth::TeamCertificate) => team(t!("auth_field.team_hint")),
+        Some(HostAuth::Other(_)) => (t!("auth_field.other_hint"), false),
+        None => {
+            let inherited = m.inherited_auth(place, group);
+            match (inherited.auth, inherited.from_group) {
+                (Some(HostAuth::TeamCertificate), Some(g)) => {
+                    team(t!("auth_field.inherited", group = g))
+                }
+                _ => (t!("auth_field.keys_hint"), false),
+            }
+        }
+    }
+}
+
 /// A host can be a jump of hosts of its own vault or of This device.
 fn jump_offered(m: &AppModel, id: Id, (scope, vault): (Scope, Option<Id>)) -> bool {
     m.hosts.iter().any(|h| {
@@ -485,6 +545,9 @@ pub struct HostEditor {
     /// Private network (0.7): only in an account whose server has them.
     network: Option<ChoiceState<Option<Id>>>,
     net_book: Entity<crate::networks::NetBook>,
+    /// Authentication (0.7 phase 4b): password/key or the team's
+    /// certificate; only in an account whose server has teams security.
+    auth: Option<ChoiceState<Option<HostAuth>>>,
     proxy_kind: ChoiceState<Option<ProxyKind>>,
     proxy_host: Entity<InputState>,
     proxy_port: Entity<InputState>,
@@ -609,6 +672,9 @@ impl HostEditor {
                 .map(|j| (*j, Unavailable::of(host_name(*j))))
                 .collect();
         }
+        // Authentication (teams security).
+        let auth_shown =
+            matches!(place.0, Scope::Account(a) if m.teams_security(a)) || s.auth.is_some();
         // Private network: the networks of the same vault.
         let network_shown = super::networks::network_field_shown(m, place, s.network_id);
         let mut net_choices = super::networks::network_choices(m, place, true);
@@ -762,6 +828,14 @@ impl HostEditor {
         let theme = ui::choice_state(themes, Some(&s.theme), window, cx);
         let network =
             network_shown.then(|| ui::choice_state(net_choices, Some(&s.network_id), window, cx));
+        let auth = auth_shown.then(|| {
+            ui::choice_state(
+                auth_choices(s.auth.as_ref(), true),
+                Some(&s.auth),
+                window,
+                cx,
+            )
+        });
         let net_book = crate::networks::NetBook::global(cx);
         if original.is_none() {
             address.update(cx, |i, cx| i.focus(window, cx));
@@ -828,6 +902,13 @@ impl HostEditor {
             ));
         }
         subs.push(cx.observe(&net_book, |_, _, cx| cx.notify()));
+        if let Some(auth) = &auth {
+            subs.push(cx.subscribe_in(
+                auth,
+                window,
+                |_, _, _: &SelectEvent<Vec<Choice<Option<HostAuth>>>>, _, cx| cx.notify(),
+            ));
+        }
         if let Some(network) = &network {
             subs.push(cx.subscribe_in(
                 network,
@@ -858,6 +939,7 @@ impl HostEditor {
             kept,
             network,
             net_book,
+            auth,
             advanced_open: has_advanced(&s),
             color: h.as_ref().and_then(|h| h.color.clone()),
             proxy_kind,
@@ -1104,6 +1186,9 @@ impl HostEditor {
         if let Some(network) = self.network.as_ref().and_then(|n| ui::chosen(n, cx)) {
             s.network_id = network;
         }
+        if let Some(auth) = self.auth.as_ref().and_then(|a| ui::chosen(a, cx)) {
+            s.auth = auth;
+        }
         s.proxy = match (proxy_kind, values.proxy) {
             (Some(kind), Some((host, port))) => Some(ProxySettings {
                 kind,
@@ -1292,6 +1377,19 @@ impl HostEditor {
                 .text_color(cx.theme().warning)
                 .child(t!("host_editor.startup_snippet_asks"))
                 .into_any_element()
+        })
+    }
+
+    /// The "Authentication" field (servers with teams security).
+    fn render_auth(&self, cx: &App) -> Option<gpui::Div> {
+        let state = self.auth.clone()?;
+        let chosen = ui::chosen(&state, cx).flatten();
+        let group = ui::chosen(&self.group, cx).flatten();
+        let (hint, warn) = auth_hint(self.model.read(cx), self.place, chosen.as_ref(), group);
+        Some(if warn {
+            ui::field(t!("auth_field.label"), Select::new(&state), cx).child(warning_text(hint, cx))
+        } else {
+            ui::field_with_hint(t!("auth_field.label"), Select::new(&state), hint, cx)
         })
     }
 
@@ -2008,7 +2106,8 @@ impl Render for HostEditor {
                         &self.kept.identity,
                         cx,
                     )),
-                ),
+                )
+                .when(fields.ssh_only, |this| this.children(self.render_auth(cx))),
             cx,
         );
 
@@ -2176,11 +2275,17 @@ impl Render for HostEditor {
                                                     .size(px(16.))
                                                     .text_color(theme.warning),
                                             )
-                                            .child(div().text_sm().child(if strict {
-                                                t!("host_editor.use_only_strict")
-                                            } else {
-                                                t!("host_editor.use_only")
-                                            })),
+                                            .child(div().flex_1().min_w_0().text_sm().child(
+                                                if self.original.as_ref().is_some_and(|o| {
+                                                    o.access == termoak_client::ItemAccess::ConnectOnly
+                                                }) {
+                                                    t!("host_editor.connect_only")
+                                                } else if strict {
+                                                    t!("host_editor.use_only_strict")
+                                                } else {
+                                                    t!("host_editor.use_only")
+                                                },
+                                            )),
                                     )
                                 })
                                 .child(identity_block)

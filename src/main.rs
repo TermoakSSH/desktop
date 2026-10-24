@@ -25,6 +25,10 @@ rust_i18n::i18n!("locales", fallback = "en");
 #[macro_use]
 mod i18n;
 
+mod access;
+mod access_model;
+#[cfg(test)]
+mod access_shots;
 mod accounts;
 mod app;
 mod app_lock;

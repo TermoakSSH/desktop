@@ -156,6 +156,21 @@ to every pane with the antenna lit (here, all but the log tail on
   create, rename and delete teams, add members by email, change their role
   (member, admin, owner), remove them and leave. Only what your role allows
   is offered.
+- **Teams security** (needs a server with teams security, 0.7): vault roles
+  Connect only, Use, Edit and Admin; the team's **Security** tab (its SSH
+  certificate authority with the install command for hosts, rotation,
+  issued certificates and revocation; the team policy: two-step
+  verification with a grace period, revealing secrets, the AI, private
+  networks, mandatory recording and certificate defaults; who lacks
+  two-step verification and each member's principal) and a personal CA in
+  Settings. Hosts and groups can use "Team certificate": the app gets a
+  short-lived certificate for your key or a key made just for it (Connect
+  only members connect without ever getting a secret). Access policies on
+  vaults, groups and hosts; a host that needs approval offers **Request
+  access** and connects by itself when an approver opens the window, whose
+  countdown shows on the host, the tab and the terminal bar. **Access**
+  lists the requests waiting for you (approve with a shorter window, deny,
+  end early) and your own; Admins watch and download recordings.
 - **Private networks** (needs a server with private networks, 0.7): your
   WireGuard networks, which the Termoak server joins to reach their hosts
   (your computer needs no VPN). Add one by pasting or importing its `.conf`,

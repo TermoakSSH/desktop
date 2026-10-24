@@ -99,6 +99,15 @@ pub struct RemoteSeat {
     pub until: Option<i64>,
 }
 
+/// A connection error for the view: "Request access" for hosts that need
+/// an approved window, else its text.
+fn failed(e: termoak_client::ClientError) -> Out {
+    match crate::access::AccessNeed::from_error(&e) {
+        Some(need) => Out::AccessRequired(need, crate::state::api_error(e)),
+        None => Out::Failed(crate::state::api_error(e)),
+    }
+}
+
 /// Events for the view.
 pub enum Out {
     /// Status text while connecting.
@@ -148,6 +157,9 @@ pub enum Out {
     Closed(Option<String>),
     /// Could not connect.
     Failed(String),
+    /// The host needs an approved access window (teams security): the
+    /// error's details and its text.
+    AccessRequired(crate::access::AccessNeed, String),
 }
 
 /// The view's end.
@@ -243,7 +255,7 @@ async fn run_local(
                 res = &mut open => match res {
                     Ok(t) => break t,
                     Err(e) => {
-                        let _ = out.send(Out::Failed(crate::state::api_error(e)));
+                        let _ = out.send(failed(e));
                         return;
                     }
                 },
@@ -272,8 +284,9 @@ async fn run_local(
                         res = &mut connect => match res {
                             Ok(c) => break c,
                             Err(e) => {
-                                // Vault rules (Use only, Strict...) are translated.
-                                let _ = out.send(Out::Failed(crate::state::api_error(e)));
+                                // Vault rules (Use only, Strict...) are translated;
+                                // an access window offers "Request access".
+                                let _ = out.send(failed(e));
                                 return;
                             }
                         },
@@ -439,7 +452,7 @@ async fn run_server(
                     }
                 },
                 Err(e) => {
-                    let _ = out.send(Out::Failed(api_error(e)));
+                    let _ = out.send(failed(e));
                     return;
                 }
             }

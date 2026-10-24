@@ -256,6 +256,9 @@ pub enum Section {
     Teams,
     /// Private networks (0.7; only with a server that has them).
     Networks,
+    /// Temporary access: approvals and your requests (0.7 phase 4c; only
+    /// with a server that has teams security).
+    Access,
     Admin,
     Settings,
 }
@@ -272,6 +275,7 @@ impl Section {
             Section::ServerSessions => t!("app.section.server_sessions"),
             Section::Teams => t!("app.section.teams"),
             Section::Networks => t!("app.section.networks"),
+            Section::Access => t!("app.section.access"),
             Section::Admin => t!("app.section.admin"),
             Section::Settings => t!("app.section.settings"),
         }
@@ -288,6 +292,7 @@ impl Section {
             Section::ServerSessions => IconName::Cloud,
             Section::Teams => IconName::Users,
             Section::Networks => IconName::Network,
+            Section::Access => IconName::Inbox,
             Section::Admin => IconName::ShieldUser,
             Section::Settings => IconName::Settings,
         }
@@ -469,6 +474,7 @@ pub struct AppView {
     server_sessions: Entity<ServerSessionsView>,
     teams: Entity<TeamsView>,
     networks: Entity<NetworksView>,
+    access: Entity<crate::views::access_requests::AccessView>,
     admin: Entity<AdminView>,
     settings: Entity<SettingsView>,
     /// Copilot visible (to the right of the terminals).
@@ -532,6 +538,9 @@ impl AppView {
         let server_sessions = cx.new(|cx| ServerSessionsView::new(model.clone(), window, cx));
         let teams = cx.new(|cx| TeamsView::new(model.clone(), window, cx));
         let networks = cx.new(|cx| NetworksView::new(model.clone(), window, cx));
+        let access =
+            cx.new(|cx| crate::views::access_requests::AccessView::new(model.clone(), window, cx));
+        let access_book = crate::access::AccessBook::global(cx);
         let admin = cx.new(|cx| AdminView::new(model.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(model.clone(), updates.clone(), window, cx));
         let workspaces = Workspaces::global(&model, cx);
@@ -552,6 +561,9 @@ impl AppView {
                 // has them (This device, signed out, an older server).
                 if this.section == Section::Networks && model.read(cx).network_accounts().is_empty()
                 {
+                    this.select_section(Section::Hosts, window, cx);
+                }
+                if this.section == Section::Access && model.read(cx).access_accounts().is_empty() {
                     this.select_section(Section::Hosts, window, cx);
                 }
                 this.try_restore(window, cx);
@@ -580,6 +592,9 @@ impl AppView {
                     ModelEvent::LayoutMigrated if notices => this.layout_notice(window, cx),
                     ModelEvent::Server(v) if v["type"] == "ai" && notices => {
                         this.on_ai_event(v, window, cx)
+                    }
+                    ModelEvent::Server(v) if v["type"] == "access_request" && notices => {
+                        this.on_access_event(v, window, cx)
                     }
                     // When starting signed in or when signing in: the running
                     // sessions, as dormant tabs (in the first window).
@@ -633,6 +648,7 @@ impl AppView {
             let others = !windows::views(cx).is_empty();
             closing.update(cx, |w, _| w.window_closed(me, others));
         }));
+        subs.push(cx.observe(&access_book, |_, _, cx| cx.notify()));
         subs.push(cx.subscribe_in(&hosts, window, Self::on_open_request));
         subs.push(cx.subscribe_in(&keychain, window, Self::on_open_request));
         subs.push(cx.subscribe_in(&snippets, window, Self::on_open_request));
@@ -671,6 +687,7 @@ impl AppView {
             server_sessions,
             teams,
             networks,
+            access,
             admin,
             settings,
             copilot_open: false,
@@ -1068,7 +1085,41 @@ impl AppView {
                 self.select_section(Section::Ai, window, cx);
                 self.ai.update(cx, |v, cx| v.open_task(task_id, window, cx));
             }
+            Target::Access => self.select_section(Section::Access, window, cx),
         }
+    }
+
+    /// An access request event: a notification of the system for
+    /// approvers (new requests) and requesters (decisions) while the
+    /// window is in the background; the toast comes from the model.
+    fn on_access_event(
+        &mut self,
+        v: &serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let account = v["account_id"].as_str().and_then(|a| a.parse::<Id>().ok());
+        let me = account.and_then(|a| self.model.read(cx).account(a).and_then(|m| m.info.user_id));
+        let Some((_, body)) = crate::access::event_notice(me, v) else {
+            return;
+        };
+        let id = v["request"]["id"].as_str().unwrap_or_default().to_string();
+        let created = v["event"] == "created";
+        self.notify_system(
+            Notice {
+                category: notifications::Category::Access,
+                key: format!("access-{id}-{}", v["event"].as_str().unwrap_or_default()),
+                title: if created {
+                    t!("access.notice.title_request").to_string()
+                } else {
+                    t!("access.notice.title_decision").to_string()
+                },
+                body,
+                target: Target::Access,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Starts the engine of the AI tasks on this computer and passes its
@@ -1528,7 +1579,21 @@ impl AppView {
                 None
             }
             Ok(true) => {
-                ui::notify(window, cx, ToastKind::Info, t!("vaults.strict_connect"));
+                let connect_only = self
+                    .model
+                    .read(cx)
+                    .host_record(host_id)
+                    .is_some_and(|h| h.access == termoak_client::ItemAccess::ConnectOnly);
+                ui::notify(
+                    window,
+                    cx,
+                    ToastKind::Info,
+                    if connect_only {
+                        t!("vaults.connect_only_connect")
+                    } else {
+                        t!("vaults.strict_connect")
+                    },
+                );
                 Some(OpenRequest::Server { host_id })
             }
             Err(code) => {
@@ -2524,6 +2589,7 @@ impl AppView {
             Section::Ai => self.ai.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Teams => self.teams.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Networks => self.networks.update(cx, |v, cx| v.refresh(window, cx)),
+            Section::Access => self.access.update(cx, |v, cx| v.refresh(cx)),
             Section::Admin => self.admin.update(cx, |v, cx| v.refresh(window, cx)),
             Section::Settings => self.settings.update(cx, |v, cx| v.refresh(window, cx)),
             _ => {}
@@ -3213,9 +3279,14 @@ impl AppView {
             let active = self.active == Some(ix);
             let title = tab.title(cx);
             let mut logo = None;
+            // The access window's time left (teams security).
+            let mut access_left = None;
             let (icon, dot, count) = match &tab.content {
                 TabContent::Terminal(p) => {
                     let t = p.focused().read(cx);
+                    if !p.is_split() {
+                        access_left = t.access_left(cx);
+                    }
                     // A single host terminal shows the host's logo.
                     if !p.is_split() {
                         logo = t.host_logo(cx);
@@ -3324,6 +3395,18 @@ impl AppView {
                             .text_ellipsis()
                             .child(title),
                     )
+                    .when_some(access_left, |this, left| {
+                        this.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .gap_0p5()
+                                .items_center()
+                                .text_xs()
+                                .text_color(theme.warning)
+                                .child(ui::icon(IconName::Timer).size(px(11.)))
+                                .child(left),
+                        )
+                    })
                     .when_some(count, |this, (n, broadcast)| {
                         this.child(
                             div()
@@ -4321,6 +4404,11 @@ impl AppView {
         let logged_in = model.logged_in();
         let is_admin = model.is_admin();
         let has_networks = !model.network_accounts().is_empty();
+        let has_access = !model.access_accounts().is_empty();
+        // Access requests waiting for your decision.
+        let waiting = crate::access::AccessBook::try_global(cx)
+            .map(|b| b.read(cx).waiting_count())
+            .unwrap_or(0);
         let user = model.current_account_name();
         let syncing = model.syncing;
         let events_online = model.events_online;
@@ -4330,7 +4418,11 @@ impl AppView {
         let running = self.cloud_sessions;
         let section = self.section;
         let item = |s: Section, cx: &mut Context<Self>| {
-            let badge = (s == Section::ServerSessions && alerts > 0).then_some(alerts);
+            let badge = match s {
+                Section::ServerSessions if alerts > 0 => Some(alerts),
+                Section::Access if waiting > 0 => Some(waiting),
+                _ => None,
+            };
             let running =
                 (s == Section::ServerSessions && alerts == 0 && running > 0).then_some(running);
             // Taller and with bigger text and icons than the stock ones (28 px):
@@ -4489,6 +4581,11 @@ impl AppView {
                     .child(item(Section::Teams, cx));
                 let menu = if has_networks {
                     menu.child(item(Section::Networks, cx))
+                } else {
+                    menu
+                };
+                let menu = if has_access {
+                    menu.child(item(Section::Access, cx))
                 } else {
                     menu
                 };
@@ -4931,6 +5028,76 @@ impl AppView {
 
     /// Home notice: sessions running on the server (they are already at the
     /// top, as tabs).
+    /// A team requires two-step verification and the current account does
+    /// not have it (`team_2fa` of `/me`): until when, or why its vaults are
+    /// hidden, with the way to set it up.
+    fn render_team_2fa_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let list = self.model.read(cx).team_2fa.clone();
+        if list.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let blocked = list.iter().any(|t| t.blocked);
+        let names = list
+            .iter()
+            .map(|t| t.team_name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let deadline = list.iter().filter(|t| !t.blocked).map(|t| t.deadline).min();
+        let color = if blocked { theme.danger } else { theme.warning };
+        Some(
+            h_flex()
+                .mx_4()
+                .mt_3()
+                .px_3()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(color)
+                .bg(theme.secondary)
+                .child(
+                    ui::icon(IconName::ShieldAlert)
+                        .size(px(16.))
+                        .text_color(color),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_medium().child(if blocked {
+                            t!("team_2fa.blocked_title", teams = names.clone())
+                        } else {
+                            t!("team_2fa.title", teams = names.clone())
+                        }))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(
+                            if blocked {
+                                t!("team_2fa.blocked_detail")
+                            } else {
+                                t!(
+                                    "team_2fa.detail",
+                                    date = deadline.map(ui::format_ms).unwrap_or_default()
+                                )
+                            },
+                        )),
+                )
+                .child(
+                    Button::new("team-2fa-setup")
+                        .small()
+                        .primary()
+                        .icon(ui::icon(IconName::ShieldCheck))
+                        .label(t!("team_2fa.setup"))
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.select_section(Section::Settings, window, cx);
+                            this.settings
+                                .update(cx, |s, cx| s.show_page(SettingsPage::General, window, cx));
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_cloud_notice(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let n = self.cloud_sessions;
@@ -5019,6 +5186,7 @@ impl AppView {
             Section::ServerSessions => self.server_sessions.clone().into_any_element(),
             Section::Teams => self.teams.clone().into_any_element(),
             Section::Networks => self.networks.clone().into_any_element(),
+            Section::Access => self.access.clone().into_any_element(),
             Section::Admin => self.admin.clone().into_any_element(),
             Section::Settings => self.settings.clone().into_any_element(),
         }
@@ -5106,6 +5274,7 @@ impl Render for AppView {
                         .flex_1()
                         .min_w_0()
                         .h_full()
+                        .children(self.render_team_2fa_banner(cx))
                         .when(self.cloud_notice_shown(cx), |this| {
                             this.child(self.render_cloud_notice(cx))
                         })

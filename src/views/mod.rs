@@ -1,5 +1,7 @@
 //! Sections of the main window.
 
+pub mod access_policy;
+pub mod access_requests;
 pub mod accounts;
 pub mod activity;
 pub mod add_account;
@@ -8,6 +10,8 @@ pub mod ai;
 pub mod ai_chat;
 pub mod ai_settings;
 pub mod ai_ui;
+pub mod ca_panel;
+pub mod cert_fields;
 pub mod forwards;
 pub mod host_editor;
 pub mod host_picker;
@@ -19,6 +23,7 @@ pub mod keychain;
 pub mod keychain_sk;
 pub mod known_hosts;
 pub mod networks;
+pub mod recording_player;
 pub mod serial;
 pub mod server_sessions;
 pub mod settings;
@@ -26,6 +31,7 @@ pub mod sftp;
 pub mod share;
 pub mod snippet_vars;
 pub mod snippets;
+pub mod team_security;
 pub mod teams;
 pub mod transfer;
 pub mod two_factor;

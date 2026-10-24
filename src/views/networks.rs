@@ -3192,7 +3192,13 @@ pub fn network_choices(
 pub fn network_field_shown(m: &AppModel, place: (Scope, Option<Id>), current: Option<Id>) -> bool {
     match place.0 {
         Scope::Device => false,
-        Scope::Account(a) => m.networks_supported(a) || current.is_some(),
+        // The team may forbid private networks in its vaults (0.7 phase 4b).
+        Scope::Account(a) => {
+            let allowed = m
+                .vault_entry_of_place(place)
+                .is_none_or(|e| crate::access::gates(e.role(), e.vault.policy.as_ref()).networks);
+            (m.networks_supported(a) && allowed) || current.is_some()
+        }
     }
 }
 

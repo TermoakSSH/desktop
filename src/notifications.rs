@@ -60,6 +60,9 @@ pub struct NotificationPrefs {
     /// A long command ended in a terminal you were not looking at (a toast
     /// in the window; a notification of the system in the background).
     pub commands: bool,
+    /// Temporary access: a request waits for your decision, or yours was
+    /// decided (0.7 phase 4c).
+    pub access: bool,
     /// How long a command must run to be "long", in seconds.
     pub command_secs: u64,
 }
@@ -72,6 +75,7 @@ impl Default for NotificationPrefs {
             ai: true,
             shared_with_me: true,
             commands: true,
+            access: true,
             command_secs: DEFAULT_COMMAND_SECS,
         }
     }
@@ -90,6 +94,7 @@ impl NotificationPrefs {
                 Category::Ai => self.ai,
                 Category::SharedWithMe => self.shared_with_me,
                 Category::Commands => self.commands,
+                Category::Access => self.access,
             }
     }
 
@@ -107,6 +112,8 @@ pub enum Category {
     SharedWithMe,
     /// A long command ended.
     Commands,
+    /// Temporary access requests and decisions.
+    Access,
 }
 
 /// Where a click on the notification leads.
@@ -124,6 +131,8 @@ pub enum Target {
     },
     /// An AI task, in the AI section.
     AiTask(Id),
+    /// The Access section (requests and approvals).
+    Access,
 }
 
 /// A notice to post as a notification.

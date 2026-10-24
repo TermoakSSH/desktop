@@ -364,6 +364,13 @@ pub fn api_error(e: ClientError) -> String {
             details,
             ..
         } => {
+            // Teams security: always the app's text (the server's English
+            // message is for developers).
+            if crate::access::is_teams_code(&code)
+                && let Some(text) = crate::i18n::api_error_text(&code)
+            {
+                return text;
+            }
             // Security keys (the server's forwarding): the app's text.
             if code.starts_with("security_key_") {
                 return crate::security_keys::error_text(&code, &message);
@@ -665,6 +672,9 @@ pub struct AppModel {
     pub me: Option<User>,
     /// Teams of the current account (to share and manage).
     pub teams: Vec<Team>,
+    /// Teams that require two-step verification from the current account,
+    /// which does not have it (`GET /me` → `team_2fa`): the banner.
+    pub team_2fa: Vec<termoak_core::access::Team2fa>,
     /// Every account signed in on this device, in order.
     pub accounts: Vec<AccountModel>,
     /// What the switcher shows.
@@ -751,6 +761,7 @@ impl AppModel {
             pending_verification: None,
             me: None,
             teams: Vec::new(),
+            team_2fa: Vec::new(),
             accounts: Vec::new(),
             view,
             vault_filter: VaultFilter::All,
@@ -1154,14 +1165,35 @@ impl AppModel {
 
     /// What the user can do with an item (Use-only rules).
     pub fn caps_of<T: CoreEntity>(&self, item: &Item<T>) -> Caps {
-        let strict = self.vault_entry_of(item).is_some_and(VaultEntry::strict);
-        accounts::caps(item.access, strict, T::KIND)
+        let entry = self.vault_entry_of(item);
+        let strict = entry.is_some_and(VaultEntry::strict);
+        let mut caps = accounts::caps(item.access, strict, T::KIND);
+        // Connect only (0.7 phase 4b): never just-in-time credentials.
+        if item.access == ItemAccess::ConnectOnly {
+            caps.connect = accounts::ConnectMode::ServerOnly;
+        }
+        // The team may forbid revealing and exporting secrets.
+        if let Some(e) = entry {
+            caps.reveal &= crate::access::gates(e.role(), e.vault.policy.as_ref()).reveal;
+        }
+        caps
     }
 
     /// What the user can do with a host (everything when it is not loaded).
+    /// Hosts that can only be used through the server connect from this
+    /// device after all when they use a team certificate (the engine asks
+    /// for one for an ephemeral key).
     pub fn host_caps(&self, id: Id) -> Caps {
         match self.host_record(id) {
-            Some(h) => self.caps_of(h),
+            Some(h) => {
+                let mut caps = self.caps_of(h);
+                if caps.connect == accounts::ConnectMode::ServerOnly
+                    && self.team_certificate_usable(h)
+                {
+                    caps.connect = accounts::ConnectMode::Local;
+                }
+                caps
+            }
             None => accounts::caps(ItemAccess::Device, false, EntityKind::Host),
         }
     }
@@ -1917,10 +1949,16 @@ impl AppModel {
             cx,
             async move { api.get::<Value>("/api/v1/me").await.map_err(api_error) },
             move |m, res, cx| match res.and_then(|v| {
-                serde_json::from_value::<User>(v["user"].clone()).map_err(|e| e.to_string())
+                let user =
+                    serde_json::from_value::<User>(v["user"].clone()).map_err(|e| e.to_string())?;
+                // Teams that require two-step verification (0.7 phase 4b).
+                let team_2fa: Vec<termoak_core::access::Team2fa> =
+                    serde_json::from_value(v["team_2fa"].clone()).unwrap_or_default();
+                Ok((user, team_2fa))
             }) {
-                Ok(user) if m.api.is_some() && m.current_account == current => {
+                Ok((user, team_2fa)) if m.api.is_some() && m.current_account == current => {
                     m.me = Some(user);
+                    m.team_2fa = team_2fa;
                     cx.notify();
                 }
                 Ok(_) => {}
@@ -2091,6 +2129,7 @@ impl AppModel {
         self.update_current(cx);
         if ok {
             self.reload(cx);
+            self.access_after_sync(id, cx);
         }
         if self.sync_again.remove(&id) {
             self.sync_account(id, cx);
@@ -2103,6 +2142,18 @@ impl AppModel {
     fn server_event(&mut self, id: Id, mut v: Value, cx: &mut Context<Self>) {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("account_id".into(), Value::String(id.to_string()));
+        }
+        if v["type"] == "access_request" {
+            self.access_event(id, &v, cx);
+        }
+        if v["type"] == "team" && v["event"] == "policy" {
+            // The vaults' effective policies and access may have changed.
+            if let Some(api) = self.api_of(Some(id)) {
+                let book = crate::access::AccessBook::global(cx);
+                book.update(cx, |b, cx| b.on_event(id, api, cx));
+            }
+            self.sync_account(id, cx);
+            self.refresh_me(cx);
         }
         if v["type"] == "vault" {
             if v["event"] == "access" {
@@ -2393,6 +2444,9 @@ impl AppModel {
     ) -> Task<Result<SignOutReport, String>> {
         let restart = self.background.contains_key(&account);
         self.stop_account(account);
+        // Its access requests and windows go with it.
+        let book = crate::access::AccessBook::global(cx);
+        book.update(cx, |b, cx| b.forget(account, cx));
         let ws = self.ws.clone();
         let fut = runtime::spawn(cx, async move {
             ws.sign_out(account, discard)

@@ -236,6 +236,10 @@ pub struct HostsView {
     workspaces: Entity<Workspaces>,
     /// Private networks: their states and the hosts tested through them.
     net_book: Entity<crate::networks::NetBook>,
+    /// Access windows and requests (teams security).
+    access_book: Entity<crate::access::AccessBook>,
+    /// Repaints the access countdowns.
+    _tick: gpui::Task<()>,
 }
 
 impl EventEmitter<OpenRequest> for HostsView {}
@@ -247,9 +251,30 @@ impl HostsView {
         let status = HostStatus::global(&model, cx);
         let workspaces = Workspaces::global(&model, cx);
         let net_book = crate::networks::NetBook::global(cx);
+        let access_book = crate::access::AccessBook::global(cx);
+        // Access countdowns: a repaint every 15 seconds (only while some
+        // host shows one).
+        let tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(15))
+                    .await;
+                let alive = this
+                    .update(cx, |v, cx| {
+                        if v.shows_windows(cx) {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        });
         let subs = vec![
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&net_book, |_, _, cx| cx.notify()),
+            cx.observe(&access_book, |_, _, cx| cx.notify()),
             cx.observe(&status, |_, _, cx| cx.notify()),
             cx.observe(&workspaces, |_, _, cx| cx.notify()),
             cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
@@ -275,7 +300,65 @@ impl HostsView {
             shown: HashMap::new(),
             workspaces,
             net_book,
+            access_book,
+            _tick: tick,
         }
+    }
+
+    /// Some host on screen has an open access window.
+    fn shows_windows(&self, cx: &gpui::App) -> bool {
+        let now = termoak_core::time::now_ms();
+        let book = self.access_book.read(cx);
+        let m = self.model.read(cx);
+        self.shown.keys().any(|id| {
+            m.account_of_host(*id).is_some_and(|a| {
+                matches!(
+                    book.window(a, *id, now),
+                    Some(crate::access::HostWindow::Open(_))
+                )
+            })
+        })
+    }
+
+    /// The access state of a host for its card: its window and whether
+    /// its sessions are recorded (asking the server when its vault has
+    /// access rules).
+    fn access_of(
+        &self,
+        rec: &Item<Host>,
+        cx: &mut Context<Self>,
+    ) -> (Option<crate::access::HostWindow>, bool) {
+        let (account, gates, api) = {
+            let m = self.model.read(cx);
+            let account = rec.account();
+            (
+                account,
+                m.gates_of(rec),
+                account.and_then(|a| m.api_of(Some(a))),
+            )
+        };
+        let Some(account) = account else {
+            return (None, false);
+        };
+        if gates.access_rules
+            && let Some(api) = api
+        {
+            let id = rec.data.id;
+            self.access_book
+                .update(cx, |b, cx| b.ensure_host(account, id, api, false, cx));
+        }
+        let book = self.access_book.read(cx);
+        let now = termoak_core::time::now_ms();
+        let recorded = gates.recorded
+            || book
+                .host(account, rec.data.id)
+                .is_some_and(|h| h.record_required);
+        let window = if gates.access_rules {
+            book.window(account, rec.data.id, now)
+        } else {
+            None
+        };
+        (window, recorded)
     }
 
     // ----- Status -----
@@ -678,6 +761,23 @@ impl HostsView {
         let network = shown.then(|| ui::choice_state(net_choices, Some(&current_net), window, cx));
         let net_book = crate::networks::NetBook::global(cx);
         let net2 = network.clone();
+        // Authentication of the group's hosts (0.7 phase 4b).
+        let current_auth = group.as_ref().and_then(|g| g.settings.auth.clone());
+        let parent = group.as_ref().and_then(|g| g.parent_id);
+        let auth_shown = {
+            let m = self.model.read(cx);
+            matches!(place.0, Scope::Account(a) if m.teams_security(a)) || current_auth.is_some()
+        };
+        let auth = auth_shown.then(|| {
+            ui::choice_state(
+                super::host_editor::auth_choices(current_auth.as_ref(), false),
+                Some(&current_auth),
+                window,
+                cx,
+            )
+        });
+        let auth2 = auth.clone();
+        let model_auth = self.model.clone();
         let model_hint = self.model.clone();
         let (n2, u2, p2) = (name.clone(), user.clone(), port.clone());
         ui::open_form_dialog(
@@ -730,6 +830,26 @@ impl HostsView {
                             cx,
                         ))
                     })
+                    .when_some(auth.clone(), |this, state| {
+                        let chosen = ui::chosen(&state, cx).flatten();
+                        let (hint, warn) = super::host_editor::auth_hint(
+                            model_auth.read(cx),
+                            place,
+                            chosen.as_ref(),
+                            parent,
+                        );
+                        let hint = if chosen.is_some() && !warn {
+                            format!("{hint} {}", t!("auth_field.group_hint")).into()
+                        } else {
+                            hint
+                        };
+                        this.child(ui::field_with_hint(
+                            t!("auth_field.label"),
+                            Select::new(&state),
+                            hint,
+                            cx,
+                        ))
+                    })
                     .into_any_element()
             },
             move |window, cx| {
@@ -764,6 +884,9 @@ impl HostsView {
                 g.settings.port = port;
                 if let Some(network) = net2.as_ref().and_then(|n| ui::chosen(n, cx)) {
                     g.settings.network_id = network;
+                }
+                if let Some(a) = auth2.as_ref().and_then(|s| ui::chosen(s, cx)) {
+                    g.settings.auth = a;
                 }
                 let task = model.update(cx, |m, cx| m.save(g, SecretUpdate::Keep, None, cx));
                 window
@@ -825,10 +948,89 @@ impl HostsView {
     }
 
     /// "Ask AI": a new AI task on these hosts (one conversation per host).
+    /// Hosts whose team does not allow the AI are left out (0.7 phase 4b).
     fn ask_ai(&mut self, ids: Vec<Id>, cx: &mut Context<Self>) {
+        let total = ids.len();
+        let ids: Vec<Id> = {
+            let m = self.model.read(cx);
+            ids.into_iter().filter(|id| m.host_gates(*id).ai).collect()
+        };
+        if ids.len() < total {
+            let text = if ids.is_empty() {
+                t!("error.ai_forbidden_by_policy")
+            } else {
+                tn!("access.ai_left_out", total - ids.len())
+            };
+            self.model.update(cx, |m, cx| {
+                m.toast(crate::state::ToastKind::Warning, text, cx)
+            });
+        }
         if !ids.is_empty() {
             cx.emit(OpenRequest::AiTask { host_ids: ids });
         }
+    }
+
+    /// "Request access…" for a host with access rules.
+    fn request_access(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let (account, api, label) = {
+            let m = self.model.read(cx);
+            let account = m.account_of_host(id);
+            (
+                account,
+                account.and_then(|a| m.api_of(Some(a))),
+                m.host_label(id),
+            )
+        };
+        let (Some(account), Some(api)) = (account, api) else {
+            ui::error(window, cx, t!("error.access_needs_server"));
+            return;
+        };
+        let model = self.model.clone();
+        let task = crate::runtime::spawn(cx, async move {
+            api.get::<termoak_core::access::HostAccess>(&format!("/api/v1/hosts/{id}/access"))
+                .await
+                .map_err(crate::state::api_error)
+        });
+        cx.spawn_in(window, async move |_, cx| {
+            let res = task.await;
+            let _ = cx.update(|window, cx| match res {
+                Ok(a) if a.allowed && a.grant.is_none() => ui::notify(
+                    window,
+                    cx,
+                    crate::state::ToastKind::Info,
+                    t!("error.access_request_not_needed"),
+                ),
+                Ok(a) => super::access_requests::open_request_dialog(
+                    model.clone(),
+                    account,
+                    label.clone(),
+                    crate::access::AccessNeed::from_access(&a),
+                    window,
+                    cx,
+                ),
+                Err(e) => ui::error(window, cx, e),
+            });
+        })
+        .detach();
+    }
+
+    /// "Access policy…" of a host or group (vault Admins).
+    fn edit_access_policy(
+        &mut self,
+        kind: termoak_core::access::AccessTargetKind,
+        id: Id,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let place = {
+            let m = self.model.read(cx);
+            m.locate_loaded(id).map(|(_, scope, vault)| (scope, vault))
+        };
+        let Some((Scope::Account(account), Some(vault))) = place else {
+            return;
+        };
+        let target = super::access_policy::target_in(&self.model, account, vault, kind, id, cx);
+        super::access_policy::open(self.model.clone(), target, window, cx);
     }
 
     fn duplicate_host(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
@@ -1204,6 +1406,45 @@ impl HostsView {
                     })),
             )
         });
+        // Teams security: request access, the access policy (Admins).
+        let (access_rules, policy_admin) = {
+            let m = this.read(cx).model.read(cx);
+            let entry = m.vault_entry_of(&rec);
+            let admin = entry.is_some_and(|e| {
+                e.role() == termoak_core::model::VaultRole::Manager
+                    && e.vault.kind != termoak_core::model::VaultKind::Personal
+                    && m.teams_security(e.account)
+            });
+            (m.gates_of(&rec).access_rules, admin)
+        };
+        let menu = menu
+            .when(access_rules, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("access.menu.request"))
+                        .icon(ui::icon(IconName::Hourglass))
+                        .on_click(act(|v, ids, window, cx| {
+                            if let Some(id) = ids.first() {
+                                v.request_access(*id, window, cx);
+                            }
+                        })),
+                )
+            })
+            .when(policy_admin, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("access.menu.policy"))
+                        .icon(ui::icon(IconName::ShieldCheck))
+                        .on_click(act(|v, ids, window, cx| {
+                            if let Some(id) = ids.first() {
+                                v.edit_access_policy(
+                                    termoak_core::access::AccessTargetKind::Host,
+                                    *id,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        })),
+                )
+            });
         let menu = menu
             .when(status_on && !status_off, |menu| {
                 menu.item(
@@ -1322,6 +1563,7 @@ impl HostsView {
         view: WeakEntity<Self>,
         group: Option<Group>,
         hosts: Vec<Id>,
+        cx: &gpui::App,
     ) -> PopupMenu {
         let (w1, w2, w3, w4, w5) = (view.clone(), view.clone(), view.clone(), view.clone(), view);
         let (h1, h2, h3) = (hosts.clone(), hosts.clone(), hosts.clone());
@@ -1363,7 +1605,40 @@ impl HostsView {
             return menu;
         };
         let g2 = g.clone();
+        // The group's access policy (vault Admins, teams security).
+        let policy_admin = w3.upgrade().is_some_and(|v| {
+            let m = v.read(cx).model.read(cx);
+            m.groups
+                .iter()
+                .find(|x| x.data.id == g.id)
+                .is_some_and(|rec| {
+                    m.vault_entry_of(rec).is_some_and(|e| {
+                        e.role() == termoak_core::model::VaultRole::Manager
+                            && e.vault.kind != termoak_core::model::VaultKind::Personal
+                            && m.teams_security(e.account)
+                    })
+                })
+        });
+        let (w6, gid) = (w3.clone(), g.id);
         menu.separator()
+            .when(policy_admin, |menu| {
+                menu.item(
+                    PopupMenuItem::new(t!("access.menu.policy"))
+                        .icon(ui::icon(IconName::ShieldCheck))
+                        .on_click(move |_, window, cx| {
+                            if let Some(v) = w6.upgrade() {
+                                v.update(cx, |v, cx| {
+                                    v.edit_access_policy(
+                                        termoak_core::access::AccessTargetKind::Group,
+                                        gid,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }),
+                )
+            })
             .item(
                 PopupMenuItem::new(t!("hosts.group.menu.edit"))
                     .icon(ui::icon(IconName::Pencil))
@@ -1697,6 +1972,9 @@ impl HostsView {
             .shown
             .get(&host.id)
             .map(|s| (*s, self.status.read(cx).is_running(host.id)));
+        let (access_window, recorded) = self.access_of(rec, cx);
+        let connect_only = rec.access == termoak_client::ItemAccess::ConnectOnly;
+        let now_ms = termoak_core::time::now_ms();
         // Private network: "via Office", with the server's test if any.
         let network = self.model.read(cx).host_network(host.id).map(|n| {
             let book = self.net_book.read(cx);
@@ -2037,9 +2315,80 @@ impl HostsView {
                                         .gap_1()
                                         .items_center()
                                         .child(ui::icon(IconName::Lock).size(px(11.)))
-                                        .child(ui::pill(t!("vaults.use_only_badge"), theme.warning))
+                                        .child(ui::pill(
+                                            if connect_only {
+                                                super::vaults::role_label(
+                                                    termoak_core::model::VaultRole::ConnectOnly,
+                                                )
+                                            } else {
+                                                t!("vaults.use_only_badge")
+                                            },
+                                            theme.warning,
+                                        ))
                                         .tooltip(|window, cx| {
                                             Tooltip::new(t!("vaults.use_only_tooltip"))
+                                                .build(window, cx)
+                                        }),
+                                )
+                            })
+                            .when_some(access_window, |this, w| {
+                                let theme = cx.theme();
+                                let (icon, text, color, tip) = match w {
+                                    crate::access::HostWindow::Open(end) => {
+                                        let left = crate::access::remaining_secs(end, now_ms);
+                                        (
+                                            IconName::Timer,
+                                            t!(
+                                                "access.chip.open",
+                                                time = crate::access::clock(end),
+                                                left = crate::access::short_remaining(left)
+                                            ),
+                                            if crate::access::ending_soon(left) {
+                                                theme.warning
+                                            } else {
+                                                theme.success
+                                            },
+                                            t!("access.chip.open_tip"),
+                                        )
+                                    }
+                                    crate::access::HostWindow::Pending => (
+                                        IconName::Hourglass,
+                                        t!("access.chip.pending"),
+                                        theme.warning,
+                                        t!("access.chip.pending_tip"),
+                                    ),
+                                    crate::access::HostWindow::Needed => (
+                                        IconName::LockKeyhole,
+                                        t!("access.chip.needed"),
+                                        theme.muted_foreground,
+                                        t!("access.chip.needed_tip"),
+                                    ),
+                                };
+                                this.child(
+                                    h_flex()
+                                        .id(("host-access", ix))
+                                        .gap_1()
+                                        .items_center()
+                                        .text_color(color)
+                                        .child(ui::icon(icon).size(px(11.)))
+                                        .child(ui::pill(text, color))
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(tip.clone()).build(window, cx)
+                                        }),
+                                )
+                            })
+                            .when(recorded, |this| {
+                                let color = cx.theme().danger;
+                                this.child(
+                                    h_flex()
+                                        .id(("host-recorded", ix))
+                                        .gap_1()
+                                        .items_center()
+                                        .text_color(color)
+                                        .child(ui::icon(IconName::CircleDot).size(px(11.)))
+                                        .child(ui::pill(t!("access.recorded"), color))
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new(t!("access.recorded_tip"))
                                                 .build(window, cx)
                                         }),
                                 )
@@ -2097,16 +2446,17 @@ impl HostsView {
                     .xsmall()
                     .ghost()
                     .icon(ui::icon(IconName::Ellipsis))
-                    .dropdown_menu(move |menu, _, _| {
-                        Self::group_menu(menu, weak.clone(), group_owned.clone(), hosts.clone())
+                    .dropdown_menu(move |menu, _, cx| {
+                        Self::group_menu(menu, weak.clone(), group_owned.clone(), hosts.clone(), cx)
                     }),
             )
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
                 Self::group_menu(
                     menu,
                     menu_view.clone(),
                     menu_group.clone(),
                     menu_hosts.clone(),
+                    cx,
                 )
             })
     }

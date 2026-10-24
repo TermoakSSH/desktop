@@ -17,6 +17,8 @@ use gpui_component::switch::Switch;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 
+use termoak_core::Id;
+
 use super::OpenRequest;
 use super::accounts::AccountsView;
 use super::add_account::{self, web_link};
@@ -49,6 +51,8 @@ pub struct SettingsView {
     /// Interface language (`None` = the system language).
     language: ui::ChoiceState<Option<String>>,
     two_factor: Entity<TwoFactorPanel>,
+    /// Your personal SSH CA (servers with teams security), per account.
+    personal_ca: Option<(Id, Entity<super::ca_panel::CaPanel>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -104,6 +108,9 @@ impl SettingsView {
                 },
             ),
             cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe_in(&model, window, |this, _, window, cx| {
+                this.sync_personal_ca(window, cx)
+            }),
             cx.observe(&updates, |_, _, cx| cx.notify()),
             cx.observe(&two_factor, |_, _, cx| cx.notify()),
         ];
@@ -116,7 +123,36 @@ impl SettingsView {
             font_family,
             language,
             two_factor,
+            personal_ca: None,
             _subs: subs,
+        }
+    }
+
+    /// The personal CA panel follows the current account.
+    fn sync_personal_ca(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = {
+            let m = self.model.read(cx);
+            m.current_account
+                .filter(|a| m.logged_in() && m.teams_security(*a))
+        };
+        match (current, &self.personal_ca) {
+            (None, None) => {}
+            (None, Some(_)) => self.personal_ca = None,
+            (Some(a), Some((b, _))) if a == *b => {}
+            (Some(a), _) => {
+                let model = self.model.clone();
+                let view = cx.new(|cx| {
+                    super::ca_panel::CaPanel::new(
+                        model,
+                        Some(a),
+                        super::ca_panel::CaScope::Personal,
+                        window,
+                        cx,
+                    )
+                });
+                self.personal_ca = Some((a, view));
+                cx.notify();
+            }
         }
     }
 
@@ -400,6 +436,21 @@ impl SettingsView {
                                     })),
                             )
                             .child(hint(t!("settings.notifications.shared_with_me_hint"))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("notifications-access")
+                                    .label(t!("settings.notifications.access"))
+                                    .checked(prefs.access)
+                                    .disabled(off)
+                                    .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                        let v = *v;
+                                        this.set_notifications(cx, |p| p.access = v)
+                                    })),
+                            )
+                            .child(hint(t!("settings.notifications.access_hint"))),
                     )
                     .child(
                         v_flex()
@@ -981,6 +1032,13 @@ impl SettingsView {
                 .child(manage),
         )
         .child(self.two_factor.clone())
+        .children(self.personal_ca.as_ref().map(|(_, ca)| {
+            div()
+                .pt_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(ca.clone())
+        }))
     }
 
     fn render_updates(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

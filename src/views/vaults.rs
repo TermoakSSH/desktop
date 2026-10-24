@@ -26,6 +26,9 @@ use termoak_core::model::{
     AuditEntry, Team, Vault, VaultKind, VaultMember, VaultPrincipal, VaultRole,
 };
 
+use termoak_core::access::{AccessPolicyRecord, AccessTargetKind};
+
+use super::recording_player::VaultRecording;
 use crate::accounts::{VaultEntry, vault_label};
 use crate::runtime;
 use crate::state::{AppModel, api_error};
@@ -93,6 +96,7 @@ pub fn role_label(role: VaultRole) -> SharedString {
         VaultRole::Manager => t!("vaults.role.manager"),
         VaultRole::Editor => t!("vaults.role.editor"),
         VaultRole::UseOnly => t!("vaults.role.use_only"),
+        VaultRole::ConnectOnly => t!("vaults.role.connect_only"),
         VaultRole::Unknown => t!("vaults.role.unknown"),
     }
 }
@@ -299,6 +303,10 @@ pub fn open_manage(
 enum VaultTab {
     General,
     Members,
+    /// Access policies of the vault, its groups and hosts (Admins).
+    Access,
+    /// Recorded sessions (Admins).
+    Recordings,
     Activity,
 }
 
@@ -334,6 +342,15 @@ struct VaultManager {
     audit_more: bool,
     delete_confirm: Entity<InputState>,
     busy: bool,
+    /// The server has teams security (fine roles, policies, recordings).
+    teams_security: bool,
+    /// You manage it as its owner or a team owner/admin (not by an Admin
+    /// grant): only then can you delete it.
+    implicit_manager: bool,
+    policies: Vec<AccessPolicyRecord>,
+    policies_error: Option<String>,
+    recordings: Vec<VaultRecording>,
+    recordings_error: Option<String>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -374,6 +391,14 @@ impl VaultManager {
                 }
             }),
         ];
+        let teams_security = model.read(cx).teams_security(entry.account);
+        // Owner of a shared vault: implicit (members say it for team vaults).
+        let me = model
+            .read(cx)
+            .account(entry.account)
+            .and_then(|a| a.info.user_id);
+        let implicit_manager =
+            v.kind == VaultKind::Shared && v.owner_user_id.is_some() && v.owner_user_id == me;
         let mut this = Self {
             model,
             account: entry.account,
@@ -399,6 +424,12 @@ impl VaultManager {
             audit_more: false,
             delete_confirm,
             busy: false,
+            teams_security,
+            implicit_manager,
+            policies: Vec::new(),
+            policies_error: None,
+            recordings: Vec::new(),
+            recordings_error: None,
             _subs: subs,
         };
         this.load_members(window, cx);
@@ -443,6 +474,16 @@ impl VaultManager {
                 this.loading = false;
                 match res {
                     Ok(list) => {
+                        let me = this
+                            .model
+                            .read(cx)
+                            .account(this.account)
+                            .and_then(|a| a.info.user_id);
+                        this.implicit_manager |= list.iter().any(|m| {
+                            m.implicit
+                                && m.role == VaultRole::Manager
+                                && matches!(&m.principal, VaultPrincipal::User { id, .. } if Some(*id) == me)
+                        });
                         this.members = list;
                         this.members_error = None;
                     }
@@ -451,6 +492,77 @@ impl VaultManager {
                 cx.notify();
             },
         );
+    }
+
+    fn load_policies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else {
+            return;
+        };
+        let id = self.vault.id;
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                api.get::<Vec<AccessPolicyRecord>>(&format!("/api/v1/vaults/{id}/access-policies"))
+                    .await
+                    .map_err(api_error)
+            },
+            |this, res, _, cx| {
+                match res {
+                    Ok(list) => {
+                        this.policies = list;
+                        this.policies_error = None;
+                    }
+                    Err(e) => this.policies_error = Some(e),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn load_recordings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(api) = self.api(cx) else {
+            return;
+        };
+        let id = self.vault.id;
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                api.get::<Vec<VaultRecording>>(&format!("/api/v1/vaults/{id}/recordings"))
+                    .await
+                    .map_err(api_error)
+            },
+            |this, res, _, cx| {
+                match res {
+                    Ok(list) => {
+                        this.recordings = list;
+                        this.recordings_error = None;
+                    }
+                    Err(e) => this.recordings_error = Some(e),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Opens the access policy editor for a target of this vault.
+    fn edit_policy(
+        &mut self,
+        kind: AccessTargetKind,
+        target: Id,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = super::access_policy::target_in(
+            &self.model,
+            self.account,
+            self.vault.id,
+            kind,
+            target,
+            cx,
+        );
+        super::access_policy::open(self.model.clone(), target, window, cx);
     }
 
     fn load_teams(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -508,6 +620,12 @@ impl VaultManager {
         self.tab = tab;
         if tab == VaultTab::Activity && self.audit.is_empty() {
             self.load_audit(false, window, cx);
+        }
+        if tab == VaultTab::Access {
+            self.load_policies(window, cx);
+        }
+        if tab == VaultTab::Recordings {
+            self.load_recordings(window, cx);
         }
         cx.notify();
     }
@@ -761,6 +879,7 @@ impl VaultManager {
                     this.child(div().text_sm().child(v.description.clone()))
                 })
                 .child(div().text_sm().text_color(muted).child(match self.role {
+                    VaultRole::ConnectOnly => t!("vaults.you_connect_only"),
                     VaultRole::UseOnly if self.strict => t!("vaults.you_use_only_strict"),
                     VaultRole::UseOnly => t!("vaults.you_use_only"),
                     _ => t!("vaults.you_editor"),
@@ -861,13 +980,18 @@ impl VaultManager {
                 let current = self.team_member_role;
                 this.child(ui::field_with_hint(
                     t!("vaults.team_role.label"),
-                    h_flex().gap_1().children(
+                    h_flex().gap_1().flex_wrap().children(
                         [
                             (Some(VaultRole::Editor), role_label(VaultRole::Editor)),
                             (Some(VaultRole::UseOnly), role_label(VaultRole::UseOnly)),
+                            (
+                                Some(VaultRole::ConnectOnly),
+                                role_label(VaultRole::ConnectOnly),
+                            ),
                             (None, t!("vaults.team_role.none")),
                         ]
                         .into_iter()
+                        .filter(|(r, _)| self.teams_security || *r != Some(VaultRole::ConnectOnly))
                         .enumerate()
                         .map(|(i, (role, label))| {
                             Button::new(("team-member-role", i))
@@ -923,46 +1047,62 @@ impl VaultManager {
                         ),
                 ),
             )
-            .when(!personal, |this| {
-                this.child(
-                    v_flex()
-                        .gap_2()
-                        .p_3()
-                        .rounded(theme.radius_lg)
-                        .border_1()
-                        .border_color(theme.danger)
-                        .child(
-                            div()
-                                .font_semibold()
-                                .text_sm()
-                                .text_color(theme.danger)
-                                .child(t!("vaults.delete_title")),
-                        )
-                        .child(div().text_sm().child(t!(
-                            "vaults.delete_message",
-                            counts = counts_text(v),
-                            members = v.member_count
-                        )))
-                        .child(ui::field(
-                            t!("vaults.delete_type", name = v.name.clone()),
-                            Input::new(&self.delete_confirm),
-                            cx,
-                        ))
-                        .child(
-                            h_flex().child(
-                                Button::new("delete-vault")
-                                    .danger()
-                                    .icon(ui::icon(IconName::Trash))
-                                    .label(t!("vaults.delete"))
-                                    .disabled(!can_delete)
-                                    .loading(self.busy)
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                        this.delete(window, cx)
-                                    })),
+            .when(
+                !personal && !crate::access::can_delete_vault(self.role, self.implicit_manager),
+                |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(t!("vaults.explicit_admin_no_delete")),
+                    )
+                },
+            )
+            .when(
+                !personal && crate::access::can_delete_vault(self.role, self.implicit_manager),
+                |this| {
+                    this.child(
+                        v_flex()
+                            .gap_2()
+                            .p_3()
+                            .rounded(theme.radius_lg)
+                            .border_1()
+                            .border_color(theme.danger)
+                            .child(
+                                div()
+                                    .font_semibold()
+                                    .text_sm()
+                                    .text_color(theme.danger)
+                                    .child(t!("vaults.delete_title")),
+                            )
+                            .child(div().text_sm().child(t!(
+                                "vaults.delete_message",
+                                counts = counts_text(v),
+                                members = v.member_count
+                            )))
+                            .child(ui::field(
+                                t!("vaults.delete_type", name = v.name.clone()),
+                                Input::new(&self.delete_confirm),
+                                cx,
+                            ))
+                            .child(
+                                h_flex().child(
+                                    Button::new("delete-vault")
+                                        .danger()
+                                        .icon(ui::icon(IconName::Trash))
+                                        .label(t!("vaults.delete"))
+                                        .disabled(!can_delete)
+                                        .loading(self.busy)
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, window, cx| {
+                                                this.delete(window, cx)
+                                            },
+                                        )),
+                                ),
                             ),
-                        ),
-                )
-            })
+                    )
+                },
+            )
             .into_any_element()
     }
 
@@ -1014,6 +1154,7 @@ impl VaultManager {
             };
             let editable = manager && !m.implicit;
             let member = m.clone();
+            let teams_security = self.teams_security;
             let (w1, w2) = (weak.clone(), weak.clone());
             h_flex()
                 .gap_3()
@@ -1052,7 +1193,7 @@ impl VaultManager {
                                 .label(role_label(member.role))
                                 .dropdown_menu(move |menu, _, _| {
                                     let mut menu = menu;
-                                    for role in [VaultRole::Editor, VaultRole::UseOnly] {
+                                    for role in crate::access::grantable_roles(teams_security) {
                                         let w = w1.clone();
                                         menu = menu.item(
                                             PopupMenuItem::new(role_label(role))
@@ -1182,7 +1323,7 @@ impl VaultManager {
                             }
                         }))
                         .children(
-                            [VaultRole::Editor, VaultRole::UseOnly]
+                            crate::access::grantable_roles(self.teams_security)
                                 .into_iter()
                                 .enumerate()
                                 .map(|(i, role)| {
@@ -1219,7 +1360,11 @@ impl VaultManager {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(t!("vaults.roles_hint")),
+                        .child(format!(
+                            "{}: {}",
+                            role_label(self.add_role),
+                            crate::access::role_hint(self.add_role)
+                        )),
                 )
         });
         v_flex()
@@ -1328,28 +1473,278 @@ fn principal_name(p: &VaultPrincipal) -> String {
     }
 }
 
+impl VaultManager {
+    /// The tabs shown (Access and Recordings for Admins on servers with
+    /// teams security).
+    fn tabs(&self) -> Vec<VaultTab> {
+        let mut v = vec![VaultTab::General, VaultTab::Members];
+        if self.teams_security && self.manager() {
+            if !self.personal() {
+                v.push(VaultTab::Access);
+            }
+            v.push(VaultTab::Recordings);
+        }
+        v.push(VaultTab::Activity);
+        v
+    }
+
+    fn render_access(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let m = self.model.read(cx);
+        let label_of = |p: &AccessPolicyRecord| -> String {
+            match p.target_kind {
+                AccessTargetKind::Vault => ui::capitalize(&t!("access_policy.the_vault")),
+                AccessTargetKind::Group => m
+                    .groups
+                    .iter()
+                    .find(|g| g.data.id == p.target_id)
+                    .map(|g| g.data.name.clone())
+                    .unwrap_or_else(|| t!("access_policy.missing_target").to_string()),
+                _ => m
+                    .hosts
+                    .iter()
+                    .find(|h| h.data.id == p.target_id)
+                    .map(|h| h.data.label.clone())
+                    .unwrap_or_else(|| t!("access_policy.missing_target").to_string()),
+            }
+        };
+        let rows: Vec<(usize, AccessTargetKind, Id, String, String)> = self
+            .policies
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mode = if p.policy.mode.requires_approval() {
+                    t!(
+                        "access_policy.summary_approval",
+                        max = crate::access::duration_label(p.policy.max_minutes)
+                    )
+                    .to_string()
+                } else {
+                    t!("access_policy.mode.direct").to_string()
+                };
+                let mode = if p.policy.record_sessions {
+                    format!("{mode} · {}", t!("access.recorded"))
+                } else {
+                    mode
+                };
+                (i, p.target_kind, p.target_id, label_of(p), mode)
+            })
+            .collect();
+        let has_vault = self
+            .policies
+            .iter()
+            .any(|p| p.target_kind == AccessTargetKind::Vault);
+        let vault_id = self.vault.id;
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(t!("access_policy.vault_hint")),
+            )
+            .when_some(self.policies_error.clone(), |this, e| {
+                this.child(div().text_sm().text_color(theme.danger).child(e))
+            })
+            .when(rows.is_empty() && self.policies_error.is_none(), |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(t!("access_policy.empty")),
+                )
+            })
+            .children(rows.into_iter().map(|(i, kind, target, label, mode)| {
+                h_flex()
+                    .gap_2()
+                    .p_2()
+                    .items_center()
+                    .rounded(theme.radius)
+                    .bg(theme.secondary)
+                    .child(
+                        ui::icon(match kind {
+                            AccessTargetKind::Vault => IconName::Vault,
+                            AccessTargetKind::Group => IconName::Folder,
+                            _ => IconName::Server,
+                        })
+                        .size(px(14.))
+                        .text_color(muted),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().font_medium().child(label))
+                            .child(div().text_xs().text_color(muted).child(mode)),
+                    )
+                    .child(
+                        Button::new(("policy-edit", i))
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::Pencil))
+                            .label(t!("common.edit"))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.edit_policy(kind, target, window, cx)
+                            })),
+                    )
+            }))
+            .child(
+                h_flex().child(
+                    Button::new("policy-vault")
+                        .small()
+                        .icon(ui::icon(IconName::ShieldCheck))
+                        .label(if has_vault {
+                            t!("access_policy.edit_vault")
+                        } else {
+                            t!("access_policy.set_vault")
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.edit_policy(AccessTargetKind::Vault, vault_id, window, cx)
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(t!("access_policy.where_hint")),
+            )
+            .into_any_element()
+    }
+
+    fn render_recordings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let (model, account, vault) = (self.model.clone(), self.account, self.vault.id);
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(t!("recordings.hint")),
+            )
+            .when_some(self.recordings_error.clone(), |this, e| {
+                this.child(div().text_sm().text_color(theme.danger).child(e))
+            })
+            .when(
+                self.recordings.is_empty() && self.recordings_error.is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(t!("recordings.empty")),
+                    )
+                },
+            )
+            .children(self.recordings.iter().enumerate().map(|(i, r)| {
+                let (r1, r2, m1, m2) = (r.clone(), r.clone(), model.clone(), model.clone());
+                h_flex()
+                    .gap_2()
+                    .py_1()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_sm().font_medium().child(
+                                if r.title.trim().is_empty() {
+                                    t!("server_sessions.default_title").to_string()
+                                } else {
+                                    r.title.clone()
+                                },
+                            ))
+                            .child(div().text_xs().text_color(muted).child(format!(
+                                    "{} · {}{}{}",
+                                    r.owner_email.clone().unwrap_or_default(),
+                                    ui::format_ms(r.created_at),
+                                    r.ended_at
+                                        .filter(|e| *e > r.created_at)
+                                        .map(|e| format!(
+                                            " · {}",
+                                            crate::access::short_remaining(
+                                                (e - r.created_at) / 1000
+                                            )
+                                        ))
+                                        .unwrap_or_default(),
+                                    if r.kind.as_deref() == Some("device") {
+                                        format!(" · {}", t!("recordings.from_device"))
+                                    } else {
+                                        String::new()
+                                    }
+                                ))),
+                    )
+                    .child(
+                        Button::new(("rec-play", i))
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::CirclePlay))
+                            .label(t!("recordings.play"))
+                            .on_click(move |_, window, cx| {
+                                super::recording_player::open_recording(
+                                    m1.clone(),
+                                    account,
+                                    vault,
+                                    r1.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    )
+                    .child(
+                        Button::new(("rec-download", i))
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::Download))
+                            .tooltip(t!("recordings.download"))
+                            .on_click(move |_, window, cx| {
+                                super::recording_player::open_recording(
+                                    m2.clone(),
+                                    account,
+                                    vault,
+                                    r2.clone(),
+                                    false,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    )
+            }))
+            .into_any_element()
+    }
+}
+
 impl Render for VaultManager {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = TabBar::new("vault-tabs")
-            .selected_index(match self.tab {
-                VaultTab::General => 0,
-                VaultTab::Members => 1,
-                VaultTab::Activity => 2,
+        let tabs_list = self.tabs();
+        let selected = tabs_list.iter().position(|t| *t == self.tab).unwrap_or(0);
+        let labels: Vec<SharedString> = tabs_list
+            .iter()
+            .map(|t| match t {
+                VaultTab::General => t!("vaults.tab.general"),
+                VaultTab::Members => tn!("vaults.tab.members", self.members.len()),
+                VaultTab::Access => t!("vaults.tab.access"),
+                VaultTab::Recordings => t!("vaults.tab.recordings"),
+                VaultTab::Activity => t!("vaults.tab.activity"),
             })
-            .child(Tab::new().label(t!("vaults.tab.general")))
-            .child(Tab::new().label(tn!("vaults.tab.members", self.members.len())))
-            .child(Tab::new().label(t!("vaults.tab.activity")))
-            .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                let tab = match *ix {
-                    1 => VaultTab::Members,
-                    2 => VaultTab::Activity,
-                    _ => VaultTab::General,
-                };
+            .collect();
+        let tabs = TabBar::new("vault-tabs")
+            .selected_index(selected)
+            .children(labels.into_iter().map(|l| Tab::new().label(l)))
+            .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                let tab = this.tabs().get(*ix).copied().unwrap_or(VaultTab::General);
                 this.set_tab(tab, window, cx);
             }));
         let body = match self.tab {
             VaultTab::General => self.render_general(cx),
             VaultTab::Members => self.render_members(cx),
+            VaultTab::Access => self.render_access(cx),
+            VaultTab::Recordings => self.render_recordings(cx),
             VaultTab::Activity => self.render_activity(cx),
         };
         let header = h_flex()

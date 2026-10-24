@@ -598,6 +598,16 @@ pub fn code_of_message(message: &str) -> Option<SkErrorCode> {
 /// An error text from the server: the app's text when it is a security
 /// key error, else as it came.
 pub fn server_error_text(message: &str) -> String {
+    // Teams security: the close reasons and codes the server sends as they
+    // are (`access_expired`, `access_approval_required`...).
+    if let Some(text) = crate::access::close_reason_text(message.trim()) {
+        return text;
+    }
+    if crate::access::is_teams_code(message.trim())
+        && let Some(text) = crate::i18n::api_error_text(message.trim())
+    {
+        return text;
+    }
     match code_of_message(message) {
         Some(code) => error_text(code.api_code(), ""),
         None => message.to_string(),
