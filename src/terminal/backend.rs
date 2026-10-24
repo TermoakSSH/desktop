@@ -499,7 +499,7 @@ async fn run_server(
                     RemoteEvent::Resync => { let _ = out.send(Out::Reset); }
                     RemoteEvent::Status(v) => {
                         if v["state"].as_str() == Some("closed") {
-                            let reason = v["reason"].as_str().map(str::to_string).or_else(|| {
+                            let reason = v["reason"].as_str().map(crate::security_keys::server_error_text).or_else(|| {
                                 v["exit_code"].as_u64().map(|c| t!("terminal.status.exited", code = c).to_string())
                             });
                             let _ = out.send(Out::Closed(reason));
@@ -615,7 +615,7 @@ fn state_message(v: &Value) -> Option<String> {
             v["message"]
                 .as_str()
                 .filter(|m| !m.is_empty())
-                .map(str::to_string)
+                .map(crate::security_keys::session_message)
                 .unwrap_or_else(|| t!("terminal.status.server_connecting").to_string()),
         ),
         "host_offline" => Some(t!("terminal.status.host_offline").to_string()),

@@ -1,7 +1,7 @@
 [package]
 name = "termoak-desktop"
 description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
-version = "0.7.0-next.2"
+version = "0.7.0-next.3"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.3" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.3" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.3" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.3" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.3", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
@@ -70,6 +70,14 @@ roxmltree = "0.21"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 
+# FIDO2 security keys (src/security_keys/ctap.rs) over USB HID on Linux and
+# macOS (MIT). Linux builds need libudev-dev (hidapi's hidraw backend) and
+# users need access to /dev/hidraw* (the usual 70-u2f udev rules). Windows
+# uses webauthn.dll instead (src/security_keys/windows.rs): since Windows 10
+# 1903 only administrators can open FIDO HID devices.
+[target.'cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))'.dependencies]
+ctap-hid-fido2 = "3.6"
+
 # Native GPUI platform (Metal on macOS, DirectX on Windows, Vulkan on Linux).
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
@@ -85,7 +93,7 @@ objc2-user-notifications = { version = "0.3.2", default-features = false, featur
 # Windows: Windows Hello for the app lock (src/app_lock/hello.rs), with the
 # same versions GPUI's platform crate already uses.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
+windows = { version = "0.62", features = ["Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT", "Win32_Networking_WindowsWebServices", "Win32_UI_WindowsAndMessaging"] }
 windows-future = "0.3"
 raw-window-handle = "0.6"
 
@@ -111,6 +119,12 @@ strip = "symbols"
 # Windows from Linux or macOS (see vendor/gpui-pre-windows/README.md).
 [patch.crates-io]
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+# The test-only software FIDO2 authenticator (never in the app): the
+# security key flows above the hardware layer are tested with it.
+[dev-dependencies]
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.5", features = ["soft-sk"] }
+tempfile = "3"
 
 [build-dependencies]
 # Icon of the Windows .exe (build.rs).

@@ -34,6 +34,12 @@ RUN curl -fsSLo /tmp/rustup-init https://static.rust-lang.org/rustup/dist/x86_64
       --target x86_64-pc-windows-gnu \
  && chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
 
+# FIDO2 security keys on Linux (ctap-hid-fido2 → hidapi's hidraw backend
+# links libudev). Its own layer so the toolchains above stay cached.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libudev-dev \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV TERMOAK_BUILDER=1 \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \

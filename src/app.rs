@@ -537,7 +537,11 @@ impl AppView {
         let workspaces = Workspaces::global(&model, cx);
         let lock = AppLock::global(&model, cx);
 
-        let mut subs = vec![
+        let mut subs = vec![];
+        if let Some(sk) = crate::security_keys::overlay::overlay(cx) {
+            subs.push(cx.observe(&sk, |_, _, cx| cx.notify()));
+        }
+        subs.extend([
             cx.observe_in(&model, window, |this, model, window, cx| {
                 // The administration section disappears if you are no longer
                 // an administrator (or you sign out).
@@ -620,7 +624,7 @@ impl AppView {
                     }
                 });
             }),
-        ];
+        ]);
         // A window that closes leaves the saved session (unless it is the
         // last one: its tabs reopen next time).
         let me = cx.entity_id();
@@ -2844,46 +2848,56 @@ impl AppView {
         let Some(p) = self.active_panes() else {
             return;
         };
-        let split = p.is_split();
         let broadcast = p.broadcast;
+        let focused = p.focused().entity_id();
+        let targets: Vec<crate::views::snippets::SendTarget> = p
+            .views()
+            .map(|v| {
+                let host = match v.read(cx).kind() {
+                    TermKind::Local { host_id } => Some(*host_id),
+                    TermKind::Server { host_id, .. } => *host_id,
+                    TermKind::Shell | TermKind::Serial { .. } => None,
+                };
+                crate::views::snippets::SendTarget {
+                    pane: v.entity_id(),
+                    host,
+                    focused: v.entity_id() == focused,
+                    included: !p.excluded.contains(&v.entity_id()),
+                }
+            })
+            .collect();
         let weak = cx.entity().downgrade();
         crate::views::snippets::open_send_dialog(
             self.model.clone(),
-            split,
+            targets,
             broadcast,
             preselect,
             window,
             cx,
-            move |script, all, window, cx| {
+            move |texts, window, cx| {
                 if let Some(app) = weak.upgrade() {
-                    app.update(cx, |this, cx| this.send_snippet(&script, all, window, cx));
+                    app.update(cx, |this, cx| this.send_snippet(texts, window, cx));
                 }
             },
         );
     }
 
-    /// Types a snippet into the focused terminal or into every included
-    /// pane of the split view.
+    /// Types a snippet into the terminals it was rendered for (each pane
+    /// its own text: its host's built-ins).
     fn send_snippet(
         &mut self,
-        script: &str,
-        all: bool,
+        texts: Vec<(EntityId, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(p) = self.active_panes() else {
             return;
         };
-        let targets: Vec<Entity<TerminalView>> = if all {
-            p.views()
-                .filter(|v| !p.excluded.contains(&v.entity_id()))
-                .cloned()
-                .collect()
-        } else {
-            vec![p.focused().clone()]
-        };
-        for t in &targets {
-            t.update(cx, |t, cx| t.send_snippet(script, cx));
+        let views: Vec<Entity<TerminalView>> = p.views().cloned().collect();
+        for (pane, text) in &texts {
+            if let Some(t) = views.iter().find(|v| v.entity_id() == *pane) {
+                t.update(cx, |t, cx| t.send_snippet(text, cx));
+            }
         }
         if let Some(tab) = self.active
             && let Some(focused) = self.active_panes().map(|p| p.focused)
@@ -5135,6 +5149,8 @@ impl Render for AppView {
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let sheet_layer = Root::render_sheet_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
+        // Security key requests: above every dialog.
+        let security_key_layer = crate::security_keys::overlay::render(window, cx);
         let theme = cx.theme();
 
         v_flex()
@@ -5219,6 +5235,7 @@ impl Render for AppView {
             .child(div().flex_1().min_h_0().w_full().child(main))
             .children(sheet_layer)
             .children(dialog_layer)
+            .children(security_key_layer)
             .children(notification_layer)
             .into_any_element()
     }

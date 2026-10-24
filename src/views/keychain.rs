@@ -9,6 +9,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::Select;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
@@ -364,8 +365,17 @@ impl KeychainView {
                     let res = task.await;
                     let _ = cx.update(|window, cx| match res {
                         Ok(Some(key)) => {
+                            let handle = termoak_ssh::sk::is_security_key(&key);
                             cx.write_to_clipboard(ClipboardItem::new_string(key));
-                            ui::success(window, cx, t!("keychain.private_copied"));
+                            ui::success(
+                                window,
+                                cx,
+                                if handle {
+                                    t!("keychain.handle_copied")
+                                } else {
+                                    t!("keychain.private_copied")
+                                },
+                            );
                         }
                         Ok(None) => ui::error(window, cx, t!("keychain.no_private")),
                         Err(e) => ui::error(window, cx, e),
@@ -643,7 +653,18 @@ impl KeychainView {
                 let theme = cx.theme();
                 let k = rec.data.clone();
                 let public = k.public_key.clone();
-                let (r1, r2, r3) = (rec.clone(), rec.clone(), rec.clone());
+                let (r1, r2, r3, r4) = (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+                let security_key = super::keychain_sk::is_security_key(&k);
+                let sk_badge: SharedString = match k
+                    .security_key
+                    .as_ref()
+                    .and_then(|i| i.device.clone())
+                    .filter(|d| !d.is_empty())
+                {
+                    Some(d) => format!("{} · {d}", t!("keychain.sk.badge")).into(),
+                    None => t!("keychain.sk.badge"),
+                };
+                let details_model = self.model.clone();
                 h_flex()
                     .id(("key", i))
                     .p_3()
@@ -662,9 +683,13 @@ impl KeychainView {
                             .items_center()
                             .justify_center()
                             .child(
-                                ui::icon(IconName::KeyRound)
-                                    .size(px(18.))
-                                    .text_color(theme.primary),
+                                ui::icon(if security_key {
+                                    IconName::Usb
+                                } else {
+                                    IconName::KeyRound
+                                })
+                                .size(px(18.))
+                                .text_color(theme.primary),
                             ),
                     )
                     .child(
@@ -677,6 +702,9 @@ impl KeychainView {
                                     .gap_2()
                                     .items_center()
                                     .child(div().font_semibold().text_sm().child(k.label.clone()))
+                                    .when(security_key, |this| {
+                                        this.child(ui::pill(sk_badge.clone(), theme.success))
+                                    })
                                     .child(ui::pill(k.algorithm.clone(), theme.primary))
                                     .when(k.has_passphrase, |this| {
                                         this.child(ui::pill(
@@ -724,13 +752,33 @@ impl KeychainView {
                                 );
                             }),
                     )
+                    .child(
+                        Button::new(("key-details", i))
+                            .small()
+                            .ghost()
+                            .icon(ui::icon(IconName::Info))
+                            .tooltip(t!("keychain.details"))
+                            .on_click(move |_, window, cx| {
+                                super::keychain_sk::open_key_details(
+                                    details_model.clone(),
+                                    r4.clone(),
+                                    false,
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    )
                     .when(caps.reveal, |this| {
                         this.child(
                             Button::new(("copy-private", i))
                                 .small()
                                 .ghost()
                                 .icon(ui::icon(IconName::FileKey))
-                                .tooltip(t!("keychain.copy_private"))
+                                .tooltip(if security_key {
+                                    t!("keychain.copy_handle")
+                                } else {
+                                    t!("keychain.copy_private")
+                                })
                                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                     this.copy_private_key(r3.clone(), window, cx)
                                 })),
@@ -886,6 +934,35 @@ impl Render for KeychainView {
         let actions = match tab {
             Tab::Keys => h_flex()
                 .gap_2()
+                .child({
+                    let (m1, m2) = (self.model.clone(), self.model.clone());
+                    Button::new("security-key-menu")
+                        .icon(ui::icon(IconName::Usb))
+                        .label(t!("keychain.sk.menu"))
+                        .dropdown_menu(move |menu, _, _| {
+                            let (m1, m2) = (m1.clone(), m2.clone());
+                            menu.item(PopupMenuItem::new(t!("keychain.sk.new")).on_click(
+                                move |_, window, cx| {
+                                    super::keychain_sk::open_new_security_key(
+                                        m1.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            ))
+                            .item(
+                                PopupMenuItem::new(t!("keychain.sk.load")).on_click(
+                                    move |_, window, cx| {
+                                        super::keychain_sk::open_load_resident(
+                                            m2.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ),
+                            )
+                        })
+                })
                 .child(
                     Button::new("import-key")
                         .icon(ui::icon(IconName::Upload))
@@ -981,6 +1058,7 @@ fn save_material(
         comment: material.comment.clone(),
         has_passphrase: material.encrypted,
         certificate: None,
+        security_key: material.security_key.clone(),
     };
     let secret = SshKeySecret {
         private_key: Some(material.private_openssh.clone()),
@@ -994,10 +1072,15 @@ fn save_material(
     let task = model.update(cx, |m, cx| {
         m.save(key, SecretUpdate::Set(secret), Some(mode), cx)
     });
+    let model = model.clone();
     window
         .spawn(cx, async move |cx| {
             let res = task.await;
             let _ = cx.update(|window, cx| match res {
+                Ok(r) if r.data.security_key.is_some() => {
+                    ui::success(window, cx, t!("keychain.sk.imported", name = r.data.label));
+                    super::keychain_sk::open_key_details(model, r, true, window, cx);
+                }
                 Ok(r) => {
                     cx.write_to_clipboard(ClipboardItem::new_string(r.data.public_key.clone()));
                     ui::success(window, cx, t!("keychain.key_saved", name = r.data.label));

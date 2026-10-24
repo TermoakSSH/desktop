@@ -743,6 +743,10 @@ pub fn via_text(network: &str, latency: Option<String>) -> String {
 /// Text of a failed host test.
 pub fn host_test_error(test: &HostTest) -> String {
     let code = test.error_code.as_deref().unwrap_or("");
+    // A security key the server asked your devices for.
+    if code.starts_with("security_key_") {
+        return crate::security_keys::error_text(code, test.error.as_deref().unwrap_or(""));
+    }
     // A Tailscale network says more: netd's reason, in words.
     if code == "network_dial_failed"
         && let (Some(net), Some(e)) = (&test.network, &test.error)
@@ -750,7 +754,9 @@ pub fn host_test_error(test: &HostTest) -> String {
     {
         if let Some((_, rest)) = e.split_once("waits for authorization") {
             // "logged in but must be approved" is an approval, not a login.
-            return if !rest.contains("approv") && (rest.contains("logged in") || rest.contains("login")) {
+            return if !rest.contains("approv")
+                && (rest.contains("logged in") || rest.contains("login"))
+            {
                 t!("networks.ts.error.login", name = net.name).to_string()
             } else {
                 t!("networks.ts.error.approval", name = net.name).to_string()

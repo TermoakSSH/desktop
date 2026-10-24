@@ -61,9 +61,13 @@ impl SessionRow {
             state: v["state"]["state"].as_str().unwrap_or("").to_string(),
             detail: v["state"]["message"]
                 .as_str()
-                .or_else(|| v["state"]["reason"].as_str())
-                .unwrap_or("")
-                .to_string(),
+                .map(crate::security_keys::session_message)
+                .or_else(|| {
+                    v["state"]["reason"]
+                        .as_str()
+                        .map(crate::security_keys::server_error_text)
+                })
+                .unwrap_or_default(),
             viewers: people_inside(v),
             created_at: v["created_at"].as_i64().unwrap_or(0),
             access: v["access"].as_str().unwrap_or("owner").to_string(),

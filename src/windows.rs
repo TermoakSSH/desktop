@@ -315,6 +315,16 @@ pub fn show_prompt(req: PromptRequest, cx: &mut App) {
     }
 }
 
+/// Shows a security key request (touch, PIN, device) in the notice
+/// window. Without a window it is dropped, which cancels it.
+pub fn show_security_key(req: crate::security_keys::overlay::SkUiRequest, cx: &mut App) {
+    if let Some((handle, _)) = notice_window(cx) {
+        let _ = handle.update(cx, |_, window, cx| {
+            crate::security_keys::overlay::show(req, window, cx)
+        });
+    }
+}
+
 /// A notification of the system was clicked: the window that has what it
 /// is about comes to the front.
 pub fn notification_clicked(tag: &str, cx: &mut App) {

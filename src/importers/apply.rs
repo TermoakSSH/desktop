@@ -255,6 +255,7 @@ async fn key_from_file(
         comment: material.comment.clone(),
         has_passphrase: material.encrypted,
         certificate: None,
+        security_key: material.security_key.clone(),
     };
     let secret = SshKeySecret {
         private_key: Some(material.private_openssh.clone()),
@@ -362,6 +363,11 @@ pub async fn run(ws: Workspace, req: Request) -> Result<Summary, String> {
             comment: k.comment.clone(),
             has_passphrase: k.has_passphrase,
             certificate: k.certificate.clone(),
+            security_key: crate::security_keys::info_of(
+                &private,
+                k.passphrase.as_deref(),
+                &k.public_key,
+            ),
         };
         let secret = SshKeySecret {
             private_key: Some(private),

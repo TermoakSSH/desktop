@@ -44,6 +44,7 @@ mod panes;
 mod prompts;
 mod qr;
 mod runtime;
+mod security_keys;
 mod sharing;
 mod state;
 mod terminal;
@@ -137,6 +138,7 @@ fn main() {
         // Linux shows the name in the notifications.
         cx.set_app_identity(notifications::APP_ID, notifications::APP_NAME);
         gpui_component::init(cx);
+        security_keys::overlay::init(cx);
         runtime::init(cx, rt);
         theme::init(cx, settings.dark);
         // The terminal keys first: the menu bar shows the shortcuts
@@ -149,7 +151,23 @@ fn main() {
             Ok(ws) => cx.open_window(options, move |window, cx| {
                 let (prompter, prompts_rx) = DesktopPrompter::new();
                 let prompter = Arc::new(prompter);
-                let model = cx.new(|cx| AppModel::new(ws, settings, prompter, cx));
+                // FIDO2 security keys: local connections sign with them and
+                // the events sockets answer the server's requests.
+                let (sk_ui, mut sk_rx) = security_keys::overlay::SkBridge::new();
+                let security_keys = security_keys::platform_authenticator()
+                    .map(|hw| Arc::new(security_keys::SecurityKeys::new(hw, Arc::new(sk_ui))));
+                ws.set_security_key_signer(
+                    security_keys
+                        .clone()
+                        .map(|s| s as Arc<dyn termoak_ssh::sk::SecurityKeySigner>),
+                );
+                cx.spawn(async move |cx| {
+                    while let Some(req) = sk_rx.recv().await {
+                        cx.update(|cx| windows::show_security_key(req, cx));
+                    }
+                })
+                .detach();
+                let model = cx.new(|cx| AppModel::new(ws, settings, prompter, security_keys, cx));
                 let updates = cx.new(|cx| UpdateModel::new(updater, cx));
                 let view = cx.new(|cx| AppView::new(model, updates, Some(prompts_rx), window, cx));
                 window.focus(&view.focus_handle(cx), cx);

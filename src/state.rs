@@ -364,6 +364,10 @@ pub fn api_error(e: ClientError) -> String {
             details,
             ..
         } => {
+            // Security keys (the server's forwarding): the app's text.
+            if code.starts_with("security_key_") {
+                return crate::security_keys::error_text(&code, &message);
+            }
             // Private networks: always the app's text, with the details
             // (the plan's number, what netd found).
             if let Some(text) = crate::networks::api_error_text(&code, &details) {
@@ -397,6 +401,10 @@ pub fn api_error(e: ClientError) -> String {
             }
         }
         ClientError::NotLoggedIn => t!("error.not_logged_in").to_string(),
+        // A security key that could not sign (no key, cancelled, PIN...).
+        ClientError::Ssh(termoak_ssh::SshError::SecurityKey { code, message }) => {
+            crate::security_keys::error_text(code, &message)
+        }
         other => other.to_string(),
     }
 }
@@ -638,6 +646,10 @@ pub struct AppModel {
     pub ws: Workspace,
     pub settings: Settings,
     pub prompter: Arc<DesktopPrompter>,
+    /// FIDO2 security keys of this computer (`None` where the platform has
+    /// none): new keys, resident keys; connections get it through the
+    /// workspace.
+    pub security_keys: Option<Arc<crate::security_keys::SecurityKeys>>,
     /// Server client of the current account, when signed in.
     pub api: Option<ApiClient>,
     /// Email and server of the current account.
@@ -706,6 +718,7 @@ impl AppModel {
         ws: Workspace,
         settings: Settings,
         prompter: Arc<DesktopPrompter>,
+        security_keys: Option<Arc<crate::security_keys::SecurityKeys>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgMsg>();
@@ -730,6 +743,7 @@ impl AppModel {
             ws,
             settings,
             prompter,
+            security_keys,
             api: None,
             server_user: None,
             server_url: None,
@@ -1966,7 +1980,8 @@ impl AppModel {
         });
         let tx = self.bg_tx.clone();
         let api = acc.api.clone();
-        let events = handle.spawn(async move { events_loop(id, api, tx).await });
+        let signer = self.ws.security_key_signer();
+        let events = handle.spawn(async move { events_loop(id, api, tx, signer).await });
         self.background.insert(id, vec![sync, events]);
         if let Some(a) = self.account_mut(id) {
             a.syncing = true;
@@ -2588,27 +2603,60 @@ impl Drop for AppModel {
 }
 
 /// Keeps the events WebSocket of an account open and forwards what arrives.
-async fn events_loop(account: Id, api: ApiClient, tx: mpsc::UnboundedSender<BgMsg>) {
+/// With a security key `signer`, the socket says this computer can sign
+/// and answers the server's signature requests
+/// ([`crate::security_keys::forwarding`]).
+async fn events_loop(
+    account: Id,
+    api: ApiClient,
+    tx: mpsc::UnboundedSender<BgMsg>,
+    signer: Option<Arc<dyn termoak_ssh::sk::SecurityKeySigner>>,
+) {
+    use futures::SinkExt;
     let mut backoff = 2u64;
+    let path = termoak_client::events::events_path(signer.is_some());
     loop {
-        match api.websocket("/api/v1/events/ws").await {
+        match api.websocket(&path).await {
             Ok(ws) => {
                 backoff = 2;
                 let _ = tx.send(BgMsg::EventsOnline(account, true));
-                let (_sink, mut stream) = ws.split();
-                while let Some(msg) = stream.next().await {
+                let (mut sink, mut stream) = ws.split();
+                let (replies_tx, mut replies) = mpsc::unbounded_channel::<Value>();
+                let mut forwarding = signer.clone().map(|s| {
+                    crate::security_keys::forwarding::Forwarding::new(s, replies_tx.clone())
+                });
+                loop {
+                    let msg = tokio::select! {
+                        m = stream.next() => match m {
+                            Some(m) => m,
+                            None => break,
+                        },
+                        Some(reply) = replies.recv() => {
+                            if sink.send(Message::Text(reply.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if let Ok(v) = serde_json::from_str::<Value>(&text)
-                                && tx.send(BgMsg::Event(account, v)).is_err()
-                            {
+                            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                                continue;
+                            };
+                            if let Some(f) = forwarding.as_mut() {
+                                f.on_event(&v);
+                            }
+                            if tx.send(BgMsg::Event(account, v)).is_err() {
                                 return;
                             }
                         }
+                        Ok(Message::Close(_)) | Err(_) => break,
                         Ok(_) => {}
-                        Err(_) => break,
                     }
                 }
+                // Requests of this socket die with it (the server stops
+                // waiting for this device).
+                drop(forwarding.take());
                 let _ = tx.send(BgMsg::EventsOnline(account, false));
             }
             Err(e) => {
@@ -2842,5 +2890,222 @@ mod tests {
         assert_eq!(item.data.name, "ls");
         assert_eq!(item.account(), None);
         assert_eq!(item.item_ref().scope, Scope::Device);
+    }
+}
+
+/// The desktop's events socket answering the server's security key
+/// requests against a real server (staging), with the desktop's flow on
+/// the software authenticator. Opt-in: `cargo test -- --ignored
+/// live_security_key_forwarding` with TERMOAK_LIVE_SERVER, _EMAIL and
+/// _PASSWORD, and TERMOAK_LIVE_SSHD (`host:port` of an sshd the server can
+/// reach, user `qa`, whose authorized_keys file is TERMOAK_LIVE_AUTHORIZED,
+/// rewritten by the test).
+#[cfg(test)]
+mod live_security_keys {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use termoak_client::{ServerChoice, Workspace};
+    use termoak_ssh::sk::{
+        SkAlgorithm, SkKeyOptions, key_from_credential, make_credential_request,
+    };
+
+    use super::*;
+    use crate::security_keys::SecurityKeys;
+    use crate::security_keys::testing::{ScriptUi, SoftHw};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn live_security_key_forwarding() {
+        let Ok(server) = std::env::var("TERMOAK_LIVE_SERVER") else {
+            eprintln!("TERMOAK_LIVE_SERVER not set: skipped");
+            return;
+        };
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+        let sshd = var("TERMOAK_LIVE_SSHD");
+        let (sshd_host, sshd_port) = sshd.rsplit_once(':').unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path(), termoak_core::crypto::MasterKey::generate()).unwrap();
+        let account = ws
+            .sign_in(
+                ServerChoice::Custom(server.clone()),
+                &var("TERMOAK_LIVE_EMAIL"),
+                &var("TERMOAK_LIVE_PASSWORD"),
+                None,
+            )
+            .await
+            .expect("sign in");
+        let api = account.api.clone();
+
+        // A security key made on "this computer" (the soft device) and a
+        // host of the account that uses it.
+        let (hw, ui) = (SoftHw::new(1), ScriptUi::new());
+        let keys = Arc::new(
+            SecurityKeys::new(hw.clone(), Arc::new(ui.clone()))
+                .with_waits(Duration::from_secs(5), Duration::from_millis(50)),
+        );
+        let req = make_credential_request(&SkKeyOptions {
+            algorithm: SkAlgorithm::Ed25519,
+            application: None,
+            user: None,
+            resident: false,
+            verify_required: false,
+            no_touch_required: false,
+            device: Some("Desktop live test".into()),
+        })
+        .unwrap();
+        let (cred, _) = keys.make_credential(&req).await.unwrap();
+        let m = key_from_credential(&req, &cred, "desktop-live").unwrap();
+        std::fs::write(
+            var("TERMOAK_LIVE_AUTHORIZED"),
+            format!("{}\n", m.public_openssh),
+        )
+        .unwrap();
+        let tag = &uuid::Uuid::new_v4().to_string()[..8];
+        let key: Value = api
+            .post(
+                "/api/v1/keys/import",
+                &json!({"label": format!("desktop-live-sk-{tag}"), "private_key": m.private_openssh}),
+            )
+            .await
+            .expect("import the sk file");
+        assert_eq!(key["security_key"]["application"], "ssh:");
+        let host: Value = api
+            .post(
+                "/api/v1/hosts",
+                &json!({"label": format!("desktop-live-sk-{tag}"), "address": sshd_host,
+                        "settings": {"port": sshd_port.parse::<u16>().unwrap(), "username": "qa", "key_id": key["id"]}}),
+            )
+            .await
+            .expect("host");
+        let host_id = host["id"].as_str().unwrap().to_string();
+        let cleanup = async || {
+            let _ = api.delete(&format!("/api/v1/hosts/{host_id}")).await;
+            let _ = api
+                .delete(&format!("/api/v1/keys/{}", key["id"].as_str().unwrap()))
+                .await;
+            if let Ok(list) = api.get::<Vec<Value>>("/api/v1/known-hosts").await {
+                for k in list.iter().filter(|k| {
+                    k["host"].as_str() == Some(sshd_host)
+                        && k["port"].as_u64() == sshd_port.parse::<u64>().ok()
+                }) {
+                    let _ = api
+                        .delete(&format!(
+                            "/api/v1/known-hosts/{}",
+                            k["id"].as_str().unwrap()
+                        ))
+                        .await;
+                }
+            }
+        };
+
+        // No device of this account can sign: at once.
+        let t: Value = api
+            .post(
+                &format!("/api/v1/hosts/{host_id}/test?trust=true"),
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        if t["error_code"] != "security_key_no_device" {
+            cleanup().await;
+            panic!("without a device: {t}");
+        }
+        assert_eq!(
+            crate::networks::host_test_error(&serde_json::from_value(t).unwrap()),
+            t!("security_keys.error.no_device").to_string()
+        );
+
+        // This computer's events socket, as the app opens it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let id = account.id;
+        let task = tokio::spawn(events_loop(
+            id,
+            api.clone(),
+            tx,
+            Some(keys.clone() as Arc<dyn termoak_ssh::sk::SecurityKeySigner>),
+        ));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+                Ok(Some(BgMsg::EventsOnline(_, true))) => break,
+                Ok(Some(_)) => {}
+                other => panic!("the events socket did not connect: {}", other.is_ok()),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t: Value = api
+            .post(
+                &format!("/api/v1/hosts/{host_id}/test?trust=true"),
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        let ok = t["ok"] == true;
+        let shown = ui.purposes.lock().last().cloned();
+        // A server session: the desktop signs it too.
+        let s: Value = api
+            .post(
+                "/api/v1/sessions",
+                &json!({"host_id": host_id, "cols": 80, "rows": 24}),
+            )
+            .await
+            .unwrap();
+        let sid = s["id"].as_str().unwrap().to_string();
+        let mut state = String::new();
+        for _ in 0..60 {
+            let v: Value = api.get(&format!("/api/v1/sessions/{sid}")).await.unwrap();
+            state = v["state"]["state"].as_str().unwrap_or_default().to_string();
+            if state == "running" || state == "closed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let session_purpose = ui.purposes.lock().last().cloned();
+        let _ = api.delete(&format!("/api/v1/sessions/{sid}")).await;
+        // "Run on…" from the server (`/exec` with the snippet): its pool
+        // connection asks this computer too.
+        let snippet: Value = api
+            .post(
+                "/api/v1/snippets",
+                &json!({"name": format!("desktop-live-{tag}"), "script": "echo {{label}}:{{prompt:Msg}}"}),
+            )
+            .await
+            .unwrap();
+        let exec: Result<Vec<crate::views::snippets::ServerExec>, _> = api
+            .post(
+                "/api/v1/exec",
+                &json!({"host_ids": [host_id], "snippet_id": snippet["id"], "variables": {"Msg": "hi"}}),
+            )
+            .await;
+        let exec_purpose = ui.purposes.lock().last().cloned();
+        let _ = api
+            .delete(&format!(
+                "/api/v1/snippets/{}",
+                snippet["id"].as_str().unwrap()
+            ))
+            .await;
+        task.abort();
+        cleanup().await;
+        assert!(ok, "the host test with this computer answering: {t}");
+        assert!(
+            matches!(&shown, Some(crate::security_keys::SkPurpose::Sign(c)) if c.purpose == "test"),
+            "{shown:?}"
+        );
+        assert_eq!(state, "running", "the server session");
+        assert!(
+            matches!(&session_purpose, Some(crate::security_keys::SkPurpose::Sign(c))
+                if c.purpose == "server_session" && c.session_id.as_deref() == Some(sid.as_str())),
+            "{session_purpose:?}"
+        );
+        let out = exec.expect("/exec").remove(0).output();
+        assert_eq!(
+            out.as_deref().map(str::trim),
+            Some(format!("desktop-live-sk-{tag}:hi").as_str())
+        );
+        assert!(
+            matches!(&exec_purpose, Some(crate::security_keys::SkPurpose::Sign(c)) if c.purpose == "server"),
+            "{exec_purpose:?}"
+        );
+        println!("live forwarding OK: test, server session and /exec signed by the desktop");
     }
 }

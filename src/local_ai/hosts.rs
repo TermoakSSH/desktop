@@ -282,6 +282,7 @@ impl HostProvider for WorkspaceHosts {
         };
         let opts = ConnectOptions::new(verifier)
             .with_agent(use_agent)
+            .with_security_key(self.ws.security_key_signer())
             .with_dialer(dialer);
         let conn = Connection::connect(&resolved, &opts).await;
         resolved.zeroize_secrets();

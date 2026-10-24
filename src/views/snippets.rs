@@ -1,13 +1,15 @@
-//! Snippets: reusable command fragments with `{{name}}` variables and
-//! "Run on…" several hosts at once (local connections, no PTY), showing the
-//! output of each one.
+//! Snippets: reusable command fragments with variables (built-ins such as
+//! `{{host}}`, prompts with defaults, selects and secrets; see
+//! `snippet_vars.rs`) and "Run on…" several hosts at once, from this
+//! computer (local connections, no PTY) or from the server (`/exec`, for
+//! hosts of one account), showing the output of each one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use gpui::{
-    AppContext, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder, px,
+    AppContext, ClickEvent, ClipboardItem, Context, Entity, EntityId, EventEmitter,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -15,11 +17,14 @@ use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, WindowExt, h_flex, v_flex};
+use termoak_client::Scope;
 use termoak_core::Id;
 use termoak_core::model::{SecretUpdate, Snippet};
+use termoak_core::template::TemplateContext;
 use termoak_ssh::{ExecOptions, ExecOutput};
 
 use super::OpenRequest;
+use super::snippet_vars::{self, SnippetVars};
 use crate::runtime;
 use crate::state::{AppModel, Item};
 use crate::ui::{self, IconName};
@@ -85,65 +90,69 @@ impl SnippetsView {
         );
     }
 
-    /// "Run on…" dialog: target hosts and values of the variables.
-    fn run_dialog(&mut self, snippet: Snippet, window: &mut Window, cx: &mut Context<Self>) {
-        let hosts: Vec<(Id, String)> = self
-            .model
-            .read(cx)
-            .hosts
-            .iter()
-            .map(|h| (h.data.id, h.data.label.clone()))
-            .collect();
+    /// "Run on…" dialog: target hosts, where it runs and the values of the
+    /// variables (prefilled with the ones remembered for this snippet).
+    fn run_dialog(&mut self, item: Item<Snippet>, window: &mut Window, cx: &mut Context<Self>) {
+        let hosts: Vec<(Id, String, Option<Id>)> = {
+            let m = self.model.read(cx);
+            m.hosts
+                .iter()
+                .map(|h| (h.data.id, h.data.label.clone(), h.account()))
+                .collect()
+        };
         if hosts.is_empty() {
             ui::error(window, cx, t!("snippets.error.no_hosts"));
             return;
         }
+        let ws = self.model.read(cx).ws.clone();
+        let id = item.data.id;
+        let remembered = runtime::spawn(cx, async move { ws.snippet_values(id, None).await });
         let weak = cx.entity().downgrade();
-        let dialog = cx.new(|cx| RunDialog::new(snippet, hosts, weak, window, cx));
-        window.open_dialog(cx, move |d, _, _| {
-            let dialog_ok = dialog.clone();
-            d.title(t!("snippets.run.title"))
-                .w(px(560.))
-                .child(dialog.clone())
-                .footer(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("run-cancel")
-                                .label(t!("common.cancel"))
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
+        cx.spawn_in(window, async move |_, cx| {
+            let remembered = remembered.await.unwrap_or_default();
+            let _ = cx.update(|window, cx| {
+                let dialog =
+                    cx.new(|cx| RunDialog::new(item, hosts, &remembered, weak, window, cx));
+                if let Some(first) = dialog.read(cx).vars.first_input() {
+                    ui::focus_later(&first, window, cx);
+                }
+                window.open_dialog(cx, move |d, _, _| {
+                    let dialog_ok = dialog.clone();
+                    d.title(t!("snippets.run.title"))
+                        .w(px(580.))
+                        .child(dialog.clone())
+                        .footer(
+                            h_flex()
+                                .w_full()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("run-cancel")
+                                        .label(t!("common.cancel"))
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("run-go")
+                                        .primary()
+                                        .icon(ui::icon(IconName::Play))
+                                        .label(t!("snippets.run.ok"))
+                                        .on_click(move |_, window, cx| {
+                                            let ok =
+                                                dialog_ok.update(cx, |d, cx| d.submit(window, cx));
+                                            if ok {
+                                                window.close_dialog(cx);
+                                            }
+                                        }),
+                                ),
                         )
-                        .child(
-                            Button::new("run-go")
-                                .primary()
-                                .icon(ui::icon(IconName::Play))
-                                .label(t!("snippets.run.ok"))
-                                .on_click(move |_, window, cx| {
-                                    let ok = dialog_ok.update(cx, |d, cx| d.submit(window, cx));
-                                    if ok {
-                                        window.close_dialog(cx);
-                                    }
-                                }),
-                        ),
-                )
-        });
+                });
+            });
+        })
+        .detach();
     }
 
-    /// Runs the script on the chosen hosts.
-    fn run(
-        &mut self,
-        name: String,
-        script: String,
-        targets: Vec<Id>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_results(&mut self, name: String, targets: &[Id], cx: &mut Context<Self>) {
         let m = self.model.read(cx);
-        let ws = m.ws.clone();
-        let prompter = m.prompter.clone();
-        let use_agent = m.settings.use_agent;
         let labels: Vec<String> = targets.iter().map(|id| m.host_label(*id)).collect();
         self.run_title = Some(name);
         self.runs = labels
@@ -154,20 +163,44 @@ impl SnippetsView {
             })
             .collect();
         cx.notify();
+    }
+
+    /// Runs the snippet on the chosen hosts from this computer: each host
+    /// gets its own built-ins.
+    fn run(
+        &mut self,
+        name: String,
+        script: String,
+        values: BTreeMap<String, String>,
+        targets: Vec<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = self.model.read(cx);
+        let ws = m.ws.clone();
+        let prompter = m.prompter.clone();
+        let use_agent = m.settings.use_agent;
+        self.start_results(name, &targets, cx);
         for (ix, host_id) in targets.into_iter().enumerate() {
             let ws = ws.clone();
             let prompter = prompter.clone();
             let script = script.clone();
+            let values = values.clone();
             runtime::run_in(
                 cx,
                 window,
                 async move {
+                    let ctx = ws
+                        .snippet_context(host_id)
+                        .await
+                        .map_err(crate::state::api_error)?;
+                    let command = snippet_vars::render_targets(&script, &values, &[ctx])?.remove(0);
                     let conn = ws
                         .connect(host_id, prompter, use_agent)
                         .await
                         .map_err(crate::state::api_error)?;
                     let out = conn
-                        .exec(&script, &ExecOptions::default())
+                        .exec(&command, &ExecOptions::default())
                         .await
                         .map_err(|e| {
                             crate::state::api_error(termoak_client::ClientError::from(e))
@@ -186,6 +219,62 @@ impl SnippetsView {
                 },
             );
         }
+    }
+
+    /// Runs the snippet from the server (`POST /exec` with `snippet_id`):
+    /// the server renders it per host and connects (a security key on
+    /// those hosts is asked on your devices).
+    fn run_on_server(
+        &mut self,
+        snippet: Snippet,
+        values: BTreeMap<String, String>,
+        targets: Vec<Id>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(api) = targets
+            .first()
+            .and_then(|h| self.model.read(cx).api_for_host(*h))
+        else {
+            ui::error(window, cx, t!("error.not_logged_in"));
+            return;
+        };
+        self.start_results(snippet.name.clone(), &targets, cx);
+        let body = serde_json::json!({
+            "host_ids": targets,
+            "snippet_id": snippet.id,
+            "variables": values,
+        });
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                api.post::<Vec<ServerExec>>("/api/v1/exec", &body)
+                    .await
+                    .map_err(crate::state::api_error)
+            },
+            move |this, res, _, cx| {
+                match res {
+                    Ok(list) => {
+                        for (ix, host) in targets.iter().enumerate() {
+                            let state = match list.iter().find(|r| r.host_id == *host) {
+                                Some(r) => r.state(),
+                                None => RunState::Failed(t!("snippets.results.no_result").into()),
+                            };
+                            if let Some(slot) = this.runs.get_mut(ix) {
+                                slot.state = state;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for r in &mut this.runs {
+                            r.state = RunState::Failed(e.clone());
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     fn render_results(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -341,6 +430,7 @@ impl Render for SnippetsView {
         } else {
             h_flex()
                 .flex_wrap()
+                .items_start()
                 .gap_3()
                 .children(
                     snippets
@@ -348,7 +438,8 @@ impl Render for SnippetsView {
                         .enumerate()
                         .map(|(i, (rec, editable))| {
                             let s = rec.data.clone();
-                            let (s_run, r_edit, r_del) = (s.clone(), rec.clone(), rec.clone());
+                            let (s_run, r_edit, r_del) = (rec.clone(), rec.clone(), rec.clone());
+                            let nvars = termoak_core::template::parse(&s.script).variables.len();
                             let script_copy = s.script.clone();
                             let preview: String =
                                 s.script.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -377,6 +468,12 @@ impl Render for SnippetsView {
                                                 .text_sm()
                                                 .child(s.name.clone()),
                                         )
+                                        .when(nvars > 0, |this| {
+                                            this.child(ui::pill(
+                                                tn!("snippets.vars.count", nvars),
+                                                theme.muted_foreground,
+                                            ))
+                                        })
                                         .when(!editable, |this| {
                                             this.child(
                                                 ui::icon(IconName::Lock)
@@ -499,38 +596,101 @@ impl Render for SnippetsView {
     }
 }
 
+/// One host's result of `POST /exec`.
+#[derive(serde::Deserialize)]
+pub(crate) struct ServerExec {
+    host_id: Id,
+    #[serde(default)]
+    exit_code: Option<u32>,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl ServerExec {
+    /// The output when it ran (tests).
+    #[cfg(test)]
+    pub fn output(&self) -> Option<String> {
+        match self.state() {
+            RunState::Done(o) => Some(o.stdout_text()),
+            _ => None,
+        }
+    }
+
+    fn state(&self) -> RunState {
+        match &self.error {
+            Some(e) => RunState::Failed(crate::security_keys::server_error_text(e)),
+            None => RunState::Done(ExecOutput {
+                exit_code: self.exit_code,
+                exit_signal: None,
+                stdout: self.stdout.clone().into_bytes(),
+                stderr: self.stderr.clone().into_bytes(),
+                truncated: false,
+                timed_out: self.timed_out,
+                duration_ms: self.duration_ms,
+            }),
+        }
+    }
+}
+
 /// Content of the "Run on…" dialog.
 struct RunDialog {
-    snippet: Snippet,
-    hosts: Vec<(Id, String)>,
+    item: Item<Snippet>,
+    /// (id, label, account) of every host.
+    hosts: Vec<(Id, String, Option<Id>)>,
     selected: Vec<Id>,
-    vars: Vec<(String, Entity<InputState>)>,
+    vars: SnippetVars,
+    /// Run from the server (`/exec`) instead of this computer.
+    on_server: bool,
     view: gpui::WeakEntity<SnippetsView>,
 }
 
 impl RunDialog {
     fn new(
-        snippet: Snippet,
-        hosts: Vec<(Id, String)>,
+        item: Item<Snippet>,
+        hosts: Vec<(Id, String, Option<Id>)>,
+        remembered: &BTreeMap<String, String>,
         view: gpui::WeakEntity<SnippetsView>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let vars = snippet
-            .variables()
-            .into_iter()
-            .map(|name| {
-                let state = cx.new(|cx| InputState::new(window, cx).placeholder(name.clone()));
-                (name, state)
-            })
-            .collect();
+        // Every target is a host: built-ins are never asked.
+        let vars = SnippetVars::new(
+            snippet_vars::prompts(&item.data.script, true),
+            remembered,
+            window,
+            cx,
+        );
         Self {
-            snippet,
+            item,
             hosts,
             selected: Vec::new(),
             vars,
+            on_server: false,
             view,
         }
+    }
+
+    /// The account whose server can run it: the snippet's, when every
+    /// chosen host is in it too.
+    fn server_account(&self) -> Option<Id> {
+        let Scope::Account(a) = self.item.scope else {
+            return None;
+        };
+        (!self.selected.is_empty()
+            && self.selected.iter().all(|id| {
+                self.hosts
+                    .iter()
+                    .any(|(h, _, acc)| h == id && *acc == Some(a))
+            }))
+        .then_some(a)
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -538,26 +698,39 @@ impl RunDialog {
             ui::error(window, cx, t!("snippets.run.choose_host"));
             return false;
         }
-        let values: BTreeMap<String, String> = self
-            .vars
-            .iter()
-            .map(|(n, s)| (n.clone(), s.read(cx).value().to_string()))
-            .collect();
-        if let Some((missing, _)) = values.iter().find(|(_, v)| v.trim().is_empty()) {
-            ui::error(window, cx, t!("snippets.run.missing_value", name = missing));
-            return false;
-        }
-        let script = match self.snippet.render(&values) {
-            Ok(s) => s,
-            Err(e) => {
-                ui::error(window, cx, e.to_string());
+        let values = match self.vars.values(cx) {
+            Ok(v) => v,
+            Err(missing) => {
+                ui::error(window, cx, t!("snippets.run.missing_value", name = missing));
                 return false;
             }
         };
-        let targets = self.selected.clone();
-        let name = self.snippet.name.clone();
+        let snippet = self.item.data.clone();
+        // Remembered on this computer for the next run (never secrets).
         if let Some(view) = self.view.upgrade() {
-            view.update(cx, |v, cx| v.run(name, script, targets, window, cx));
+            let ws = view.read(cx).model.read(cx).ws.clone();
+            let (id, script, v) = (snippet.id, snippet.script.clone(), values.clone());
+            runtime::handle(cx).spawn(async move {
+                let _ = ws.remember_snippet_values(id, None, &script, &v).await;
+            });
+        }
+        let targets = self.selected.clone();
+        let on_server = self.on_server && self.server_account().is_some();
+        if let Some(view) = self.view.upgrade() {
+            view.update(cx, |v, cx| {
+                if on_server {
+                    v.run_on_server(snippet, values, targets, window, cx)
+                } else {
+                    v.run(
+                        snippet.name.clone(),
+                        snippet.script.clone(),
+                        values,
+                        targets,
+                        window,
+                        cx,
+                    )
+                }
+            });
         }
         true
     }
@@ -567,19 +740,34 @@ impl Render for RunDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let all = self.selected.len() == self.hosts.len();
+        let server = self.server_account().is_some();
+        let where_button = |id: &'static str,
+                            label: SharedString,
+                            server_side: bool,
+                            on: bool,
+                            cx: &mut Context<Self>| {
+            Button::new(id)
+                .small()
+                .label(label)
+                .map(|b| if on { b.primary() } else { b.ghost() })
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.on_server = server_side;
+                    cx.notify();
+                }))
+        };
+        let on_server = self.on_server && server;
+        let muted = theme.muted_foreground;
         v_flex()
             .gap_3()
             .child(
                 div()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("snippets.run.explanation", name = self.snippet.name)),
+                    .text_color(muted)
+                    .child(t!("snippets.run.explanation", name = self.item.data.name)),
             )
-            .children(
-                self.vars.iter().map(|(name, state)| {
-                    ui::field(format!("{{{{{name}}}}}"), Input::new(state), cx)
-                }),
-            )
+            .when(!self.vars.is_empty(), |this| {
+                this.child(self.vars.render(cx))
+            })
             .child(
                 h_flex()
                     .justify_between()
@@ -602,7 +790,8 @@ impl Render for RunDialog {
                                 if all {
                                     this.selected.clear();
                                 } else {
-                                    this.selected = this.hosts.iter().map(|(id, _)| *id).collect();
+                                    this.selected =
+                                        this.hosts.iter().map(|(id, _, _)| *id).collect();
                                 }
                                 cx.notify();
                             })),
@@ -611,10 +800,10 @@ impl Render for RunDialog {
             .child(
                 v_flex()
                     .id("run-hosts")
-                    .max_h(px(260.))
+                    .max_h(px(220.))
                     .gap_1()
                     .overflow_y_scrollbar()
-                    .children(self.hosts.iter().enumerate().map(|(i, (id, label))| {
+                    .children(self.hosts.iter().enumerate().map(|(i, (id, label, _))| {
                         let id = *id;
                         Checkbox::new(("run-host", i))
                             .label(label.clone())
@@ -631,6 +820,37 @@ impl Render for RunDialog {
                             }))
                     })),
             )
+            .when(server, |this| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().text_sm().font_medium().child(t!("snippets.run.from")))
+                                .child(where_button(
+                                    "run-here",
+                                    t!("snippets.run.from_here"),
+                                    false,
+                                    !on_server,
+                                    cx,
+                                ))
+                                .child(where_button(
+                                    "run-server",
+                                    t!("snippets.run.from_server"),
+                                    true,
+                                    on_server,
+                                    cx,
+                                )),
+                        )
+                        .child(div().text_xs().text_color(muted).child(if on_server {
+                            t!("snippets.run.from_server_hint")
+                        } else {
+                            t!("snippets.run.from_here_hint")
+                        })),
+                )
+            })
     }
 }
 
@@ -645,19 +865,32 @@ pub fn snippet_input(script: &str, run: bool) -> String {
     }
 }
 
+/// A terminal the "Send snippet" dialog may type into.
+#[derive(Debug, Clone)]
+pub struct SendTarget {
+    pub pane: EntityId,
+    /// Its host (`None`: a local shell or serial port: the host built-ins
+    /// are asked).
+    pub host: Option<Id>,
+    pub focused: bool,
+    /// Included in "Run in all panes" (not left out of the broadcast).
+    pub included: bool,
+}
+
 /// Terminal → Send snippet: picks a snippet, fills its variables and types
-/// it into the focused terminal or, in a split view, into every pane ("Run
-/// in all panes", checked while broadcasting). `on_send` gets the text and
-/// whether it goes to all the panes. `preselect` chooses a snippet first
-/// (the command palette, for one with variables to fill in).
+/// it into the focused terminal or, in a split view, into every included
+/// pane ("Run in all panes", checked while broadcasting), each one with its
+/// own built-ins (`{{host}}`, `{{user}}`...). `on_send` gets the text of
+/// each pane. `preselect` chooses a snippet first (the command palette, for
+/// one with variables to fill in).
 pub fn open_send_dialog(
     model: Entity<AppModel>,
-    split: bool,
+    targets: Vec<SendTarget>,
     broadcast: bool,
     preselect: Option<Id>,
     window: &mut Window,
     cx: &mut gpui::App,
-    on_send: impl Fn(String, bool, &mut Window, &mut gpui::App) + 'static,
+    on_send: impl Fn(Vec<(EntityId, String)>, &mut Window, &mut gpui::App) + 'static,
 ) {
     if model.read(cx).snippets.is_empty() {
         ui::notify(
@@ -668,18 +901,18 @@ pub fn open_send_dialog(
         );
         return;
     }
-    let dialog = cx.new(|cx| SendDialog::new(model, split, broadcast, preselect, window, cx));
+    let dialog = cx.new(|cx| SendDialog::new(model, targets, broadcast, preselect, window, cx));
     let on_send = std::rc::Rc::new(on_send);
     window.open_dialog(cx, move |d, _, _| {
         let (paste, run, enter) = (dialog.clone(), dialog.clone(), dialog.clone());
         let (send_paste, send_run, send_enter) =
             (on_send.clone(), on_send.clone(), on_send.clone());
         d.title(t!("snippets.send.title"))
-            .w(px(560.))
+            .w(px(580.))
             .on_ok(move |_, window, cx| {
                 match enter.update(cx, |d, cx| d.finish(true, window, cx)) {
-                    Some((text, all)) => {
-                        send_enter(text, all, window, cx);
+                    Some(texts) => {
+                        send_enter(texts, window, cx);
                         true
                     }
                     None => false,
@@ -702,11 +935,11 @@ pub fn open_send_dialog(
                             .label(t!("snippets.send.paste"))
                             .tooltip(t!("snippets.send.paste_tooltip"))
                             .on_click(move |_, window, cx| {
-                                if let Some((text, all)) =
+                                if let Some(texts) =
                                     paste.update(cx, |d, cx| d.finish(false, window, cx))
                                 {
                                     window.close_dialog(cx);
-                                    send_paste(text, all, window, cx);
+                                    send_paste(texts, window, cx);
                                 }
                             }),
                     )
@@ -716,11 +949,11 @@ pub fn open_send_dialog(
                             .icon(ui::icon(IconName::Play))
                             .label(t!("snippets.send.run"))
                             .on_click(move |_, window, cx| {
-                                if let Some((text, all)) =
+                                if let Some(texts) =
                                     run.update(cx, |d, cx| d.finish(true, window, cx))
                                 {
                                     window.close_dialog(cx);
-                                    send_run(text, all, window, cx);
+                                    send_run(texts, window, cx);
                                 }
                             }),
                     ),
@@ -733,16 +966,20 @@ struct SendDialog {
     model: Entity<AppModel>,
     search: Entity<InputState>,
     selected: Option<Id>,
-    vars: Vec<(String, Entity<InputState>)>,
-    split: bool,
+    vars: SnippetVars,
+    targets: Vec<SendTarget>,
     all_panes: bool,
+    /// Built-ins of the targets' hosts (loaded when the dialog opens).
+    contexts: HashMap<Id, TemplateContext>,
+    /// Which load of remembered values is current.
+    load: u64,
     _sub: Subscription,
 }
 
 impl SendDialog {
     fn new(
         model: Entity<AppModel>,
-        split: bool,
+        targets: Vec<SendTarget>,
         broadcast: bool,
         preselect: Option<Id>,
         window: &mut Window,
@@ -771,17 +1008,68 @@ impl SendDialog {
         let selected = preselect
             .filter(|id| model.read(cx).snippets.iter().any(|s| s.data.id == *id))
             .or_else(|| model.read(cx).snippets.first().map(|s| s.data.id));
+        // The built-ins of every host among the targets.
+        let ws = model.read(cx).ws.clone();
+        let mut hosts: Vec<Id> = targets.iter().filter_map(|t| t.host).collect();
+        hosts.sort();
+        hosts.dedup();
+        for host in hosts {
+            let ws = ws.clone();
+            runtime::run_in(
+                cx,
+                window,
+                async move { ws.snippet_context(host).await },
+                move |this: &mut Self, res, _, cx| {
+                    if let Ok(ctx) = res {
+                        this.contexts.insert(host, ctx);
+                        cx.notify();
+                    }
+                },
+            );
+        }
+        let split = targets.len() > 1;
         let mut dialog = Self {
             model,
             search,
             selected: None,
-            vars: Vec::new(),
-            split,
+            vars: SnippetVars::new(Vec::new(), &BTreeMap::new(), window, cx),
+            targets,
             all_panes: split && broadcast,
+            contexts: HashMap::new(),
+            load: 0,
             _sub: sub,
         };
         dialog.select(selected, window, cx);
         dialog
+    }
+
+    fn split(&self) -> bool {
+        self.targets.len() > 1
+    }
+
+    /// The terminals it goes to.
+    fn chosen_targets(&self) -> Vec<SendTarget> {
+        self.targets
+            .iter()
+            .filter(|t| {
+                if self.split() && self.all_panes {
+                    t.included || t.focused
+                } else {
+                    t.focused
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The host its values are remembered for: the focused terminal's
+    /// (runs in several panes: none).
+    fn memory_host(&self) -> Option<Id> {
+        let chosen = self.chosen_targets();
+        match chosen.as_slice() {
+            [one] => one.host,
+            _ => None,
+        }
     }
 
     fn matches(&self, cx: &gpui::App) -> Vec<Item<Snippet>> {
@@ -810,49 +1098,102 @@ impl SendDialog {
             .map(|s| s.data.clone())
     }
 
+    /// Chooses a snippet: its fields now, prefilled with the values
+    /// remembered for it once they are read.
     fn select(&mut self, id: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = id;
-        self.vars = self
-            .snippet(cx)
-            .map(|s| s.variables())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|name| {
-                let state = cx.new(|cx| InputState::new(window, cx).placeholder(name.clone()));
-                (name, state)
-            })
-            .collect();
+        self.rebuild_vars(&BTreeMap::new(), window, cx);
+        self.load += 1;
+        let (load, host) = (self.load, self.memory_host());
+        if let Some(id) = id {
+            let ws = self.model.read(cx).ws.clone();
+            runtime::run_in(
+                cx,
+                window,
+                async move { ws.snippet_values(id, host).await },
+                move |this: &mut Self, res, window, cx| {
+                    if this.load == load
+                        && let Ok(values) = res
+                        && !values.is_empty()
+                    {
+                        this.rebuild_vars(&values, window, cx);
+                    }
+                },
+            );
+        }
         cx.notify();
     }
 
-    /// The text to type and whether it goes to every pane, or `None` (with
-    /// an error shown) if something is missing.
+    fn rebuild_vars(
+        &mut self,
+        remembered: &BTreeMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let all_hosts = self.chosen_targets().iter().all(|t| t.host.is_some());
+        let vars = self
+            .snippet(cx)
+            .map(|s| snippet_vars::prompts(&s.script, all_hosts))
+            .unwrap_or_default();
+        self.vars = SnippetVars::new(vars, remembered, window, cx);
+        cx.notify();
+    }
+
+    /// The text for each terminal, or `None` (with an error shown) if
+    /// something is missing.
     fn finish(
         &mut self,
         run: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(String, bool)> {
+    ) -> Option<Vec<(EntityId, String)>> {
         let Some(snippet) = self.snippet(cx) else {
             ui::error(window, cx, t!("snippets.send.choose"));
             return None;
         };
-        let values: BTreeMap<String, String> = self
-            .vars
-            .iter()
-            .map(|(n, s)| (n.clone(), s.read(cx).value().to_string()))
-            .collect();
-        if let Some((missing, _)) = values.iter().find(|(_, v)| v.trim().is_empty()) {
-            ui::error(window, cx, t!("snippets.run.missing_value", name = missing));
-            return None;
-        }
-        match snippet.render(&values) {
-            Ok(script) => Some((snippet_input(&script, run), self.split && self.all_panes)),
-            Err(e) => {
-                ui::error(window, cx, e.to_string());
-                None
+        let values = match self.vars.values(cx) {
+            Ok(v) => v,
+            Err(missing) => {
+                ui::error(window, cx, t!("snippets.run.missing_value", name = missing));
+                return None;
+            }
+        };
+        let targets = self.chosen_targets();
+        let mut contexts = Vec::new();
+        for t in &targets {
+            match t.host {
+                None => contexts.push(TemplateContext::default()),
+                Some(h) => match self.contexts.get(&h) {
+                    Some(c) => contexts.push(c.clone()),
+                    None => {
+                        ui::error(window, cx, t!("snippets.send.loading"));
+                        return None;
+                    }
+                },
             }
         }
+        let texts = match snippet_vars::render_targets(&snippet.script, &values, &contexts) {
+            Ok(t) => t,
+            Err(e) => {
+                ui::error(window, cx, e);
+                return None;
+            }
+        };
+        // Remembered for next time (never secrets).
+        let ws = self.model.read(cx).ws.clone();
+        let host = self.memory_host();
+        runtime::handle(cx).spawn(async move {
+            let _ = ws
+                .remember_snippet_values(snippet.id, host, &snippet.script, &values)
+                .await;
+        });
+        Some(
+            targets
+                .iter()
+                .zip(texts)
+                .map(|(t, text)| (t.pane, snippet_input(&text, run)))
+                .collect(),
+        )
     }
 }
 
@@ -860,6 +1201,7 @@ impl Render for SendDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let items = self.matches(cx);
         let selected = self.selected;
+        let split = self.split();
         let theme = cx.theme();
         v_flex()
             .gap_3()
@@ -921,12 +1263,10 @@ impl Render for SendDialog {
                             )
                     })),
             )
-            .children(
-                self.vars.iter().map(|(name, state)| {
-                    ui::field(format!("{{{{{name}}}}}"), Input::new(state), cx)
-                }),
-            )
-            .when(self.split, |this| {
+            .when(!self.vars.is_empty(), |this| {
+                this.child(self.vars.render(cx))
+            })
+            .when(split, |this| {
                 this.child(
                     v_flex()
                         .gap_1()
@@ -934,9 +1274,11 @@ impl Render for SendDialog {
                             Checkbox::new("send-all-panes")
                                 .label(t!("snippets.send.all_panes"))
                                 .checked(self.all_panes)
-                                .on_click(cx.listener(|this, v: &bool, _, cx| {
+                                .on_click(cx.listener(|this, v: &bool, window, cx| {
                                     this.all_panes = *v;
-                                    cx.notify();
+                                    // The host built-ins may need asking now.
+                                    let typed = this.vars.values(cx).unwrap_or_default();
+                                    this.rebuild_vars(&typed, window, cx);
                                 })),
                         )
                         .child(
@@ -1017,6 +1359,10 @@ pub(crate) fn open_snippet_form(
                     t!("snippets.form.script_hint"),
                     cx,
                 ))
+                .children(snippet_vars::editor_summary(
+                    &script.read(cx).value().to_string(),
+                    cx,
+                ))
                 .child(ui::field(t!("snippets.form.tags"), Input::new(&tags), cx))
                 .into_any_element()
         },
@@ -1036,6 +1382,10 @@ pub(crate) fn open_snippet_form(
             };
             if snippet.name.is_empty() || snippet.script.trim().is_empty() {
                 ui::error(window, cx, t!("snippets.error.name_and_script"));
+                return false;
+            }
+            if !snippet_vars::issues(&snippet.script).is_empty() {
+                ui::error(window, cx, t!("snippets.issue.fix_first"));
                 return false;
             }
             let task = model.update(cx, |m, cx| m.save(snippet, SecretUpdate::Keep, None, cx));

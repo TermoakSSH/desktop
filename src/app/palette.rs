@@ -711,7 +711,9 @@ impl AppView {
             return;
         }
         let text = crate::views::snippets::snippet_input(&snippet.script, run);
-        self.send_snippet(&text, false, window, cx);
+        if let Some(t) = self.focused_terminal() {
+            self.send_snippet(vec![(t.entity_id(), text)], window, cx);
+        }
     }
 }
 

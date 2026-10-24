@@ -1277,6 +1277,24 @@ impl HostEditor {
 
     /// Warning under a field that still has a reference its place does not
     /// offer.
+    /// A startup snippet cannot ask: built-ins and defaults are filled in,
+    /// other variables are typed as written.
+    fn startup_snippet_hint(&self, cx: &App) -> Option<gpui::AnyElement> {
+        let id = ui::chosen(&self.snippet, cx).flatten()?;
+        let m = self.model.read(cx);
+        let snippet = m.snippets.iter().find(|s| s.data.id == id)?;
+        let asks = super::snippet_vars::prompts(&snippet.data.script, true)
+            .iter()
+            .any(|v| v.default.is_none());
+        asks.then(|| {
+            div()
+                .text_xs()
+                .text_color(cx.theme().warning)
+                .child(t!("host_editor.startup_snippet_asks"))
+                .into_any_element()
+        })
+    }
+
     fn kept_warning(
         &self,
         state: &ChoiceState<Option<Id>>,
@@ -1649,11 +1667,8 @@ impl HostEditor {
                         Select::new(&self.snippet),
                         cx,
                     )
-                    .children(self.kept_warning(
-                        &self.snippet,
-                        &self.kept.snippet,
-                        cx,
-                    )),
+                    .children(self.kept_warning(&self.snippet, &self.kept.snippet, cx))
+                    .children(self.startup_snippet_hint(cx)),
                 )
                 .child(self.checked_field(
                     Field::Env,

@@ -362,6 +362,7 @@ mod tests {
             comment: "deploy".into(),
             has_passphrase: false,
             certificate: None,
+            security_key: None,
         });
         f.identities.push(Identity {
             id: iid,
