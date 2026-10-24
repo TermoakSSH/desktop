@@ -40,8 +40,16 @@ pub struct VaultRecording {
 pub struct Cast {
     pub cols: u16,
     pub rows: u16,
-    /// `(seconds since the start, output)`.
-    pub events: Vec<(f64, String)>,
+    /// `(seconds since the start, event)`.
+    pub events: Vec<(f64, CastEvent)>,
+}
+
+/// What the player replays.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CastEvent {
+    Output(String),
+    /// The terminal was resized (`"r"`, `COLSxROWS`).
+    Resize(u16, u16),
 }
 
 impl Cast {
@@ -67,10 +75,18 @@ impl Cast {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else {
                 continue;
             };
-            if v[1] == "o"
-                && let (Some(t), Some(s)) = (v[0].as_f64(), v[2].as_str())
+            let (Some(t), Some(s)) = (v[0].as_f64(), v[2].as_str()) else {
+                continue;
+            };
+            if v[1] == "o" {
+                events.push((t, CastEvent::Output(s.to_string())));
+            } else if v[1] == "r"
+                && let Some((c, r)) = s.split_once('x')
+                && let (Ok(c), Ok(r)) = (c.trim().parse::<u16>(), r.trim().parse::<u16>())
+                && c > 0
+                && r > 0
             {
-                events.push((t, s.to_string()));
+                events.push((t, CastEvent::Resize(c, r)));
             }
         }
         Ok(Self {
@@ -135,7 +151,12 @@ impl RecordingPlayer {
             if *t > self.position {
                 break;
             }
-            self.model.feed(out.as_bytes());
+            match out {
+                CastEvent::Output(o) => {
+                    self.model.feed(o.as_bytes());
+                }
+                CastEvent::Resize(c, r) => self.model.resize(*c, (*r).min(60)),
+            }
             self.next += 1;
         }
     }
@@ -188,7 +209,7 @@ impl Render for RecordingPlayer {
         let speed = self.speed;
         // Every row of the recorded size (the screen text leaves out the
         // empty ones at the end).
-        let rows = usize::from(self.cast.rows.clamp(5, 40));
+        let rows = usize::from(self.model.rows().clamp(5, 40));
         let mut lines: Vec<String> = self
             .model
             .screen_text()
@@ -364,6 +385,8 @@ mod tests {
         let c = Cast::parse(text).unwrap();
         assert_eq!((c.cols, c.rows), (100, 30));
         assert_eq!(c.events.len(), 2);
+        let r = Cast::parse("{\"version\": 2}\n[0.1, \"r\", \"120x40\"]\n").unwrap();
+        assert_eq!(r.events, vec![(0.1, CastEvent::Resize(120, 40))]);
         assert_eq!(c.duration(), 1.25);
         assert!(Cast::parse("{\"version\": 1}").is_err());
         assert!(Cast::parse("").is_err());
@@ -377,7 +400,10 @@ mod tests {
         )
         .unwrap();
         let mut m = TermModel::new(c.cols, c.rows, 0);
-        m.feed(c.events[0].1.as_bytes());
+        let CastEvent::Output(o) = &c.events[0].1 else {
+            panic!("output expected")
+        };
+        m.feed(o.as_bytes());
         assert!(m.screen_text().contains("ls -la"));
     }
 }
