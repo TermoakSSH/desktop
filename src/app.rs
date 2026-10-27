@@ -596,6 +596,9 @@ impl AppView {
                     ModelEvent::Server(v) if v["type"] == "access_request" && notices => {
                         this.on_access_event(v, window, cx)
                     }
+                    ModelEvent::E2eePairing { account, pairing } if notices => {
+                        this.on_e2ee_pairing(*account, pairing.clone(), window, cx)
+                    }
                     // When starting signed in or when signing in: the running
                     // sessions, as dormant tabs (in the first window).
                     ModelEvent::SessionChanged => {
@@ -1086,6 +1089,55 @@ impl AppView {
                 self.ai.update(cx, |v, cx| v.open_task(task_id, window, cx));
             }
             Target::Access => self.select_section(Section::Access, window, cx),
+            Target::Security => self.show_settings_page(SettingsPage::Security, window, cx),
+        }
+    }
+
+    /// Settings, at one of its pages.
+    pub fn show_settings_page(
+        &mut self,
+        page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_section(Section::Settings, window, cx);
+        self.settings
+            .update(cx, |s, cx| s.show_page(page, window, cx));
+    }
+
+    /// Another device of yours asks for the E2EE key: the approval opens
+    /// here (in front) or a notification of the system says so.
+    fn on_e2ee_pairing(
+        &mut self,
+        account: Id,
+        pairing: termoak_client::e2ee::PairingRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = window.is_window_active();
+        self.notify_system(
+            Notice {
+                category: notifications::Category::Security,
+                key: format!("e2ee-pairing-{}", pairing.pairing.id),
+                title: t!("e2ee.pairing.notice_title").to_string(),
+                body: t!(
+                    "e2ee.pairing.notice_body",
+                    device = pairing.pairing.device_name.clone()
+                )
+                .to_string(),
+                target: Target::Security,
+            },
+            window,
+            cx,
+        );
+        if active && !window.has_active_dialog(cx) {
+            crate::views::e2ee::open_pairing_approval(
+                self.model.clone(),
+                account,
+                pairing,
+                window,
+                cx,
+            );
         }
     }
 
@@ -4409,6 +4461,10 @@ impl AppView {
         let waiting = crate::access::AccessBook::try_global(cx)
             .map(|b| b.read(cx).waiting_count())
             .unwrap_or(0);
+        // Devices of yours asking for the E2EE key (Settings → Security).
+        let pairings = crate::e2ee::E2eeBook::try_global(cx)
+            .map(|b| b.read(cx).pairing_count())
+            .unwrap_or(0);
         let user = model.current_account_name();
         let syncing = model.syncing;
         let events_online = model.events_online;
@@ -4421,6 +4477,7 @@ impl AppView {
             let badge = match s {
                 Section::ServerSessions if alerts > 0 => Some(alerts),
                 Section::Access if waiting > 0 => Some(waiting),
+                Section::Settings if pairings > 0 => Some(pairings),
                 _ => None,
             };
             let running =
@@ -5098,6 +5155,151 @@ impl AppView {
         )
     }
 
+    /// End-to-end encryption needs the person (0.7 phase 5b): a device asks
+    /// for the key, vaults locked on this computer, a key to set up, or
+    /// members waiting for a vault's key.
+    fn render_e2ee_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (account, vaults) = {
+            let m = self.model.read(cx);
+            let account = m
+                .current_account
+                .filter(|a| m.logged_in() && m.e2ee_supported(*a))?;
+            let vaults: Vec<_> = m
+                .account(account)?
+                .vaults
+                .iter()
+                .filter(|v| v.vault.crypto == termoak_core::model::VaultCrypto::E2ee)
+                .cloned()
+                .collect();
+            (account, vaults)
+        };
+        let st = self.model.read(cx).e2ee_of(account, cx)?;
+        if !st.loaded {
+            return None;
+        }
+        let model = self.model.clone();
+        type Action = Box<dyn Fn(&mut Window, &mut App)>;
+        let (title, detail, label, action): (SharedString, SharedString, SharedString, Action) =
+            if st.unlocked && !st.pairings.is_empty() {
+                let p = st.pairings[0].clone();
+                (
+                    t!(
+                        "e2ee.banner.pairing_title",
+                        device = p.pairing.device_name.clone()
+                    ),
+                    t!("e2ee.banner.pairing_detail"),
+                    t!("e2ee.pairing.review"),
+                    Box::new(move |window, cx| {
+                        crate::views::e2ee::open_pairing_approval(
+                            model.clone(),
+                            account,
+                            p.clone(),
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+            } else if st.set_up()
+                && !st.unlocked
+                && (st.locked_secrets > 0
+                    || vaults
+                        .iter()
+                        .any(|v| v.vault.e2ee.as_ref().is_some_and(|e| e.wrap.is_some())))
+            {
+                (
+                    t!("e2ee.banner.locked_title"),
+                    if st.locked_secrets > 0 {
+                        tn!("e2ee.locked_secrets", st.locked_secrets)
+                    } else {
+                        t!("e2ee.banner.locked_detail")
+                    },
+                    t!("e2ee.unlock.button"),
+                    Box::new(move |window, cx| {
+                        crate::views::e2ee::open_unlock(model.clone(), account, window, cx)
+                    }),
+                )
+            } else if !st.set_up()
+                && let Some(v) = vaults
+                    .iter()
+                    .find(|v| v.vault.e2ee.as_ref().is_some_and(|e| e.may_hold_key))
+            {
+                (
+                    t!("e2ee.banner.setup_title", vault = v.label()),
+                    t!("e2ee.banner.setup_detail"),
+                    t!("e2ee.setup.button"),
+                    Box::new(move |window, cx| {
+                        crate::views::e2ee::open_setup(model.clone(), account, window, cx)
+                    }),
+                )
+            } else if st.unlocked
+                && let Some(v) = vaults.iter().find(|v| {
+                    v.vault
+                        .e2ee
+                        .as_ref()
+                        .is_some_and(|e| e.wrap.is_some() && !e.pending.is_empty())
+                })
+            {
+                let n = v.vault.e2ee.as_ref().map(|e| e.pending.len()).unwrap_or(0);
+                let vault = v.id();
+                (
+                    tn!("e2ee.banner.pending_title", n, vault = v.label()),
+                    t!("e2ee.banner.pending_detail"),
+                    t!("e2ee.pairing.review"),
+                    Box::new(move |window, cx| {
+                        crate::views::vaults::open_encryption(
+                            model.clone(),
+                            account,
+                            vault,
+                            window,
+                            cx,
+                        )
+                    }),
+                )
+            } else {
+                return None;
+            };
+        let theme = cx.theme();
+        let color = theme.warning;
+        Some(
+            h_flex()
+                .mx_4()
+                .mt_3()
+                .px_3()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(color)
+                .bg(theme.secondary)
+                .child(
+                    ui::icon(IconName::ShieldLock)
+                        .size(px(16.))
+                        .text_color(color),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_sm().font_medium().child(title))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    Button::new("e2ee-banner")
+                        .small()
+                        .primary()
+                        .label(label)
+                        .on_click(move |_: &ClickEvent, window, cx| action(window, cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_cloud_notice(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let n = self.cloud_sessions;
@@ -5275,6 +5477,7 @@ impl Render for AppView {
                         .min_w_0()
                         .h_full()
                         .children(self.render_team_2fa_banner(cx))
+                        .children(self.render_e2ee_banner(cx))
                         .when(self.cloud_notice_shown(cx), |this| {
                             this.child(self.render_cloud_notice(cx))
                         })

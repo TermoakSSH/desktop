@@ -1102,10 +1102,30 @@ pub mod api {
 
     /// `trust`: accept the host's key if the server does not know it yet
     /// (after the user confirmed its fingerprint).
-    pub async fn test_host(api: &ApiClient, host: Id, trust: bool) -> Result<HostTest> {
+    /// `unlock`: the host's credentials of an end-to-end encrypted vault,
+    /// sent for this test only (0.7 phase 5b).
+    pub async fn test_host(
+        api: &ApiClient,
+        host: Id,
+        trust: bool,
+        unlock: Option<serde_json::Value>,
+    ) -> Result<HostTest> {
         let query = if trust { "?trust=true" } else { "" };
-        api.post(&format!("/api/v1/hosts/{host}/test{query}"), &json!({}))
+        let body = match unlock {
+            Some(u) => json!({"unlock": u}),
+            None => json!({}),
+        };
+        match api
+            .post(&format!("/api/v1/hosts/{host}/test{query}"), &body)
             .await
+        {
+            // The answer the view understands: ask, then test with `unlock`.
+            Err(e) if e.api_code() == Some("e2ee_unlock_required") => Ok(HostTest {
+                error_code: Some("e2ee_unlock_required".into()),
+                ..Default::default()
+            }),
+            other => other,
+        }
     }
 }
 
@@ -1210,6 +1230,7 @@ impl NetBook {
         api: termoak_client::ApiClient,
         host: Id,
         trust: bool,
+        unlock: Option<serde_json::Value>,
         cx: &mut gpui::Context<Self>,
         done: impl FnOnce(Result<HostTest, String>, &mut gpui::App) + 'static,
     ) {
@@ -1218,7 +1239,9 @@ impl NetBook {
         }
         cx.notify();
         let task = crate::runtime::spawn(cx, async move {
-            api::test_host(&api, host, trust).await.map_err(error_text)
+            api::test_host(&api, host, trust, unlock)
+                .await
+                .map_err(error_text)
         });
         cx.spawn(async move |this, cx| {
             let res = task.await;
@@ -1913,7 +1936,7 @@ mod tests {
             // through the network, the peers to add hosts at.
             let status = api::status(&api, net_id).await.map_err(|e| e.to_string())?;
             // The server keeps its own known hosts: trust the site's key.
-            let test = api::test_host(&api, host_id, true)
+            let test = api::test_host(&api, host_id, true, None)
                 .await
                 .map_err(|e| e.to_string())?;
             let peers = api::peers(&api, net_id).await.map_err(|e| e.to_string())?;

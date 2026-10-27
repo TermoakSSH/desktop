@@ -1,7 +1,7 @@
 [package]
 name = "termoak-desktop"
 description = "Termoak for desktop: native app (GPUI) for Windows, Linux and macOS"
-version = "0.7.0-next.4"
+version = "0.7.0-next.5"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Oihalitz <oihalitz@ohz.es>"]
@@ -17,13 +17,13 @@ name = "termoak-desktop"
 path = "src/main.rs"
 
 [dependencies]
-termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8" }
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8" }
-termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8" }
-termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8" }
+termoak-core = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12" }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12" }
+termoak-client = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12" }
+termoak-update = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12" }
 # AI engine: checks your own API keys from this computer (and, next, runs
 # the copilot and tasks locally).
-termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8", features = ["pty"] }
+termoak-ai = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12", features = ["pty"] }
 
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui-component = "0.6.6"
@@ -123,7 +123,7 @@ gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # The test-only software FIDO2 authenticator (never in the app): the
 # security key flows above the hardware layer are tested with it.
 [dev-dependencies]
-termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.8", features = ["soft-sk"] }
+termoak-ssh = { git = "https://github.com/TermoakSSH/core", tag = "v0.7.0-next.12", features = ["soft-sk"] }
 tempfile = "3"
 
 [build-dependencies]

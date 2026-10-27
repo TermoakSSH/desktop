@@ -299,6 +299,27 @@ pub fn open_manage(
     });
 }
 
+/// Opens a vault's settings at its Encryption tab.
+pub fn open_encryption(
+    model: Entity<AppModel>,
+    account: Id,
+    vault: Id,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(entry) = model.read(cx).vault_entry(account, vault).cloned() else {
+        return;
+    };
+    let title = entry.label();
+    let view = cx.new(|cx| VaultManager::new(model, entry, window, cx));
+    view.update(cx, |v, cx| v.set_tab(VaultTab::Encryption, window, cx));
+    window.open_dialog(cx, move |d, _, _| {
+        d.title(t!("vaults.manage_title", name = title.clone()))
+            .w(px(620.))
+            .child(view.clone())
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VaultTab {
     General,
@@ -307,6 +328,8 @@ enum VaultTab {
     Access,
     /// Recorded sessions (Admins).
     Recordings,
+    /// End-to-end encryption (0.7 phase 5b).
+    Encryption,
     Activity,
 }
 
@@ -351,6 +374,9 @@ struct VaultManager {
     policies_error: Option<String>,
     recordings: Vec<VaultRecording>,
     recordings_error: Option<String>,
+    /// The Encryption tab (servers with E2EE vaults).
+    encryption: Option<Entity<super::vault_e2ee::VaultE2eeView>>,
+    e2ee_tab: bool,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -392,6 +418,7 @@ impl VaultManager {
             }),
         ];
         let teams_security = model.read(cx).teams_security(entry.account);
+        let e2ee_tab = model.read(cx).e2ee_supported(entry.account);
         // Owner of a shared vault: implicit (members say it for team vaults).
         let me = model
             .read(cx)
@@ -428,6 +455,8 @@ impl VaultManager {
             implicit_manager,
             policies: Vec::new(),
             policies_error: None,
+            encryption: None,
+            e2ee_tab,
             recordings: Vec::new(),
             recordings_error: None,
             _subs: subs,
@@ -626,6 +655,24 @@ impl VaultManager {
         }
         if tab == VaultTab::Recordings {
             self.load_recordings(window, cx);
+        }
+        if tab == VaultTab::Encryption {
+            match &self.encryption {
+                Some(v) => v.update(cx, |v, cx| v.load(window, cx)),
+                None => {
+                    let (model, account, vault, manager) = (
+                        self.model.clone(),
+                        self.account,
+                        self.vault.id,
+                        self.manager(),
+                    );
+                    self.encryption = Some(cx.new(|cx| {
+                        super::vault_e2ee::VaultE2eeView::new(
+                            model, account, vault, manager, window, cx,
+                        )
+                    }));
+                }
+            }
         }
         cx.notify();
     }
@@ -1484,6 +1531,9 @@ impl VaultManager {
             }
             v.push(VaultTab::Recordings);
         }
+        if self.e2ee_tab {
+            v.push(VaultTab::Encryption);
+        }
         v.push(VaultTab::Activity);
         v
     }
@@ -1730,6 +1780,7 @@ impl Render for VaultManager {
                 VaultTab::Members => tn!("vaults.tab.members", self.members.len()),
                 VaultTab::Access => t!("vaults.tab.access"),
                 VaultTab::Recordings => t!("vaults.tab.recordings"),
+                VaultTab::Encryption => t!("vaults.tab.encryption"),
                 VaultTab::Activity => t!("vaults.tab.activity"),
             })
             .collect();
@@ -1745,6 +1796,11 @@ impl Render for VaultManager {
             VaultTab::Members => self.render_members(cx),
             VaultTab::Access => self.render_access(cx),
             VaultTab::Recordings => self.render_recordings(cx),
+            VaultTab::Encryption => self
+                .encryption
+                .clone()
+                .map(|v| v.into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
             VaultTab::Activity => self.render_activity(cx),
         };
         let header = h_flex()

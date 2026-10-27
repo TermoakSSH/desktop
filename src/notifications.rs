@@ -95,6 +95,7 @@ impl NotificationPrefs {
                 Category::SharedWithMe => self.shared_with_me,
                 Category::Commands => self.commands,
                 Category::Access => self.access,
+                Category::Security => true,
             }
     }
 
@@ -114,6 +115,9 @@ pub enum Category {
     Commands,
     /// Temporary access requests and decisions.
     Access,
+    /// Another device of yours asks for your end-to-end encryption key
+    /// (0.7 phase 5b): always on while notifications are.
+    Security,
 }
 
 /// Where a click on the notification leads.
@@ -133,6 +137,8 @@ pub enum Target {
     AiTask(Id),
     /// The Access section (requests and approvals).
     Access,
+    /// Settings → Security (end-to-end encryption, pairing requests).
+    Security,
 }
 
 /// A notice to post as a notification.

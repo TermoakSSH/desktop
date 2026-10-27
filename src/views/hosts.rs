@@ -411,6 +411,51 @@ impl HostsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.test_through_network_with(id, trust, None, window, cx)
+    }
+
+    /// The test again with this host's end-to-end encrypted credentials,
+    /// resolved here and sent for this test only (after asking).
+    fn test_with_unlock(
+        &mut self,
+        id: Id,
+        trust: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (ws, acc) = {
+            let m = self.model.read(cx);
+            (
+                m.ws.clone(),
+                m.account_of_host(id).and_then(|a| m.ws.account(a)),
+            )
+        };
+        let Some(acc) = acc else {
+            return;
+        };
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                crate::terminal::backend::unlock_payload(&ws, &acc, id)
+                    .await
+                    .map_err(crate::state::api_error)
+            },
+            move |this, res, window, cx| match res {
+                Ok(u) => this.test_through_network_with(id, trust, Some(u), window, cx),
+                Err(e) => ui::error(window, cx, e),
+            },
+        );
+    }
+
+    fn test_through_network_with(
+        &mut self,
+        id: Id,
+        trust: bool,
+        unlock: Option<serde_json::Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (api, net) = {
             let m = self.model.read(cx);
             (m.api_for_host(id), m.host_network(id))
@@ -423,8 +468,26 @@ impl HostsView {
         let handle = window.window_handle();
         let view = cx.entity().downgrade();
         self.net_book.update(cx, |b, cx| {
-            b.test_host(api, id, trust, cx, move |res, cx| {
+            b.test_host(api, id, trust, unlock, cx, move |res, cx| {
                 let _ = handle.update(cx, |_, window, cx| match res {
+                    // End-to-end encrypted: send the credentials for this
+                    // test only, if the person agrees.
+                    Ok(t) if t.error_code.as_deref() == Some("e2ee_unlock_required") => {
+                        let view = view.clone();
+                        ui::confirm(
+                            window,
+                            cx,
+                            t!("vault_e2ee.test.title"),
+                            t!("vault_e2ee.test.message", host = label.clone()),
+                            t!("vault_e2ee.session.send"),
+                            false,
+                            move |window, cx| {
+                                if let Some(v) = view.upgrade() {
+                                    v.update(cx, |v, cx| v.test_with_unlock(id, trust, window, cx));
+                                }
+                            },
+                        );
+                    }
                     // The server does not know the host's key yet: ask.
                     Ok(t) if t.error_code.as_deref() == Some("host_key_unknown") && !trust => {
                         let fingerprint = t.fingerprint.clone().unwrap_or_default();
@@ -1973,6 +2036,7 @@ impl HostsView {
             .get(&host.id)
             .map(|s| (*s, self.status.read(cx).is_running(host.id)));
         let (access_window, recorded) = self.access_of(rec, cx);
+        let e2ee_locked = rec.meta.e2ee_locked;
         let connect_only = rec.access == termoak_client::ItemAccess::ConnectOnly;
         let now_ms = termoak_core::time::now_ms();
         // Private network: "via Office", with the server's test if any.
@@ -2392,6 +2456,22 @@ impl HostsView {
                                                 .build(window, cx)
                                         }),
                                 )
+                            })
+                            .when(e2ee_locked, |this| {
+                                let color = cx.theme().warning;
+                                this.child(
+                                    h_flex()
+                                        .id(("host-e2ee-locked", ix))
+                                        .gap_1()
+                                        .items_center()
+                                        .text_color(color)
+                                        .child(ui::icon(IconName::Lock).size(px(11.)))
+                                        .child(ui::pill(t!("vault_e2ee.item_locked"), color))
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new(t!("vault_e2ee.item_locked_tip"))
+                                                .build(window, cx)
+                                        }),
+                                )
                             }),
                     )
                 },
@@ -2769,6 +2849,31 @@ impl Render for HostsView {
                             None => this,
                         })
                         .child(div().text_lg().font_semibold().child(label))
+                        .when_some(
+                            entry.clone().filter(|v| {
+                                v.vault.crypto == termoak_core::model::VaultCrypto::E2ee
+                            }),
+                            |this, v| {
+                                let unlocked = self
+                                    .model
+                                    .read(cx)
+                                    .e2ee_of(v.account, cx)
+                                    .is_some_and(|s| s.unlocked)
+                                    && v.vault.e2ee.as_ref().is_some_and(|e| e.wrap.is_some());
+                                this.child(ui::pill(
+                                    if unlocked {
+                                        t!("vault_e2ee.badge")
+                                    } else {
+                                        t!("vault_e2ee.badge_locked")
+                                    },
+                                    if unlocked {
+                                        theme.success
+                                    } else {
+                                        theme.warning
+                                    },
+                                ))
+                            },
+                        )
                         .when_some(entry.filter(|v| !v.can_write()), |this, v| {
                             this.child(ui::pill(
                                 if v.strict() {

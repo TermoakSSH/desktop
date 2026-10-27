@@ -101,6 +101,11 @@ enum TeamTab {
     Vaults,
     /// CA, policy, 2FA compliance (servers with teams security).
     Security,
+    /// Single sign-on (servers with SSO; 0.7 phase 5b).
+    Sso,
+    /// The team's audit, retention and sinks (owners and admins, servers
+    /// with the extended audit).
+    Audit,
 }
 
 pub struct TeamsView {
@@ -117,6 +122,10 @@ pub struct TeamsView {
     busy: bool,
     /// The Security tab of the selected team.
     security: Option<(Id, Entity<super::team_security::TeamSecurity>)>,
+    /// The Single sign-on tab of the selected team.
+    sso: Option<(Id, Entity<super::sso::TeamSsoView>)>,
+    /// The Audit tab of the selected team.
+    audit: Option<(Id, Entity<super::audit::AuditPanel>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -170,6 +179,8 @@ impl TeamsView {
             add_roles_owner: false,
             busy: false,
             security: None,
+            sso: None,
+            audit: None,
             _subs: subs,
         }
     }
@@ -246,12 +257,71 @@ impl TeamsView {
         self.security = Some((team.id, view));
     }
 
+    /// Creates the Single sign-on or Audit tab of the selected team.
+    fn ensure_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(team) = self.team(cx) else {
+            return;
+        };
+        let manage = matches!(
+            self.my_role(&team, cx),
+            Some(TeamRole::Admin | TeamRole::Owner)
+        );
+        match self.tab {
+            TeamTab::Security => self.ensure_security(window, cx),
+            // Shown again: read again (a domain verified meanwhile...).
+            TeamTab::Sso if self.sso.as_ref().is_some_and(|(id, _)| *id == team.id) => {
+                if let Some((_, v)) = &self.sso {
+                    v.update(cx, |v, cx| v.load(window, cx));
+                }
+            }
+            TeamTab::Audit if self.audit.as_ref().is_some_and(|(id, _)| *id == team.id) => {
+                if let Some((_, v)) = &self.audit {
+                    v.update(cx, |v, cx| v.reload(window, cx));
+                }
+            }
+            TeamTab::Sso if self.sso.as_ref().is_none_or(|(id, _)| *id != team.id) => {
+                let model = self.model.clone();
+                let view = cx.new(|cx| {
+                    super::sso::TeamSsoView::new(
+                        model,
+                        team.id,
+                        team.name.clone(),
+                        manage,
+                        window,
+                        cx,
+                    )
+                });
+                self.sso = Some((team.id, view));
+            }
+            TeamTab::Audit if self.audit.as_ref().is_none_or(|(id, _)| *id != team.id) => {
+                let model = self.model.clone();
+                let Some(account) = self.model.read(cx).current_account else {
+                    return;
+                };
+                let view = cx.new(|cx| {
+                    super::audit::AuditPanel::new(
+                        model,
+                        account,
+                        termoak_client::audit::AuditOf::Team(team.id),
+                        team.name.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                self.audit = Some((team.id, view));
+            }
+            _ => {}
+        }
+    }
+
     fn select(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected != Some(id) {
             self.selected = Some(id);
             if self.tab == TeamTab::Security {
                 self.security = None;
             }
+            self.sso = None;
+            self.audit = None;
             self.members.clear();
             self.members_error = None;
             self.add_email
@@ -259,9 +329,7 @@ impl TeamsView {
         }
         self.load_members(window, cx);
         self.sync_selection(window, cx);
-        if self.tab == TeamTab::Security {
-            self.ensure_security(window, cx);
-        }
+        self.ensure_tab(window, cx);
         cx.notify();
     }
 
@@ -1055,35 +1123,67 @@ impl TeamsView {
                 })
         });
 
-        let security = self
-            .model
-            .read(cx)
-            .current_account
-            .is_some_and(|a| self.model.read(cx).teams_security(a));
+        let (security, sso, audit) = {
+            let m = self.model.read(cx);
+            let a = m.current_account;
+            (
+                a.is_some_and(|a| m.teams_security(a)),
+                a.is_some_and(|a| m.sso_supported(a)),
+                a.is_some_and(|a| m.audit_v2(a).is_some()) && perms.add_members,
+            )
+        };
+        // The tabs shown, in order.
+        let mut shown = vec![TeamTab::Members, TeamTab::Vaults];
+        if security {
+            shown.push(TeamTab::Security);
+        }
+        if sso {
+            shown.push(TeamTab::Sso);
+        }
+        if audit {
+            shown.push(TeamTab::Audit);
+        }
+        let shown2 = shown.clone();
         let tabs = TabBar::new("team-tabs")
-            .selected_index(match self.tab {
-                TeamTab::Members => 0,
-                TeamTab::Vaults => 1,
-                TeamTab::Security => 2,
-            })
-            .child(Tab::new().label(t!("teams.members")))
-            .child(Tab::new().label(t!("teams.vaults")))
-            .when(security, |this| {
-                this.child(Tab::new().label(t!("teams.security")))
-            })
-            .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                this.tab = match *ix {
-                    1 => TeamTab::Vaults,
-                    2 => TeamTab::Security,
-                    _ => TeamTab::Members,
-                };
-                if this.tab == TeamTab::Security {
-                    this.ensure_security(window, cx);
-                }
+            .selected_index(shown.iter().position(|t| *t == self.tab).unwrap_or(0))
+            .children(shown.iter().map(|t| {
+                Tab::new().label(match t {
+                    TeamTab::Members => t!("teams.members"),
+                    TeamTab::Vaults => t!("teams.vaults"),
+                    TeamTab::Security => t!("teams.security"),
+                    TeamTab::Sso => t!("teams.sso"),
+                    TeamTab::Audit => t!("teams.audit"),
+                })
+            }))
+            .on_click(cx.listener(move |this, ix: &usize, window, cx| {
+                this.tab = shown2.get(*ix).copied().unwrap_or(TeamTab::Members);
+                this.ensure_tab(window, cx);
                 cx.notify();
             }));
         if self.tab == TeamTab::Security
             && let Some((id, view)) = &self.security
+            && *id == team.id
+        {
+            return v_flex()
+                .gap_5()
+                .child(header)
+                .child(tabs)
+                .child(view.clone())
+                .into_any_element();
+        }
+        if self.tab == TeamTab::Sso
+            && let Some((id, view)) = &self.sso
+            && *id == team.id
+        {
+            return v_flex()
+                .gap_5()
+                .child(header)
+                .child(tabs)
+                .child(view.clone())
+                .into_any_element();
+        }
+        if self.tab == TeamTab::Audit
+            && let Some((id, view)) = &self.audit
             && *id == team.id
         {
             return v_flex()

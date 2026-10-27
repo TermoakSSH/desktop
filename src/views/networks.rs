@@ -2361,6 +2361,9 @@ struct SavePlan {
 struct Destination {
     account: Id,
     vault: Id,
+    /// The vault is end-to-end encrypted: the network's key stays readable
+    /// by the server (decision §9.3 of E2EE-SSO-AUDIT.md).
+    e2ee: bool,
 }
 
 /// What an edit does with a Tailscale auth key.
@@ -2401,6 +2404,8 @@ struct NetworkForm {
     ts_ephemeral: Option<bool>,
     /// The switch, once the user changed it.
     ts_ephemeral_set: Option<bool>,
+    /// Editing a network of an end-to-end encrypted vault.
+    editing_e2ee: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -2414,6 +2419,13 @@ impl NetworkForm {
     ) -> Self {
         let m = model.read(cx);
         let multi = m.network_accounts().len() > 1;
+        let editing_e2ee = editing.as_ref().is_some_and(|r| {
+            let personal = m.account(r.account).and_then(|a| a.info.user_id);
+            r.vault
+                .or(personal)
+                .and_then(|v| m.vault_entry(r.account, v))
+                .is_some_and(|v| v.vault.crypto == termoak_core::model::VaultCrypto::E2ee)
+        });
         let tailscale_accounts: Vec<Id> = m
             .network_accounts()
             .into_iter()
@@ -2439,6 +2451,7 @@ impl NetworkForm {
                     destinations.push(Destination {
                         account,
                         vault: v.id(),
+                        e2ee: v.vault.crypto == termoak_core::model::VaultCrypto::E2ee,
                     });
                 }
             }
@@ -2553,6 +2566,7 @@ impl NetworkForm {
             ts_tags,
             ts_ephemeral: ts.ephemeral,
             ts_ephemeral_set: None,
+            editing_e2ee,
             _subs: subs,
         };
         form.reparse(cx);
@@ -3075,8 +3089,29 @@ impl Render for NetworkForm {
                 .map(|b| if on { b.primary() } else { b.ghost() })
                 .disabled(!enabled)
         };
+        let e2ee = self.editing_e2ee
+            || self
+                .destination
+                .as_ref()
+                .and_then(|d| ui::chosen(d, cx))
+                .and_then(|i| self.destinations.get(i))
+                .is_some_and(|d| d.e2ee);
+        let warning = theme.warning;
         v_flex()
             .gap_3()
+            .when(e2ee, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .p_2()
+                        .rounded(theme.radius)
+                        .border_1()
+                        .border_color(warning)
+                        .child(ui::icon(IconName::TriangleAlert).text_color(warning))
+                        .child(div().text_sm().child(t!("vault_e2ee.network_form_warning"))),
+                )
+            })
             .when(!editing, |this| {
                 this.child(ui::field(
                     t!("networks.form.kind"),

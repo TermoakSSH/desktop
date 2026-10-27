@@ -185,6 +185,118 @@ impl TerminalView {
     }
 
     /// Instead of the error: what is needed and "Request access".
+    /// An end-to-end encrypted host (0.7 phase 5b): unlock this computer,
+    /// or send its credentials to the server for this session only.
+    pub(super) fn render_e2ee_card(&self, text: String, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let need = self
+            .e2ee_need
+            .unwrap_or(crate::terminal::backend::E2eeNeed::Unlock);
+        let send = need == crate::terminal::backend::E2eeNeed::SendForSession;
+        let account = self.access_target(cx).map(|(a, _)| a);
+        let app = self.app.clone();
+        v_flex()
+            .absolute()
+            .inset_0()
+            .items_center()
+            .justify_center()
+            .child(
+                ui::card(cx)
+                    .p_6()
+                    .gap_3()
+                    .max_w(px(560.))
+                    .items_center()
+                    .child(
+                        ui::icon(IconName::ShieldLock)
+                            .size(px(32.))
+                            .text_color(theme.warning),
+                    )
+                    .child(div().text_lg().font_semibold().child(if send {
+                        t!("vault_e2ee.session.title")
+                    } else {
+                        t!("vault_e2ee.locked_card.title")
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_center()
+                            .text_color(theme.muted_foreground)
+                            .child(if send {
+                                t!("vault_e2ee.session.text").to_string()
+                            } else {
+                                text
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(send, |this| {
+                                this.child(
+                                    Button::new("e2ee-send")
+                                        .primary()
+                                        .icon(ui::icon(IconName::Send))
+                                        .label(t!("vault_e2ee.session.send"))
+                                        .on_click(cx.listener(
+                                            |this, _: &ClickEvent, window, cx| {
+                                                this.send_unlock = true;
+                                                this.connect(window, cx);
+                                            },
+                                        )),
+                                )
+                            })
+                            .when(!send, |this| {
+                                this.child(
+                                    Button::new("e2ee-unlock")
+                                        .primary()
+                                        .icon(ui::icon(IconName::LockOpen))
+                                        .label(t!("e2ee.unlock.button"))
+                                        .on_click(move |_: &ClickEvent, window, cx| {
+                                            if let Some(a) = account {
+                                                let set_up = app
+                                                    .read(cx)
+                                                    .e2ee_of(a, cx)
+                                                    .is_some_and(|s| s.set_up());
+                                                if set_up {
+                                                    crate::views::e2ee::open_unlock(
+                                                        app.clone(),
+                                                        a,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                } else {
+                                                    crate::views::e2ee::open_setup(
+                                                        app.clone(),
+                                                        a,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }
+                                            }
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("e2ee-retry")
+                                    .icon(ui::icon(IconName::RefreshCw))
+                                    .label(t!("common.retry"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.connect(window, cx)
+                                    })),
+                            ),
+                    )
+                    .when(send, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_center()
+                                .text_color(theme.muted_foreground)
+                                .child(t!("vault_e2ee.session.hint")),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn render_access_card(&self, _text: String, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let need = self.access_need.clone();

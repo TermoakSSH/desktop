@@ -505,6 +505,12 @@ pub struct TerminalView {
     /// The host needs an approved access window (teams security): shown
     /// with "Request access" instead of the error.
     access_need: Option<crate::access::AccessNeed>,
+    /// The host's credentials are end-to-end encrypted (0.7 phase 5b):
+    /// "Unlock" or "Send for this session" instead of the error.
+    e2ee_need: Option<backend::E2eeNeed>,
+    /// The next server session sends the host's credentials (the person
+    /// agreed).
+    send_unlock: bool,
     /// Follows the access book (a window approved, ended or revoked).
     access_sub: Option<gpui::Subscription>,
     /// Repaints the access countdown.
@@ -579,6 +585,8 @@ impl TerminalView {
             proposal: None,
             proposal_gen: 0,
             access_need: None,
+            e2ee_need: None,
+            send_unlock: false,
             access_sub: None,
             access_tick: None,
             _reader: None,
@@ -800,6 +808,8 @@ impl TerminalView {
             old.send(Cmd::Close);
         }
         self.access_need = None;
+        self.e2ee_need = None;
+        let send_unlock = std::mem::take(&mut self.send_unlock);
         self.watch_access(window, cx);
         self.local = None;
         self.can_write = false;
@@ -857,8 +867,18 @@ impl TerminalView {
                 ..
             } => match app.api_of(*account) {
                 Some(api) => {
+                    let unlock_account = account
+                        .or_else(|| host_id.and_then(|h| app.account_of_host(h)))
+                        .and_then(|a| app.ws.account(a));
                     let target = match (session_id, host_id) {
                         (Some(s), _) => Some(ServerTarget::Attach { session_id: *s }),
+                        (None, Some(h)) if send_unlock && unlock_account.is_some() => {
+                            Some(ServerTarget::NewUnlocked {
+                                host_id: *h,
+                                ws: app.ws.clone(),
+                                account: unlock_account.clone().expect("checked"),
+                            })
+                        }
                         (None, Some(h)) => Some(ServerTarget::New { host_id: *h }),
                         (None, None) => None,
                     };
@@ -1050,6 +1070,10 @@ impl TerminalView {
                 Out::Failed(e) => self.state = TermState::Failed(e),
                 Out::AccessRequired(need, e) => {
                     self.access_need = Some(need);
+                    self.state = TermState::Failed(e);
+                }
+                Out::E2eeRequired(need, e) => {
+                    self.e2ee_need = Some(need);
                     self.state = TermState::Failed(e);
                 }
             }
@@ -4305,6 +4329,9 @@ impl TerminalView {
             ),
             TermState::Failed(e) if self.access_need.is_some() => {
                 Some(self.render_access_card(e.clone(), cx))
+            }
+            TermState::Failed(e) if self.e2ee_need.is_some() => {
+                Some(self.render_e2ee_card(e.clone(), cx))
             }
             TermState::Failed(e) => Some(
                 v_flex()

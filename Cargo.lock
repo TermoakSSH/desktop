@@ -8446,8 +8446,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ai"
-version = "0.7.0-next.8"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
+version = "0.7.0-next.12"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.12#e7dfbdb1deaafed7550d53340c1db18b35ebe88d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8472,8 +8472,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-client"
-version = "0.7.0-next.8"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
+version = "0.7.0-next.12"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.12#e7dfbdb1deaafed7550d53340c1db18b35ebe88d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8503,8 +8503,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-core"
-version = "0.7.0-next.8"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
+version = "0.7.0-next.12"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.12#e7dfbdb1deaafed7550d53340c1db18b35ebe88d"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -8527,13 +8527,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "uuid",
+ "x25519-dalek",
  "zeroize",
 ]
 
 [[package]]
 name = "termoak-desktop"
-version = "0.7.0-next.4"
+version = "0.7.0-next.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8585,8 +8587,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-ssh"
-version = "0.7.0-next.8"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
+version = "0.7.0-next.12"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.12#e7dfbdb1deaafed7550d53340c1db18b35ebe88d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8609,8 +8611,8 @@ dependencies = [
 
 [[package]]
 name = "termoak-update"
-version = "0.7.0-next.8"
-source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.8#589b67a3f4cc90e329a6218e5c9e251b483fc2d4"
+version = "0.7.0-next.12"
+source = "git+https://github.com/TermoakSSH/core?tag=v0.7.0-next.12#e7dfbdb1deaafed7550d53340c1db18b35ebe88d"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -10627,6 +10629,18 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "x509-parser"

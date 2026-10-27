@@ -35,6 +35,10 @@ use crate::update::{self, UpdateModel, UpdateStatus};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsPage {
     General,
+    /// End-to-end encryption and linked identities (0.7 phase 5b).
+    Security,
+    /// Your activity: the account's audit (0.7 phase 5b).
+    Activity,
     Accounts,
     Ai,
 }
@@ -51,6 +55,12 @@ pub struct SettingsView {
     /// Interface language (`None` = the system language).
     language: ui::ChoiceState<Option<String>>,
     two_factor: Entity<TwoFactorPanel>,
+    /// Settings → Security: end-to-end encryption of the current account.
+    e2ee: Entity<super::e2ee::E2eePanel>,
+    /// Settings → Security: linked identities (SSO).
+    identities: Entity<super::sso::LinkedIdentities>,
+    /// Settings → Security: your activity (per account).
+    activity: Option<(Id, Entity<super::audit::AuditPanel>)>,
     /// Your personal SSH CA (servers with teams security), per account.
     personal_ca: Option<(Id, Entity<super::ca_panel::CaPanel>)>,
     _subs: Vec<Subscription>,
@@ -94,6 +104,8 @@ impl SettingsView {
         });
         let language = ui::choice_state(language_items(), Some(&language_choice), window, cx);
         let two_factor = cx.new(|cx| TwoFactorPanel::new(model.clone(), window, cx));
+        let e2ee = cx.new(|cx| super::e2ee::E2eePanel::new(model.clone(), window, cx));
+        let identities = cx.new(|cx| super::sso::LinkedIdentities::new(model.clone(), window, cx));
         let ai = cx.new(|cx| AiSettingsView::new(model.clone(), window, cx));
         let accounts = cx.new(|cx| AccountsView::new(model.clone(), window, cx));
         let subs = vec![
@@ -109,7 +121,14 @@ impl SettingsView {
             ),
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe_in(&model, window, |this, _, window, cx| {
-                this.sync_personal_ca(window, cx)
+                this.sync_personal_ca(window, cx);
+                // The activity panel follows the current account.
+                let current = this.model.read(cx).current_account;
+                if matches!(this.page, SettingsPage::Security | SettingsPage::Activity)
+                    && this.activity.as_ref().map(|(a, _)| *a) != current
+                {
+                    this.sync_security(window, cx);
+                }
             }),
             cx.observe(&updates, |_, _, cx| cx.notify()),
             cx.observe(&two_factor, |_, _, cx| cx.notify()),
@@ -123,9 +142,43 @@ impl SettingsView {
             font_family,
             language,
             two_factor,
+            e2ee,
+            identities,
+            activity: None,
             personal_ca: None,
             _subs: subs,
         }
+    }
+
+    /// Settings → Security follows the current account: its activity
+    /// panel, its identities and E2EE state read again.
+    fn sync_security(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = {
+            let m = self.model.read(cx);
+            m.current_account
+                .filter(|a| m.logged_in() && m.audit_v2(*a).is_some())
+        };
+        match (current, &self.activity) {
+            (None, _) => self.activity = None,
+            (Some(a), Some((b, _))) if a == *b => {}
+            (Some(a), _) => {
+                let model = self.model.clone();
+                let view = cx.new(|cx| {
+                    super::audit::AuditPanel::new(
+                        model,
+                        a,
+                        termoak_client::audit::AuditOf::Me,
+                        String::new(),
+                        window,
+                        cx,
+                    )
+                });
+                self.activity = Some((a, view));
+            }
+        }
+        self.identities.update(cx, |v, cx| v.load(window, cx));
+        self.e2ee.update(cx, |v, cx| v.refresh(cx));
+        cx.notify();
     }
 
     /// The personal CA panel follows the current account.
@@ -161,6 +214,9 @@ impl SettingsView {
         if self.page == SettingsPage::Ai {
             self.ai.update(cx, |v, cx| v.refresh(window, cx));
         }
+        if matches!(self.page, SettingsPage::Security | SettingsPage::Activity) {
+            self.sync_security(window, cx);
+        }
     }
 
     /// Shows a page (the AI one reloads its data when it appears).
@@ -169,6 +225,9 @@ impl SettingsView {
             return;
         }
         self.page = page;
+        if matches!(page, SettingsPage::Security | SettingsPage::Activity) {
+            self.sync_security(window, cx);
+        }
         self.refresh(window, cx);
         cx.notify();
     }
@@ -1041,6 +1100,65 @@ impl SettingsView {
         }))
     }
 
+    /// Settings → Security: the current account's end-to-end encryption,
+    /// linked identities and activity.
+    fn render_security(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let m = self.model.read(cx);
+        let current = m.current_account.filter(|_| m.logged_in());
+        let Some(account) = current else {
+            return ui::empty_state(
+                IconName::ShieldLock,
+                t!("settings.security.signed_out"),
+                t!("settings.security.signed_out_hint"),
+                cx,
+            )
+            .into_any_element();
+        };
+        let e2ee = m.e2ee_supported(account);
+        let sso = m.sso_supported(account);
+        v_flex()
+            .gap_5()
+            .when(e2ee, |this| {
+                this.child(ui::card(cx).p_4().gap_3().child(self.e2ee.clone()))
+            })
+            .when(!e2ee, |this| {
+                this.child(
+                    ui::card(cx).p_4().child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("settings.security.no_e2ee")),
+                    ),
+                )
+            })
+            .when(sso, |this| {
+                this.child(ui::card(cx).p_4().child(self.identities.clone()))
+            })
+            .into_any_element()
+    }
+
+    /// Settings → Activity: the current account's audit (servers with the
+    /// extended audit).
+    fn render_activity(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let m = self.model.read(cx);
+        let account = m.current_account.filter(|_| m.logged_in());
+        let panel = self
+            .activity
+            .as_ref()
+            .filter(|(a, _)| Some(*a) == account)
+            .map(|(_, v)| v.clone());
+        match panel {
+            Some(p) => ui::card(cx).p_4().child(p).into_any_element(),
+            None => ui::empty_state(
+                IconName::ScrollText,
+                t!("settings.activity.none"),
+                t!("settings.activity.none_hint"),
+                cx,
+            )
+            .into_any_element(),
+        }
+    }
+
     fn render_updates(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let u = self.updates.read(cx);
         let status = u.status.clone();
@@ -1135,13 +1253,25 @@ impl Render for SettingsView {
             .segmented()
             .selected_index(match self.page {
                 SettingsPage::General => 0,
-                SettingsPage::Accounts => 1,
-                SettingsPage::Ai => 2,
+                SettingsPage::Security => 1,
+                SettingsPage::Activity => 2,
+                SettingsPage::Accounts => 3,
+                SettingsPage::Ai => 4,
             })
             .child(
                 Tab::new()
                     .icon(ui::icon(IconName::Settings))
                     .label(t!("settings.page.general")),
+            )
+            .child(
+                Tab::new()
+                    .icon(ui::icon(IconName::ShieldLock))
+                    .label(t!("settings.page.security")),
+            )
+            .child(
+                Tab::new()
+                    .icon(ui::icon(IconName::ScrollText))
+                    .label(t!("settings.page.activity")),
             )
             .child(
                 Tab::new()
@@ -1155,8 +1285,10 @@ impl Render for SettingsView {
             )
             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                 let page = match *ix {
-                    1 => SettingsPage::Accounts,
-                    2 => SettingsPage::Ai,
+                    1 => SettingsPage::Security,
+                    2 => SettingsPage::Activity,
+                    3 => SettingsPage::Accounts,
+                    4 => SettingsPage::Ai,
                     _ => SettingsPage::General,
                 };
                 this.show_page(page, window, cx);
@@ -1165,6 +1297,8 @@ impl Render for SettingsView {
             t!("settings.title"),
             match self.page {
                 SettingsPage::General => t!("settings.subtitle"),
+                SettingsPage::Security => t!("settings.subtitle_security"),
+                SettingsPage::Activity => t!("settings.subtitle_activity"),
                 SettingsPage::Accounts => t!("settings.subtitle_accounts"),
                 SettingsPage::Ai => t!("settings.subtitle_ai"),
             },
@@ -1183,6 +1317,28 @@ impl Render for SettingsView {
                     .size_full()
                     .child(header)
                     .child(div().flex_1().min_h_0().child(self.accounts.clone()));
+            }
+            SettingsPage::Activity => {
+                let activity = self.render_activity(cx);
+                return v_flex().size_full().child(header).child(
+                    div().flex_1().min_h_0().child(
+                        v_flex()
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .child(v_flex().p_6().gap_5().child(activity)),
+                    ),
+                );
+            }
+            SettingsPage::Security => {
+                let security = self.render_security(cx);
+                return v_flex().size_full().child(header).child(
+                    div().flex_1().min_h_0().child(
+                        v_flex()
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .child(v_flex().p_6().gap_5().child(security)),
+                    ),
+                );
             }
             SettingsPage::General => {}
         }

@@ -223,6 +223,12 @@ pub enum ModelEvent {
     /// First start after the data moved to one store per account
     /// ([`AppModel::take_layout_notice`]).
     LayoutMigrated,
+    /// Another device of yours asks for the E2EE key and this computer can
+    /// approve it (0.7 phase 5b): the window offers the approval.
+    E2eePairing {
+        account: Id,
+        pairing: termoak_client::e2ee::PairingRequest,
+    },
 }
 
 /// An item with where it lives and what the user can do with it. It
@@ -325,6 +331,13 @@ pub enum LoginError {
     TotpRequired,
     /// The verification code is not correct.
     TotpInvalid,
+    /// The email's team signs in through single sign-on only
+    /// (`sso_required`): the team and the text.
+    SsoRequired {
+        team_id: Option<Id>,
+        team_name: Option<String>,
+        text: String,
+    },
     Failed(String),
 }
 
@@ -334,10 +347,25 @@ impl From<ClientError> for LoginError {
             LoginError::TotpRequired
         } else if e.is_totp_invalid() {
             LoginError::TotpInvalid
+        } else if let ClientError::Api { code, details, .. } = &e
+            && code == "sso_required"
+        {
+            LoginError::SsoRequired {
+                team_id: details["team_id"].as_str().and_then(|s| s.parse().ok()),
+                team_name: details["team_name"].as_str().map(str::to_string),
+                text: api_error(e),
+            }
         } else {
             LoginError::Failed(api_error(e))
         }
     }
+}
+
+/// How a single sign-on ended in the app (0.7 phase 5b).
+pub enum SsoDone {
+    Signed(LoginOutcome),
+    /// The account asks for its two-step code: finish with it.
+    Totp(crate::sso::SsoTotpStep),
 }
 
 /// Stable code of a client error: the server's (`Api`) or a vault rule of
@@ -371,6 +399,22 @@ pub fn api_error(e: ClientError) -> String {
             {
                 return text;
             }
+            // E2EE vaults, SSO and the audit (0.7 phase 5b): the app's text.
+            if crate::e2ee::is_e2ee_code(&code)
+                && let Some(text) = crate::e2ee::error_text(&code, &details)
+            {
+                return text;
+            }
+            if crate::sso::is_sso_code(&code)
+                && let Some(text) = crate::sso::error_text(&code, &details)
+            {
+                return text;
+            }
+            if crate::audit::is_audit_code(&code)
+                && let Some(text) = crate::i18n::api_error_text(&code)
+            {
+                return text;
+            }
             // Security keys (the server's forwarding): the app's text.
             if code.starts_with("security_key_") {
                 return crate::security_keys::error_text(&code, &message);
@@ -389,10 +433,22 @@ pub fn api_error(e: ClientError) -> String {
                 None => crate::i18n::api_error_text(&code).unwrap_or(code),
             }
         }
-        ClientError::Core(c) => match c.vault_code().and_then(crate::i18n::api_error_text) {
-            Some(text) => text,
-            None => c.to_string(),
-        },
+        ClientError::Core(c) => {
+            if let termoak_core::CoreError::Vault {
+                code,
+                detail: Some(detail),
+                ..
+            } = &c
+                && crate::e2ee::is_e2ee_code(code)
+                && let Some(text) = crate::e2ee::error_text(code, detail)
+            {
+                return text;
+            }
+            match c.vault_code().and_then(crate::i18n::api_error_text) {
+                Some(text) => text,
+                None => c.to_string(),
+            }
+        }
         ClientError::Network(detail) => {
             tracing::warn!(%detail, "network error");
             t!("error.network").to_string()
@@ -2037,9 +2093,10 @@ impl AppModel {
         runtime::run(
             cx,
             async move { acc.refresh_info().await },
-            |m, res, cx| match res {
+            move |m, res, cx| match res {
                 Ok(_) => {
                     m.refresh_accounts();
+                    m.refresh_e2ee(id, cx);
                     cx.notify();
                 }
                 Err(e) => tracing::debug!(error = %e, "server info"),
@@ -2089,6 +2146,7 @@ impl AppModel {
             .unwrap_or_default();
         let summary = match res {
             Ok(report) => {
+                self.e2ee_synced(id, &report, cx);
                 for (level, text) in accounts::sync_notices(&report) {
                     let kind = match level {
                         NoticeLevel::Info => ToastKind::Info,
@@ -2145,6 +2203,9 @@ impl AppModel {
         }
         if v["type"] == "access_request" {
             self.access_event(id, &v, cx);
+        }
+        if v["type"] == "e2ee" {
+            self.e2ee_event(id, &v, cx);
         }
         if v["type"] == "team" && v["event"] == "policy" {
             // The vaults' effective policies and access may have changed.
@@ -2267,6 +2328,55 @@ impl AppModel {
                 .map_err(LoginError::from)
         });
         self.adopt(task, false, cx)
+    }
+
+    /// Waits for the browser of a single sign-on and signs the account in
+    /// (or asks for its two-step code).
+    pub fn sso_finish(
+        &mut self,
+        pending: termoak_core::sso::SsoPending,
+        lb: termoak_client::sso::Loopback,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SsoDone, LoginError>> {
+        let ws = self.ws.clone();
+        let task =
+            runtime::handle(cx).spawn(async move { crate::sso::finish(ws, pending, lb).await });
+        self.adopt_sso(task, cx)
+    }
+
+    /// Finishes a single sign-on with the account's two-step code.
+    pub fn sso_totp(
+        &mut self,
+        step: crate::sso::SsoTotpStep,
+        code: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SsoDone, LoginError>> {
+        let ws = self.ws.clone();
+        let task = runtime::handle(cx).spawn(async move {
+            crate::sso::complete(ws, step.pending, step.callback, Some(code)).await
+        });
+        self.adopt_sso(task, cx)
+    }
+
+    fn adopt_sso(
+        &mut self,
+        task: tokio::task::JoinHandle<Result<crate::sso::SsoOutcome, ClientError>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SsoDone, LoginError>> {
+        cx.spawn(async move |this, cx| {
+            let res = task.await.map_err(|e| {
+                LoginError::Failed(t!("common.task_interrupted", error = e).to_string())
+            })?;
+            match res.map_err(LoginError::from)? {
+                crate::sso::SsoOutcome::Account(acc) => {
+                    let outcome = this
+                        .update(cx, |m, cx| m.account_added(acc, false, cx))
+                        .map_err(|e| LoginError::Failed(e.to_string()))?;
+                    Ok(SsoDone::Signed(outcome))
+                }
+                crate::sso::SsoOutcome::Totp(step) => Ok(SsoDone::Totp(step)),
+            }
+        })
     }
 
     /// Creates an account on a server (with an invitation code when its
@@ -2447,6 +2557,8 @@ impl AppModel {
         // Its access requests and windows go with it.
         let book = crate::access::AccessBook::global(cx);
         book.update(cx, |b, cx| b.forget(account, cx));
+        let e2ee = crate::e2ee::E2eeBook::global(cx);
+        e2ee.update(cx, |b, cx| b.forget(account, cx));
         let ws = self.ws.clone();
         let fut = runtime::spawn(cx, async move {
             ws.sign_out(account, discard)

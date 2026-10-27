@@ -1652,6 +1652,7 @@ mod tests {
             plan: "free".into(),
             email_verified: true,
             locale: "en".into(),
+            sso_only: false,
         };
         assert_eq!(
             actor_label(&format!("user:{}", ana.id), std::slice::from_ref(&ana)),

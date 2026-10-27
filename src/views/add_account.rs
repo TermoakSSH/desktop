@@ -126,6 +126,8 @@ pub struct ServerInfo {
     pub official: bool,
     /// The server has vaults (older ones: one personal vault, no sharing).
     pub vaults: bool,
+    /// Teams can sign in through single sign-on (0.7 phase 5b).
+    pub sso: bool,
 }
 
 /// Reads `/info`. `None` if it is not a Termoak server.
@@ -155,6 +157,7 @@ pub fn parse_server_info(url: &str, v: &Value) -> Option<ServerInfo> {
         insecure: servers::is_insecure(url),
         official: servers::is_official(url),
         vaults: v["features"]["vaults"].as_bool().unwrap_or(false),
+        sso: v["features"]["sso"].as_bool().unwrap_or(false),
     })
 }
 
@@ -208,7 +211,33 @@ pub struct AddAccountDialog {
     countdown: bool,
     invite_check: Option<InviteCheck>,
     _invite_task: Option<Task<()>>,
+    /// The email's team signs in through single sign-on (0.7 phase 5b).
+    sso: Option<SsoHintState>,
+    /// The email the hint is for.
+    sso_for: String,
+    _sso_discover: Option<Task<()>>,
+    /// Waiting for the browser (the sign-in in progress).
+    sso_waiting: Option<Task<()>>,
+    /// The single sign-on asks for the account's two-step code.
+    sso_totp: Option<crate::sso::SsoTotpStep>,
     _subs: Vec<Subscription>,
+}
+
+/// What `GET /auth/sso/discover` said about the typed email.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SsoHintState {
+    team_id: Option<Id>,
+    team_name: String,
+    /// Password sign-in is refused for it.
+    enforced: bool,
+}
+
+/// An email worth asking about (something@domain.tld).
+fn looks_like_email(email: &str) -> bool {
+    let email = email.trim();
+    email.split_once('@').is_some_and(|(user, domain)| {
+        !user.is_empty() && domain.contains('.') && !domain.ends_with('.')
+    })
 }
 
 fn input(
@@ -254,10 +283,12 @@ impl AddAccountDialog {
                     this.submit(window, cx);
                 }
             }),
-            // Another email: the previous two-step code no longer applies.
+            // Another email: the previous two-step code no longer applies,
+            // and its team may sign in through single sign-on.
             cx.subscribe_in(&email, window, |this, _, ev: &InputEvent, window, cx| {
                 if let InputEvent::Change = ev {
                     this.cancel_totp(window, cx);
+                    this.schedule_sso_discover(window, cx);
                 }
             }),
             cx.subscribe_in(&invite, window, |this, _, ev: &InputEvent, window, cx| {
@@ -309,6 +340,11 @@ impl AddAccountDialog {
             countdown: false,
             invite_check: None,
             _invite_task: None,
+            sso: None,
+            sso_for: String::new(),
+            _sso_discover: None,
+            sso_waiting: None,
+            sso_totp: None,
             _subs: subs,
         };
         match start {
@@ -430,6 +466,9 @@ impl AddAccountDialog {
                         if from == Step::CustomUrl && this.step == Step::CustomUrl {
                             this.go(Step::SignIn, Some(Step::CustomUrl), window, cx);
                         }
+                        // A pre-filled email may belong to an SSO team.
+                        this.sso_for.clear();
+                        this.schedule_sso_discover(window, cx);
                     }
                     Err(e) if from == Step::CustomUrl => {
                         ui::error(window, cx, t!("add_account.check_failed", error = e))
@@ -526,6 +565,259 @@ impl AddAccountDialog {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect()
+    }
+
+    /// Asks the server (shortly after typing stops) whether the email's
+    /// team signs in through single sign-on.
+    fn schedule_sso_discover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let email = self.email.read(cx).value().trim().to_lowercase();
+        if email == self.sso_for {
+            return;
+        }
+        self.sso_for = email.clone();
+        if self.sso.take().is_some() {
+            cx.notify();
+        }
+        let sso = self.info.as_ref().is_some_and(|i| i.sso);
+        if !sso || !looks_like_email(&email) || !matches!(self.step, Step::SignIn | Step::SignUp) {
+            self._sso_discover = None;
+            return;
+        }
+        let Ok(url) = self.server_url(cx) else {
+            return;
+        };
+        self._sso_discover = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(450))
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| {
+                let e2 = email.clone();
+                runtime::run_in(
+                    cx,
+                    window,
+                    async move {
+                        let api = ApiClient::new(&url).map_err(api_error)?;
+                        termoak_client::sso::discover(&api, &e2)
+                            .await
+                            .map_err(api_error)
+                    },
+                    move |this, res, _, cx| {
+                        if this.sso_for != email {
+                            return;
+                        }
+                        this.sso = match res {
+                            Ok(h) if h.sso => Some(SsoHintState {
+                                team_id: h.team_id,
+                                team_name: h.team_name.unwrap_or_default(),
+                                enforced: h.enforced,
+                            }),
+                            _ => None,
+                        };
+                        cx.notify();
+                    },
+                );
+            });
+        }));
+    }
+
+    /// "Continue with <team>": the system browser, then back here.
+    fn start_sso(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let server = match self.server_choice(cx) {
+            Ok(s) => s,
+            Err(e) => return ui::error(window, cx, e),
+        };
+        let email = Some(self.email.read(cx).value().trim().to_string()).filter(|e| !e.is_empty());
+        let team = self.sso.as_ref().and_then(|h| h.team_id);
+        let ws = self.model.read(cx).ws.clone();
+        self.busy = true;
+        self.sso_totp = None;
+        cx.notify();
+        runtime::run_in(
+            cx,
+            window,
+            async move {
+                crate::sso::begin(ws, server, email, team)
+                    .await
+                    .map_err(api_error)
+            },
+            |this, res, window, cx| {
+                match res {
+                    Ok((url, pending, lb)) => {
+                        cx.open_url(&url);
+                        let task = this.model.update(cx, |m, cx| m.sso_finish(pending, lb, cx));
+                        this.after_sso(task, window, cx);
+                    }
+                    Err(e) => {
+                        this.busy = false;
+                        ui::error(window, cx, e);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// The two-step code of a single sign-on.
+    fn sso_with_totp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(step) = self.sso_totp.clone() else {
+            return;
+        };
+        let code = Self::code(&self.totp, cx);
+        if code.is_empty() {
+            ui::error(window, cx, t!("settings.login.missing_code"));
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+        let task = self.model.update(cx, |m, cx| m.sso_totp(step, code, cx));
+        self.after_sso(task, window, cx);
+    }
+
+    fn after_sso(
+        &mut self,
+        task: Task<Result<crate::state::SsoDone, LoginError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sso_waiting = Some(cx.spawn_in(window, async move |this, cx| {
+            let res = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                this.sso_waiting = None;
+                match res {
+                    Ok(crate::state::SsoDone::Signed(LoginOutcome::SignedIn {
+                        account,
+                        first,
+                    })) => {
+                        this.sso_totp = None;
+                        this.done(account, first, window, cx)
+                    }
+                    Ok(crate::state::SsoDone::Signed(LoginOutcome::VerifyEmail(_))) => {
+                        this.go(Step::Verify, None, window, cx)
+                    }
+                    Ok(crate::state::SsoDone::Totp(step)) => {
+                        this.sso_totp = Some(step);
+                        this.totp.update(cx, |i, cx| i.set_value("", window, cx));
+                        ui::focus_later(&this.totp, window, cx);
+                        ui::notify(
+                            window,
+                            cx,
+                            ToastKind::Info,
+                            t!("settings.login.totp_required"),
+                        );
+                    }
+                    Err(LoginError::TotpInvalid) => {
+                        this.totp.update(cx, |i, cx| i.set_value("", window, cx));
+                        ui::focus_later(&this.totp, window, cx);
+                        ui::error(window, cx, t!("settings.login.totp_invalid"));
+                    }
+                    Err(LoginError::SsoRequired { text, .. }) | Err(LoginError::Failed(text)) => {
+                        this.sso_totp = None;
+                        ui::error(window, cx, t!("add_account.sso.failed", error = text))
+                    }
+                    Err(LoginError::TotpRequired) => {}
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn cancel_sso(&mut self, cx: &mut Context<Self>) {
+        self.sso_waiting = None;
+        self.busy = false;
+        cx.notify();
+    }
+
+    fn render_sso(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let theme = cx.theme();
+        if self.sso_waiting.is_some() && self.sso_totp.is_none() {
+            return Some(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.primary)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(gpui_component::spinner::Spinner::new().small())
+                            .child(div().text_sm().child(t!("add_account.sso.waiting"))),
+                    )
+                    .child(
+                        h_flex().child(
+                            Button::new("sso-cancel")
+                                .small()
+                                .label(t!("common.cancel"))
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_sso(cx)),
+                                ),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if self.sso_totp.is_some() {
+            return Some(
+                v_flex()
+                    .gap_2()
+                    .child(self.render_totp_box(cx))
+                    .child(
+                        h_flex().child(
+                            Button::new("sso-totp")
+                                .primary()
+                                .icon(ui::icon(IconName::ShieldCheck))
+                                .label(t!("settings.login.verify"))
+                                .loading(self.busy)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.sso_with_totp(window, cx)
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let hint = self.sso.clone()?;
+        let team = if hint.team_name.is_empty() {
+            t!("add_account.sso.your_team").to_string()
+        } else {
+            hint.team_name.clone()
+        };
+        Some(
+            v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(if hint.enforced {
+                    theme.primary
+                } else {
+                    theme.border
+                })
+                .child(div().text_sm().child(if hint.enforced {
+                    t!("add_account.sso.enforced", team = team.clone())
+                } else {
+                    t!("add_account.sso.available", team = team.clone())
+                }))
+                .child(
+                    h_flex().child(
+                        Button::new("sso-continue")
+                            .map(|b| if hint.enforced { b.primary() } else { b })
+                            .icon(ui::icon(IconName::LogIn))
+                            .label(t!("add_account.sso.continue", team = team))
+                            .loading(self.busy)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.start_sso(window, cx)
+                            })),
+                    ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -629,6 +921,24 @@ impl AddAccountDialog {
                         ui::focus_later(&this.totp, window, cx);
                         ui::error(window, cx, t!("settings.login.totp_invalid"));
                     }
+                    Err(LoginError::SsoRequired {
+                        team_id,
+                        team_name,
+                        text,
+                    }) => {
+                        // Switch to single sign-on.
+                        this.sso = Some(SsoHintState {
+                            team_id,
+                            team_name: team_name.unwrap_or_default(),
+                            enforced: true,
+                        });
+                        this.sso_for = this.email.read(cx).value().trim().to_lowercase();
+                        if this.step == Step::SignUp {
+                            let back = this.back;
+                            this.go(Step::SignIn, back, window, cx);
+                        }
+                        ui::notify(window, cx, ToastKind::Info, text);
+                    }
                     Err(LoginError::Failed(e)) => ui::error(
                         window,
                         cx,
@@ -709,7 +1019,7 @@ impl AddAccountDialog {
                         ui::focus_later(&this.totp, window, cx);
                         ui::error(window, cx, t!("settings.login.totp_invalid"));
                     }
-                    Err(LoginError::Failed(e)) => {
+                    Err(LoginError::Failed(e)) | Err(LoginError::SsoRequired { text: e, .. }) => {
                         this.email_code
                             .update(cx, |i, cx| i.set_value("", window, cx));
                         ui::focus_later(&this.email_code, window, cx);
@@ -1033,6 +1343,11 @@ impl AddAccountDialog {
         let totp_step = self.totp_step;
         let can_sign_up = self.can_sign_up(cx);
         let server = self.render_server(cx);
+        let sso = self.render_sso(cx);
+        // Enforced (or in the middle of it): only single sign-on.
+        let sso_only = self.sso.as_ref().is_some_and(|h| h.enforced)
+            || self.sso_waiting.is_some()
+            || self.sso_totp.is_some();
         v_flex()
             .gap_3()
             .child(server)
@@ -1041,61 +1356,68 @@ impl AddAccountDialog {
                 Input::new(&self.email),
                 cx,
             ))
-            .child(ui::field(
-                t!("settings.login.password"),
-                Input::new(&self.password).mask_toggle(),
-                cx,
-            ))
-            .when(totp_step, |this| this.child(self.render_totp_box(cx)))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .flex_wrap()
-                    .child(
-                        Button::new("sign-in")
-                            .primary()
-                            .icon(ui::icon(if totp_step {
-                                IconName::ShieldCheck
-                            } else {
-                                IconName::LogIn
-                            }))
-                            .label(if totp_step {
-                                t!("settings.login.verify")
-                            } else {
-                                t!("settings.login.sign_in")
-                            })
-                            .loading(self.busy)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.sign_in(window, cx)
-                            })),
-                    )
-                    .when(!totp_step, |this| {
-                        this.child(
-                            Button::new("forgot-password")
-                                .ghost()
-                                .label(t!("settings.login.forgot_password"))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    let url = this.server_url(cx).unwrap_or_default();
-                                    if let Some(link) = web_link(&url, "/forgot-password") {
-                                        cx.open_url(&link);
-                                    }
-                                })),
-                        )
-                    })
-                    .when(!totp_step && can_sign_up, |this| {
-                        this.child(
-                            Button::new("to-sign-up")
-                                .ghost()
-                                .label(t!("settings.login.new_account"))
+            .children(sso)
+            .when(!sso_only, |this| {
+                this.child(ui::field(
+                    t!("settings.login.password"),
+                    Input::new(&self.password).mask_toggle(),
+                    cx,
+                ))
+            })
+            .when(totp_step && !sso_only, |this| {
+                this.child(self.render_totp_box(cx))
+            })
+            .when(!sso_only, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            Button::new("sign-in")
+                                .primary()
+                                .icon(ui::icon(if totp_step {
+                                    IconName::ShieldCheck
+                                } else {
+                                    IconName::LogIn
+                                }))
+                                .label(if totp_step {
+                                    t!("settings.login.verify")
+                                } else {
+                                    t!("settings.login.sign_in")
+                                })
+                                .loading(self.busy)
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    let back = this.back;
-                                    this.go(Step::SignUp, back, window, cx);
-                                    this.schedule_invite_check(window, cx);
+                                    this.sign_in(window, cx)
                                 })),
                         )
-                    }),
-            )
+                        .when(!totp_step, |this| {
+                            this.child(
+                                Button::new("forgot-password")
+                                    .ghost()
+                                    .label(t!("settings.login.forgot_password"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        let url = this.server_url(cx).unwrap_or_default();
+                                        if let Some(link) = web_link(&url, "/forgot-password") {
+                                            cx.open_url(&link);
+                                        }
+                                    })),
+                            )
+                        })
+                        .when(!totp_step && can_sign_up, |this| {
+                            this.child(
+                                Button::new("to-sign-up")
+                                    .ghost()
+                                    .label(t!("settings.login.new_account"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        let back = this.back;
+                                        this.go(Step::SignUp, back, window, cx);
+                                        this.schedule_invite_check(window, cx);
+                                    })),
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 
@@ -1127,6 +1449,7 @@ impl AddAccountDialog {
             || !self.invite.read(cx).value().trim().is_empty()
             || self.info.as_ref().is_some_and(|i| !i.registration_open);
         let server = self.render_server(cx);
+        let sso = self.render_sso(cx);
         v_flex()
             .gap_3()
             .child(server)
@@ -1136,6 +1459,7 @@ impl AddAccountDialog {
                 Input::new(&self.email),
                 cx,
             ))
+            .children(sso)
             .child(ui::field(
                 t!("settings.login.password"),
                 Input::new(&self.password).mask_toggle(),
@@ -1341,6 +1665,16 @@ impl Render for AddAccountDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sso_discovery_waits_for_a_whole_email() {
+        assert!(looks_like_email("ana@corp.example"));
+        assert!(looks_like_email(" ana@corp.example.com "));
+        assert!(!looks_like_email("ana@corp"));
+        assert!(!looks_like_email("ana@corp."));
+        assert!(!looks_like_email("@corp.example"));
+        assert!(!looks_like_email("ana"));
+    }
     use serde_json::json;
 
     #[test]

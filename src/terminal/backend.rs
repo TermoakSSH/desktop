@@ -102,10 +102,27 @@ pub struct RemoteSeat {
 /// A connection error for the view: "Request access" for hosts that need
 /// an approved window, else its text.
 fn failed(e: termoak_client::ClientError) -> Out {
-    match crate::access::AccessNeed::from_error(&e) {
-        Some(need) => Out::AccessRequired(need, crate::state::api_error(e)),
-        None => Out::Failed(crate::state::api_error(e)),
+    if let Some(need) = crate::access::AccessNeed::from_error(&e) {
+        return Out::AccessRequired(need, crate::state::api_error(e));
     }
+    match crate::state::error_code(&e).as_deref() {
+        Some("e2ee_locked") => Out::E2eeRequired(E2eeNeed::Unlock, crate::state::api_error(e)),
+        Some("e2ee_unlock_required") => {
+            Out::E2eeRequired(E2eeNeed::SendForSession, crate::state::api_error(e))
+        }
+        _ => Out::Failed(crate::state::api_error(e)),
+    }
+}
+
+/// What an end-to-end encrypted host needs before it connects (0.7 phase
+/// 5b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum E2eeNeed {
+    /// Its secrets are locked on this computer: unlock E2EE.
+    Unlock,
+    /// A server session: this computer must send the host's credentials
+    /// for this session (`unlock`), after asking.
+    SendForSession,
 }
 
 /// Events for the view.
@@ -160,6 +177,8 @@ pub enum Out {
     /// The host needs an approved access window (teams security): the
     /// error's details and its text.
     AccessRequired(crate::access::AccessNeed, String),
+    /// The host's credentials are end-to-end encrypted (0.7 phase 5b).
+    E2eeRequired(E2eeNeed, String),
 }
 
 /// The view's end.
@@ -395,10 +414,32 @@ async fn run_local(
     }
 }
 
+/// The credentials of an end-to-end encrypted host (and its jumps),
+/// resolved on this computer, for one server session or test (the server
+/// uses them for that connection and wipes them).
+pub async fn unlock_payload(
+    ws: &termoak_client::Workspace,
+    account: &termoak_client::Account,
+    host_id: Id,
+) -> Result<Value, termoak_client::ClientError> {
+    let item = ws.locate(host_id).await?;
+    let mut resolved = ws.resolve_item(item).await?;
+    let unlock = account.e2ee_unlock_for(&resolved).await;
+    resolved.zeroize_secrets();
+    Ok(unlock)
+}
+
 /// Which server session to open.
 pub enum ServerTarget {
     /// New session on the server for this host.
     New { host_id: Id },
+    /// New session with this host's credentials (an end-to-end encrypted
+    /// vault), resolved on this computer and sent for this session only.
+    NewUnlocked {
+        host_id: Id,
+        ws: termoak_client::Workspace,
+        account: std::sync::Arc<termoak_client::Account>,
+    },
     /// Attach to an existing session (own or shared).
     Attach { session_id: Id },
     /// Join with a link (maybe on another server, maybe as a guest).
@@ -432,16 +473,30 @@ async fn run_server(
     let (session_id, link) = match target {
         ServerTarget::Attach { session_id } => (session_id, None),
         ServerTarget::Link { session_id, link } => (session_id, Some(link)),
-        ServerTarget::New { host_id } => {
+        target @ (ServerTarget::New { .. } | ServerTarget::NewUnlocked { .. }) => {
             let _ = out.send(Out::Status(
                 t!("terminal.status.opening_server_session").to_string(),
             ));
-            let created: Result<Value, _> = api
-                .post(
-                    "/api/v1/sessions",
-                    &json!({"host_id": host_id, "cols": cols, "rows": rows}),
-                )
-                .await;
+            let (host_id, unlock) = match target {
+                ServerTarget::NewUnlocked {
+                    host_id,
+                    ws,
+                    account,
+                } => match unlock_payload(&ws, &account, host_id).await {
+                    Ok(u) => (host_id, Some(u)),
+                    Err(e) => {
+                        let _ = out.send(failed(e));
+                        return;
+                    }
+                },
+                ServerTarget::New { host_id } => (host_id, None),
+                _ => unreachable!(),
+            };
+            let mut body = json!({"host_id": host_id, "cols": cols, "rows": rows});
+            if let Some(u) = unlock {
+                body["unlock"] = u;
+            }
+            let created: Result<Value, _> = api.post("/api/v1/sessions", &body).await;
             match created {
                 Ok(v) => match v["id"].as_str().and_then(|s| s.parse::<Id>().ok()) {
                     Some(id) => (id, None),
